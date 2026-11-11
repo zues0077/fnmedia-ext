@@ -2,6 +2,27 @@
 
 本文件记录 fnmedia-ext（飞牛影视在线扩展）每个版本的更新内容，最新版本在最前。
 
+## v1.1.1 — 2026-11-11（品牌归属修正 + 自更新修复 + 单包分发）
+
+### 品牌与仓库归属
+
+- 关于页原样显示上游信息：`开发作者：funwukong`、版本检查打上游仓库（实测报 `GitHub 返回 403`）。现改为维护者 **zues0077**，仓库链接指向本 fork；同时保留「基于上游 funwukong/fnmedia-ext 的二次开发（Apache-2.0）」致谢，符合 fork 合规要求。
+- `proxy/updater.py` 的 `REPO_SLUG` 由 `funwukong/fnmedia-ext` 改为 `zues0077/fnmedia-ext`：此前版本检查请求上游仓库（已不可用），管理页「关于」因此长期 403。
+- `packaging/fpk/manifest.in` 的 `maintainer` / `maintainer_url` 改为本仓库（应用中心详情页显示的维护者）。
+- 侵权声明页的联系方式改指本仓库 Issue。
+
+### 自更新修复（重要）
+
+- fpk 命名对齐 `updater._pick_asset` 的正则：
+  - 完整版 **必须**叫 `fnmedia-ext-<ver>-full.fpk` —— updater 判定「全功能版」时只认它、**没有任何 fallback**；此前发布为 `fnmedia-ext-<ver>.fpk`，导致完整版点「立即更新」找不到包。
+  - 轻量版改为 `fnmedia-ext-<ver>-lite.fpk`（原 `-public` 虽在正则内，语义对齐上游）。
+  - 架构后缀仅当 `--platform` 不等于 `all` 时追加。
+
+### 分发方式
+
+- fpk 改为 **单包 `platform=all`**：实测包内 20 个 wheel 中 16 个为纯 Python、4 个 `pydantic_core` 覆盖 cp311/cp312 × x86_64/aarch64，唯一 ELF 是下发给 Android 容器的 arm 库，故一套包即可同时装 x86 与 arm（与上游默认包一致），不再分架构出包。
+- `build.sh` 保留 `--platform x86|arm|loongarch|risc-v|all` 参数备用。
+
 ## v1.1.0 — 2026-11-10（P0/P1 优化 + 续播修复 + 多用户 fail-open 回归）
 
 自 v0.2.42 以来的全部改动（上游 v1.0.0 之后无新提交，fork 已追平）。

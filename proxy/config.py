@@ -57,35 +57,6 @@ def parse_config_version(raw):
     """解析存量 config_version：返回 int，无法确定时返回 None。
 
     接受 int、整数 float（如 2.0）、数字字符串（如 "2"、"2.0"）；
-    非数字字符串（"abc"）、None、非整数 float（2.5）、bool 等一律返回 None，
-    调用方不得将其误判为 v1（否则会重跑 v1→v2 迁移，翻掉用户显式设的值）。
-    """
-    if isinstance(raw, bool):
-        return None
-    if isinstance(raw, int):
-        return raw
-    if isinstance(raw, float):
-        return int(raw) if raw.is_integer() else None
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return None
-        try:
-            return int(s)
-        except ValueError:
-            pass
-        try:
-            f = float(s)
-        except ValueError:
-            return None
-        return int(f) if f.is_integer() else None
-    return None
-
-
-def parse_config_version(raw):
-    """解析存量 config_version：返回 int，无法确定时返回 None。
-
-    接受 int、整数 float（如 2.0）、数字字符串（如 "2"、"2.0"）；
     非数字字符串（"abc"）、None、非整数 float（2.5）、bool、空串等一律返回 None，
     调用方不得将其误判为 v1（否则会重跑破坏性迁移，翻掉用户显式设的值）。
     与 p0p1-config（P1-11）同一函数、同一语义，合入时去重。

@@ -60,6 +60,26 @@ def _source_health_enabled() -> bool:
     except Exception:
         return True
 
+
+def _health_gate(source: dict) -> bool:
+    """非普通源（spider/guard/drpy/catvod/dduo）搜索前的死源冷却短路。
+
+    普通 http/T4 源在 search_source 内部已做此短路，不经过这里。
+    开关 source_health_enabled 关闭时恒放行（不跳过）。"""
+    if not _source_health_enabled() or _health is None:
+        return True
+    return _health.usable(source.get("id", ""))
+
+
+def _health_record(source: dict, ok: bool, latency: float) -> None:
+    """非普通源搜索结果记健康画像（成功/失败二元，成功清零失败计数）。
+
+    只有这些源画像被记录后，展示层的 weight() 排序降权才对它们生效。"""
+    if not _source_health_enabled() or _health is None:
+        return
+    _health.record(source.get("id", ""), ok, latency)
+
+
 # 2026-10-17 国内直连实测（搜索+m3u8 直链可达性）。403/404 多为走 Clash 代理所致。
 DEFAULT_SOURCES: list[dict] = [
     {"id": "baofeng", "name": "暴风资源", "api": "https://bfzyapi.com/api.php/provide/vod/at/json", "enabled": True},
@@ -816,9 +836,18 @@ async def dduo_search_source(client: httpx.AsyncClient, source: dict,
     """
     import asyncio
     import dduo
-    vods = await dduo.search(client, source, keyword)
-    if not vods:
+    if not _health_gate(source):
         return []
+    _t0 = time.monotonic()
+    try:
+        vods = await dduo.search(client, source, keyword)
+    except Exception:
+        _health_record(source, False, time.monotonic() - _t0)
+        return []
+    if not vods:
+        _health_record(source, False, time.monotonic() - _t0)
+        return []
+    _health_record(source, True, time.monotonic() - _t0)
 
     async def one(v: dict) -> OnlineTitle | None:
         try:
@@ -903,11 +932,16 @@ async def xiaoya_search_source(client, source: dict,
     """小雅搜索：catvod 爬虫检索全库索引。不逐个补详情（线路在播放时按需解析）。"""
     import asyncio
     import catvod
+    if not _health_gate(source):
+        return []
+    _t0 = time.monotonic()
     try:
         lst = await asyncio.to_thread(catvod.search, keyword,
                                       (await catvod.xiaoya_token()))
     except Exception:
+        _health_record(source, False, time.monotonic() - _t0)
         return []
+    _health_record(source, True, time.monotonic() - _t0)
     out = []
     for v in lst:
         t = _xiaoya_map_item(v)
@@ -964,11 +998,16 @@ async def drpy_search_source(client, source: dict,
                              keyword: str) -> list[OnlineTitle]:
     import asyncio
     import drpy
+    if not _health_gate(source):
+        return []
+    _t0 = time.monotonic()
     try:
         site = _drpy_site(source)
         lst = await asyncio.to_thread(drpy.search, site, keyword, False, 1)
     except Exception:
+        _health_record(source, False, time.monotonic() - _t0)
         return []
+    _health_record(source, True, time.monotonic() - _t0)
     out = []
     for v in lst:
         t = _drpy_map_item(source, v)
@@ -1024,6 +1063,9 @@ async def guard_search_source(client, source: dict, keyword: str) -> list[Online
     conf = _guard_conf(source)
     if not conf or not guard.available():
         return []
+    if not _health_gate(source):
+        return []
+    _t0 = time.monotonic()
     try:
         # 加固搜索走安卓真机（to_thread 本身无超时）。聚合搜索会并发几十个源并
         # gather 等全部完成，若不给硬超时，单台设备卡顿（深预热后偶发降级）会把整次
@@ -1032,7 +1074,9 @@ async def guard_search_source(client, source: dict, keyword: str) -> list[Online
             asyncio.to_thread(guard.search, conf, keyword, False, 1),
             timeout=GUARD_SEARCH_TIMEOUT)
     except Exception:
+        _health_record(source, False, time.monotonic() - _t0)
         return []
+    _health_record(source, True, time.monotonic() - _t0)
     out = []
     for v in lst:
         t = _guard_map_item(source, v)
@@ -1089,10 +1133,15 @@ async def spider_search_source(client, source: dict, keyword: str) -> list[Onlin
     conf = _spider_conf(source)
     if not conf or not spiders.available():
         return []
+    if not _health_gate(source):
+        return []
+    _t0 = time.monotonic()
     try:
         lst = await asyncio.to_thread(spiders.search, conf, keyword, False, 1)
     except Exception:
+        _health_record(source, False, time.monotonic() - _t0)
         return []
+    _health_record(source, True, time.monotonic() - _t0)
     out = []
     for v in lst:
         t = _spider_map_item(source, v)

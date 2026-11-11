@@ -17,6 +17,8 @@ dist/
 
 # Android 构建工具链（可再生 SDK/NDK，数百 MB，不入库；spider-runner 源码入库）
 /spider-runner/android/.buildtools/
+# 构建产物（由 build_bridge.sh 现场生成，不入库）
+/spider-runner/android/build/
 
 # Editor/OS
 .DS_Store

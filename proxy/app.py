@@ -11521,12 +11521,23 @@ async def ext_subscriptions_update(sid: str, request: Request):
     for key in ("name", "url", "update_interval_h", "enabled"):
         if key in body:
             kwargs[key] = body[key]
-    if not kwargs:
+    if not kwargs and not body.get("purge_sources"):
         return JSONResponse({"code": 400, "msg": "无更新字段"}, status_code=400)
-    ok, msg = config.update_subscription(sid, **kwargs)
-    if not ok:
-        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
-    return {"code": 0, "msg": "已更新", "data": True}
+    purged = 0
+    if kwargs:
+        ok, msg = config.update_subscription(sid, **kwargs)
+        if not ok:
+            return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    # 改订阅地址后可选「清空旧源」：仅删该 sub_id 名下、非内置的源
+    if body.get("purge_sources"):
+        purged = config.purge_subscription_sources(sid)
+        if purged:
+            try:
+                _search_cache.clear(); _AGG_CACHE.clear()
+                _schedule_routes_refresh()
+            except Exception:
+                pass
+    return {"code": 0, "msg": "已更新", "data": {"purged": purged}}
 
 
 @app.delete("/v/api/ext/subscriptions/{sid}")

@@ -954,6 +954,32 @@ class Config:
             self._persist(cfg)
             return True, "ok"
 
+    def purge_subscription_sources(self, sid: str) -> int:
+        """清空某个订阅此前导入的全部源（仅按 sub_id 精确匹配，内置源永不涉及）。
+
+        用于「改了订阅地址后重新导入」：旧地址的源已无意义，清掉避免新旧混杂。
+        返回被删除的源数量。其他订阅/自定义源不受影响。
+        """
+        with _LOCK:
+            cfg = self.get()
+            keep, removed = [], 0
+            for s in cfg["sources"]:
+                if s.get("sub_id") == sid and not s.get("builtin"):
+                    removed += 1
+                    continue
+                keep.append(s)
+            if removed:
+                cfg["sources"] = keep
+                self._persist(cfg)
+            return removed
+
+    def subscription_source_count(self, sid: str) -> int:
+        """统计某个订阅当前名下的源数量（按 sub_id）。"""
+        self.maybe_reload()
+        with _LOCK:
+            return sum(1 for s in self._cfg["sources"]
+                       if s.get("sub_id") == sid and not s.get("builtin"))
+
     def mark_subscription_update(self, sid: str, ok: bool, error: str = "") -> None:
         """记录一次订阅拉取结果（更新 last_update/last_status/fail_count）。"""
         import time as _time

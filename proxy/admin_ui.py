@@ -2039,6 +2039,7 @@ async function jreq(method,p,b){
 }
 /* ---------- 订阅管理（导入+跟踪合一，支持编辑/删除） ---------- */
 let SUB_MG_EDIT=null;   // 当前处于编辑态的订阅 sid
+let SUB_MG_CACHE=[];    // 最近一次加载的订阅列表（编辑时比对原 URL / 源数）
 
 function subMgFmt(ts){
   if(!ts)return "从未";
@@ -2063,6 +2064,7 @@ async function loadSubMgmt(){
     const r=await jget("/v/api/ext/subscriptions");
     if(r.code!==0){box.innerHTML='<div class="hint">加载失败</div>';return;}
     const subs=(r.data&&r.data.subscriptions)||[];
+    SUB_MG_CACHE=subs;
     if(!subs.length){box.innerHTML='<div class="muted sm" style="padding:8px 0">还没有订阅源。在上方填地址点「添加并更新」。</div>';return;}
     box.innerHTML=subs.map(s=>{
       // —— 编辑态：行内表单（可改名称/URL/间隔）——
@@ -2076,6 +2078,7 @@ async function loadSubMgmt(){
           +'<span class="muted sm" style="text-align:right">更新间隔</span>'
           +'<div class="row" style="gap:6px"><input type="number" id="smEiv" value="'+esc(s.update_interval_h||24)+'" min="1" max="168" style="width:80px"/><span class="muted sm">小时（1~168）</span></div>'
           +'</div>'
+          +'<div class="muted sm" style="margin-top:8px">改了订阅地址后，保存时会询问是否<b>清空旧源并用新地址重新拉取</b>。</div>'
           +'<div class="btn-row" style="justify-content:flex-end;margin:10px 0 0">'
           +'<button class="small" onclick="subMgCancelEdit()">取消</button>'
           +'<button class="primary small" onclick="subMgSaveEdit(\''+s.id+'\')">保存</button>'
@@ -2113,11 +2116,36 @@ async function subMgSaveEdit(sid){
   if(el&&!el.disabled&&!url){toast("订阅 URL 不能为空","fail");return;}
   if(!(iv>=1&&iv<=168)){toast("间隔需在 1~168 小时","fail");return;}
   const body={name:nm,update_interval_h:iv};
-  if(el&&!el.disabled)body.url=url;
+  const old=(SUB_MG_CACHE||[]).find(x=>x.id===sid)||{};
+  const urlChanged=!!(el&&!el.disabled&&url&&url!==(old.url||""));
+  let purge=false;
+  if(urlChanged){
+    body.url=url;
+    const cnt=old.source_count||0;
+    purge=confirm(
+      "订阅地址已变更。\n\n"
+      +(cnt>0?("是否清空此前由该订阅导入的 "+cnt+" 个源，并用新地址重新拉取？\n\n"):"是否立即用新地址拉取一次？\n\n")
+      +"点「确定」= 清空旧源并用新地址重新拉取（推荐，避免新旧混杂）\n"
+      +"点「取消」= 保留旧源，只保存新地址");
+  }
+  if(purge)body.purge_sources=true;
   try{
     const r=await jpost("/v/api/ext/subscriptions/"+sid,body);
     if(r.code!==0){toast(r.msg||"保存失败","fail");return;}
-    SUB_MG_EDIT=null;toast("已保存修改");loadSubMgmt();
+    SUB_MG_EDIT=null;
+    const purged=(r.data&&r.data.purged)||0;
+    toast(purged?("已清空 "+purged+" 个旧源，正在用新地址重新拉取…"):"已保存修改");
+    loadSubMgmt();
+    if(purge){
+      try{
+        const rr=await jreq("POST","/v/api/ext/subscriptions/"+sid+"/refresh",{});
+        const d=rr.data||{};
+        if(rr.code!==0)toast("重新拉取失败："+(rr.msg||"")+"（可点「立即更新」重试）","fail");
+        else toast("重新拉取完成：CMS 新增 "+(d.cms_added||0)+" 源"+(d.live&&d.live.added?("、直播 "+(d.live.added)):""));
+      }catch(e){toast("重新拉取出错，可点「立即更新」重试","fail");}
+      try{loadLiveSubscribe();}catch(e){}
+      loadSubMgmt();
+    }
   }catch(e){toast("保存失败："+e,"fail");}
 }
 async function subMgAdd(){

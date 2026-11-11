@@ -127,6 +127,7 @@ async def refresh_subscription(sub_id: str) -> dict:
             return c, pr
 
     checked = await asyncio.gather(*[_probe(c) for c in cms_cands[:80]])
+    standalone = bool(sub.get("standalone"))
     for c, pr in checked:
         key = c["api"].rstrip("/").lower()
         if key in existing:
@@ -135,7 +136,7 @@ async def refresh_subscription(sub_id: str) -> dict:
         if not pr.get("ok"):
             failed += 1
             continue
-        ok, _sid = cfg.add_source(c["name"], c["api"], True, False,
+        ok, _sid = cfg.add_source(c["name"], c["api"], True, standalone,
                                   sub_id=sub_id)
         if ok:
             added_names.append(c["name"])

@@ -542,52 +542,44 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div id="adfStatus" class="muted sm" style="margin-top:6px">正在加载去广告规则…</div>
       </div>
       <div class="card">
-        <div class="card-title">TVBox / T4 订阅</div>
-        <p class="card-sub">自动识别并分类：标准苹果CMS影视站（type 0/1）
-          <!-- >>> PRIVATE:GUARD -->
-          、<strong>Guard 加固秒播源</strong>、<strong>普通爬虫源（csp_，自动下载/补传 jar）</strong>（完整版，本地安卓运行时执行）
-          <!-- <<< PRIVATE:GUARD -->
-          <!-- >>> PRIVATE:DRPY -->
-          与 <strong>远程 JS 爬虫源（DRPY）</strong>
-          <!-- <<< PRIVATE:DRPY -->
-          能直接播放的<strong>自动启用</strong>；P2P/磁力/云盘等慢源与 jar/脚本暂未就绪的源导入后默认关闭，可在结果里开启或补传；
-          网盘/直播/无法识别的源跳过并说明原因。</p>
-        <div class="row"><input type="text" id="subUrl" placeholder="配置订阅 URL（支持 T4 / base64 / 多订阅聚合）" style="flex:2"/>
-          <button class="primary small" onclick="importSubscription('url')">按 URL 导入</button>
+        <div class="card-title">📚 订阅管理
+          <button class="small" style="float:right" onclick="loadSubMgmt();loadLiveSubscribe()">刷新</button></div>
+        <p class="card-sub">贴订阅地址即可，格式<strong>自动识别</strong>：TVBox / base64 / LunaTV（Base58，
+          <code>api_site</code> 视频源 + <code>lives</code> 直播源）/ 饭太硬 / T4 / 多订阅聚合，无需区别添加。
+          视频源与直播源自动分流；能直接播放的源自动启用，P2P/磁力/云盘等慢源与 jar/脚本未就绪的导入后默认关闭。</p>
+        <div class="row" style="margin:4px 0 8px;gap:8px;flex-wrap:wrap;align-items:center">
+          <input type="text" id="subMgName" placeholder="订阅名称（可留空）" style="flex:1;min-width:130px"/>
+          <input type="text" id="subMgUrl" placeholder="订阅 URL（http/https），或粘贴配置 JSON" style="flex:2.5;min-width:210px"/>
+          <span class="muted sm" style="white-space:nowrap">间隔</span>
+          <input type="number" id="subMgInterval" value="24" min="1" max="168" title="更新间隔（小时，1~168）" style="width:70px"/>
+          <span class="muted sm">h</span>
+          <button class="primary small" onclick="subMgAdd()">添加并更新</button>
+        </div>
+        <div class="row" style="gap:14px;margin-bottom:4px">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+            <input type="checkbox" id="subMgStandalone" style="width:15px;height:15px;accent-color:var(--accent)"/>
+            苹果CMS源同时「作为独立媒体库」</label>
+          <a href="javascript:;" class="muted sm" style="text-decoration:underline" onclick="toggleSubPaste()">粘贴配置 JSON 导入（仅一次）</a>
           <!-- >>> PRIVATE:SPIDER -->
           <button class="small" style="border-color:var(--accent);color:var(--accent)" onclick="importFantaiying()" title="官方维护、在线影视+网盘聚合；自动解密、智能跳过 x86 会崩溃的加固源">⚡ 一键饭太硬</button>
           <!-- <<< PRIVATE:SPIDER -->
         </div>
-        <label class="field"><textarea id="subText" rows="7" placeholder="或直接粘贴配置 JSON（含 sites 数组）…"></textarea></label>
-        <div class="btn-row">
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
-            <input type="checkbox" id="subStandalone" style="width:15px;height:15px;accent-color:var(--accent)"/>
-            苹果CMS源同时「作为独立媒体库」</label>
-          <button class="primary small" onclick="importSubscription('text')">解析并导入</button>
+        <div id="subPasteWrap" style="display:none;margin-top:6px">
+          <label class="field"><textarea id="subText" rows="6" placeholder="粘贴配置 JSON（含 sites 数组 / LunaTV 配置）…"></textarea></label>
+          <div class="btn-row"><button class="primary small" onclick="importSubscription('text')">解析并导入（仅一次）</button></div>
         </div>
         <div id="subResult"></div>
-      </div>
+        <div id="subMgList" style="margin-top:10px"><div class="muted sm">正在加载订阅…</div></div>
 
-      <div class="card" style="margin-top:14px">
-        <div class="card-title">📺 电视直播订阅 <button class="small" style="float:right" onclick="loadLiveSubscribe()">刷新</button></div>
-        <p class="card-sub">把库内已导入的 m3u8 直播源（LunaTV <code>lives</code> / 资源站电视直播源）聚合为一份标准 IPTV 播放列表。复制下方地址，到<strong>飞牛影视 → 新增媒体库 → 内容类型选「电视直播」→ URL 导入</strong>粘贴即可，由飞牛原生播放。</p>
-        <div class="row" style="margin:8px 0">
-          <input type="text" id="liveSubUrl" readonly placeholder="正在生成订阅地址…" style="flex:1;font-family:monospace;font-size:12px"/>
-          <button class="small" id="liveSubCopyBtn" onclick="copyLiveSubscribe()">📋 复制订阅地址</button>
+        <div style="border-top:1px dashed var(--line);margin-top:14px;padding-top:12px">
+          <div class="card-title" style="font-size:14px;margin-bottom:4px">📺 电视直播出口</div>
+          <p class="card-sub" style="margin-bottom:6px">把订阅里解析出的 m3u8 直播源聚合为一份标准 IPTV 播放列表，交给飞牛原生播放（本扩展不碰播放链路）。</p>
+          <div class="row" style="margin:6px 0">
+            <input type="text" id="liveSubUrl" readonly placeholder="正在生成订阅地址…" style="flex:1;font-family:monospace;font-size:12px"/>
+            <button class="small" id="liveSubCopyBtn" onclick="copyLiveSubscribe()">📋 复制订阅地址</button>
+          </div>
+          <div id="liveSubInfo" class="muted sm">正在加载…</div>
         </div>
-        <div id="liveSubInfo" class="muted sm">正在加载…</div>
-      </div>
-
-      <div class="card" style="margin-top:14px">
-        <div class="card-title">📚 订阅源管理 <button class="small" style="float:right" onclick="loadSubMgmt()">刷新</button></div>
-        <p class="card-sub">添加多个订阅地址，各自设定时更新间隔（1~168 小时，默认 24h）。后台到点自动拉取，<strong>只增不减</strong>：只补充库里还没有的新源，绝不覆盖你手动启用/改名/停用过的源。定期体检失效 3 次的源：内置源停用、订阅/自定义源删除。</p>
-        <div class="row" style="margin:8px 0;gap:8px;flex-wrap:wrap;align-items:center">
-          <input type="text" id="subMgName" placeholder="订阅名称（可留空）" style="flex:1;min-width:130px"/>
-          <input type="text" id="subMgUrl" placeholder="订阅 URL（http/https）" style="flex:2;min-width:200px"/>
-          <input type="number" id="subMgInterval" value="24" min="1" max="168" title="更新间隔（小时）" style="width:78px"/>
-          <button class="primary small" onclick="subMgAdd()">添加订阅</button>
-        </div>
-        <div id="subMgList"><div class="muted sm">点击「刷新」加载。</div></div>
       </div>
 
       <!-- >>> PRIVATE:SPIDER -->
@@ -1867,9 +1859,9 @@ async function toggleAdfilterSps(on){
   }catch(e){toast(String(e),"fail");}
 }
 async function importSubscription(kind){
-  const standalone=$("subStandalone").checked;
+  const standalone=$("subMgStandalone").checked;
   const payload={standalone:standalone,enable_guard:"smart"};
-  if(kind==="url"){payload.url=$("subUrl").value.trim();if(!payload.url){toast("请填写订阅 URL","fail");return;}}
+  if(kind==="url"){payload.url=$("subMgUrl").value.trim();if(!payload.url){toast("请填写订阅 URL","fail");return;}}
   else{payload.text=$("subText").value.trim();if(!payload.text){toast("请粘贴配置 JSON","fail");return;}}
   const out=$("subResult");out.innerHTML='<div class="muted sm">正在解析订阅并探测源，请稍候…</div>';
   try{
@@ -1897,7 +1889,7 @@ async function importFantaiying(){
   out.innerHTML='<div class="muted sm">正在拉取内置「饭太硬」官方订阅（多镜像自动切换、自动解密），请稍候…</div>';
   try{
     const r=await jpost("/v/api/ext/source/import-subscription",
-      {builtin:"fantaiying",standalone:$("subStandalone").checked,enable_guard:"smart"});
+      {builtin:"fantaiying",standalone:$("subMgStandalone").checked,enable_guard:"smart"});
     if(r.code!==0){out.innerHTML='<div class="hint" style="color:var(--danger)">导入失败：'+esc(r.msg||"")+'</div>';return;}
     renderSubResult(r.data||{});
     toast("饭太硬导入完成");
@@ -2003,7 +1995,7 @@ function renderSubResult(d){
   if(lv && (lv.added||0)>0){
     h+='<div class="subgrp"><div class="subgrp-t">📺 电视直播源　新增 '+lv.added+' · 已存在 '+(lv.duplicate||0)+'</div>';
     (lv.added_names||[]).forEach(n=>{h+='<div class="subrow ok"><span>＋ '+esc(n)+'</span><span class="tag">已聚合进订阅</span></div>';});
-    h+='<div class="muted sm" style="padding:4px 2px">已并入下方「电视直播订阅」，去飞牛影视「电视直播」媒体库 URL 导入即可播放。</div></div>';
+    h+='<div class="muted sm" style="padding:4px 2px">已并入下方「📺 电视直播出口」，去飞牛影视「电视直播」媒体库 URL 导入即可播放。</div></div>';
   }
   if(lv && lv.error){h+='<div class="hint" style="color:var(--danger)">直播源写入失败：'+esc(lv.error)+'</div>';}
   // 跳过
@@ -2045,45 +2037,112 @@ async function jreq(method,p,b){
   if(b!==undefined)opt.body=JSON.stringify(b);
   const r=await fetch(p,opt);return r.json();
 }
+/* ---------- 订阅管理（导入+跟踪合一，支持编辑/删除） ---------- */
+let SUB_MG_EDIT=null;   // 当前处于编辑态的订阅 sid
+
+function subMgFmt(ts){
+  if(!ts)return "从未";
+  const diff=(Date.now()-ts*1000)/1000;
+  if(diff<60)return "刚刚";
+  if(diff<3600)return Math.floor(diff/60)+" 分钟前";
+  if(diff<86400)return Math.floor(diff/3600)+" 小时前";
+  return Math.floor(diff/86400)+" 天前";
+}
+function subMgStatus(s){
+  if(s.last_status==="ok")return '<span style="color:var(--ok,#3a9)">● 正常</span>';
+  if(s.last_status==="error")return '<span style="color:var(--danger)">● 失败×'+esc(s.fail_count||1)+'</span>'+(s.last_error?' <span class="muted sm">'+esc(s.last_error)+'</span>':'');
+  return '<span class="muted">● 未拉取</span>';
+}
+function toggleSubPaste(){
+  const w=$("subPasteWrap");if(!w)return;
+  w.style.display=(w.style.display==="none"||!w.style.display)?"block":"none";
+}
 async function loadSubMgmt(){
   const box=$("subMgList");if(!box)return;
   try{
     const r=await jget("/v/api/ext/subscriptions");
     if(r.code!==0){box.innerHTML='<div class="hint">加载失败</div>';return;}
     const subs=(r.data&&r.data.subscriptions)||[];
-    if(!subs.length){box.innerHTML='<div class="muted sm">还没有订阅源。在上方填地址添加（「按 URL 导入」只导入一次、不会登记为订阅）。</div>';return;}
+    if(!subs.length){box.innerHTML='<div class="muted sm" style="padding:8px 0">还没有订阅源。在上方填地址点「添加并更新」。</div>';return;}
     box.innerHTML=subs.map(s=>{
-      const lastTxt=s.last_update?new Date(s.last_update*1000).toLocaleString():"从未";
-      let st='<span class="muted">未拉取</span>';
-      if(s.last_status==="ok")st='<span style="color:var(--ok,#3a9)">正常</span>';
-      else if(s.last_status==="error")st='<span style="color:var(--danger)">失败×'+esc(s.fail_count||1)+'</span>'+(s.last_error?' <span class="muted sm">'+esc(s.last_error)+'</span>':'');
-      return '<div style="margin:8px 0;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:#fbfcfe">'
+      // —— 编辑态：行内表单（可改名称/URL/间隔）——
+      if(SUB_MG_EDIT===s.id){
+        return '<div style="margin:10px 0;padding:12px;border:1px dashed var(--accent);border-radius:8px;background:#fff">'
+          +'<div style="display:grid;grid-template-columns:78px 1fr;gap:8px 10px;align-items:center">'
+          +'<span class="muted sm" style="text-align:right">订阅名称</span>'
+          +'<input type="text" id="smEname" value="'+esc(s.name||"")+'"/>'
+          +'<span class="muted sm" style="text-align:right">订阅 URL</span>'
+          +'<input type="text" id="smEurl" value="'+esc(s.url||"")+'"'+(s.builtin?' disabled title="内置订阅地址不可改"':'')+'/>'
+          +'<span class="muted sm" style="text-align:right">更新间隔</span>'
+          +'<div class="row" style="gap:6px"><input type="number" id="smEiv" value="'+esc(s.update_interval_h||24)+'" min="1" max="168" style="width:80px"/><span class="muted sm">小时（1~168）</span></div>'
+          +'</div>'
+          +'<div class="btn-row" style="justify-content:flex-end;margin:10px 0 0">'
+          +'<button class="small" onclick="subMgCancelEdit()">取消</button>'
+          +'<button class="primary small" onclick="subMgSaveEdit(\''+s.id+'\')">保存</button>'
+          +'</div></div>';
+      }
+      // —— 展示态 ——
+      return '<div style="margin:10px 0;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:#fbfcfe">'
         +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
         +'<b>'+esc(s.name||s.id)+'</b>'
         +(s.builtin?'<span class="tag">内置</span>':'')
+        +(s.standalone?'<span class="tag">独立库</span>':'')
         +'<label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer"><input type="checkbox" '+(s.enabled?'checked':'')+' onchange="subMgToggle(\''+s.id+'\',this.checked)" style="width:14px;height:14px;accent-color:var(--accent)"/>启用</label>'
-        +'<span class="muted sm">间隔 <input type="number" value="'+esc(s.update_interval_h||24)+'" min="1" max="168" style="width:60px" onchange="subMgInterval(\''+s.id+'\',this.value)"/> h</span>'
-        +'<span class="muted sm">已导入 '+esc(s.source_count||0)+' 源</span>'
-        +'<span class="muted sm">上次：'+esc(lastTxt)+'</span>'
-        +'<span class="sm">'+st+'</span>'
-        +'<span style="margin-left:auto;display:flex;gap:6px">'
-        +'<button class="small" onclick="subMgRefresh(\''+s.id+'\',this)">立即拉取</button>'
+        +'<span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">'
+        +'<button class="small" onclick="subMgEdit(\''+s.id+'\')">编辑</button>'
+        +'<button class="small" onclick="subMgRefresh(\''+s.id+'\',this)">立即更新</button>'
         +'<button class="small" style="border-color:var(--danger);color:var(--danger)" onclick="subMgRemove(\''+s.id+'\')">删除</button>'
         +'</span></div>'
-        +'<div class="muted sm" style="margin-top:4px;word-break:break-all">'+esc(s.url||'')+'</div>'
+        +'<div class="muted sm" style="margin-top:6px;display:flex;gap:14px;flex-wrap:wrap">'
+        +'<span>已导入 <b style="color:var(--text)">'+esc(s.source_count||0)+'</b> 源</span>'
+        +'<span>间隔 <b style="color:var(--text)">'+esc(s.update_interval_h||24)+'</b> h</span>'
+        +'<span>上次 <b style="color:var(--text)">'+esc(subMgFmt(s.last_update))+'</b></span>'
+        +'<span>'+subMgStatus(s)+'</span>'
+        +'</div>'
+        +'<div class="muted sm" style="margin-top:4px;word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace">'+esc(s.url||'')+'</div>'
         +'</div>';
     }).join("");
   }catch(e){box.innerHTML='<div class="hint" style="color:var(--danger)">加载失败：'+esc(String(e))+'</div>';}
 }
+function subMgEdit(sid){SUB_MG_EDIT=sid;loadSubMgmt();}
+function subMgCancelEdit(){SUB_MG_EDIT=null;loadSubMgmt();}
+async function subMgSaveEdit(sid){
+  const nm=$("smEname").value.trim();
+  const el=$("smEurl"),url=el?el.value.trim():"";
+  const iv=parseInt($("smEiv").value||"24",10);
+  if(el&&!el.disabled&&!url){toast("订阅 URL 不能为空","fail");return;}
+  if(!(iv>=1&&iv<=168)){toast("间隔需在 1~168 小时","fail");return;}
+  const body={name:nm,update_interval_h:iv};
+  if(el&&!el.disabled)body.url=url;
+  try{
+    const r=await jpost("/v/api/ext/subscriptions/"+sid,body);
+    if(r.code!==0){toast(r.msg||"保存失败","fail");return;}
+    SUB_MG_EDIT=null;toast("已保存修改");loadSubMgmt();
+  }catch(e){toast("保存失败："+e,"fail");}
+}
 async function subMgAdd(){
   const name=$("subMgName").value.trim(),url=$("subMgUrl").value.trim();
   const iv=parseInt($("subMgInterval").value||"24",10);
+  const standalone=$("subMgStandalone").checked;
   if(!url){toast("请填写订阅 URL","fail");return;}
+  if(!(iv>=1&&iv<=168)){toast("间隔需在 1~168 小时","fail");return;}
   try{
-    const r=await jpost("/v/api/ext/subscriptions",{name,url,update_interval_h:iv});
+    const r=await jpost("/v/api/ext/subscriptions",{name,url,update_interval_h:iv,standalone});
     if(r.code!==0){toast(r.msg||"添加失败","fail");return;}
-    $("subMgName").value="";$("subMgUrl").value="";$("subMgInterval").value="24";
-    toast("已添加订阅");loadSubMgmt();
+    const sid=r.data&&r.data.id;
+    $("subMgName").value="";$("subMgUrl").value="";$("subMgInterval").value="24";$("subMgStandalone").checked=false;
+    loadSubMgmt();
+    if(sid){
+      toast("已添加，正在首次拉取…");
+      try{
+        const rr=await jreq("POST","/v/api/ext/subscriptions/"+sid+"/refresh",{});
+        const d=rr.data||{};
+        if(rr.code!==0)toast("首次拉取失败："+(rr.msg||"")+"（可点「立即更新」重试）","fail");
+        else toast("添加成功：CMS 新增 "+(d.cms_added||0)+" 源"+(d.live&&d.live.added?("、直播 "+(d.live.added)):""));
+      }catch(e){toast("首次拉取出错，可稍后点「立即更新」重试","fail");}
+      try{loadLiveSubscribe();}catch(e){}
+      loadSubMgmt();
+    }else toast("已添加订阅");
   }catch(e){toast("添加失败："+e,"fail");}
 }
 async function subMgToggle(sid,on){
@@ -2092,18 +2151,12 @@ async function subMgToggle(sid,on){
   }catch(e){toast("操作失败："+e,"fail");}
   loadSubMgmt();
 }
-async function subMgInterval(sid,v){
-  const iv=parseInt(v||"24",10);
-  try{const r=await jpost("/v/api/ext/subscriptions/"+sid,{update_interval_h:iv});
-    if(r.code!==0)toast(r.msg||"保存失败","fail");else toast("间隔已保存 "+iv+"h");
-  }catch(e){toast("保存失败："+e,"fail");}
-  loadSubMgmt();
-}
 async function subMgRemove(sid){
   if(!confirm("删除该订阅？\n\n只停止后续自动更新，已导入的源不会被删除。"))return;
   try{const r=await jreq("DELETE","/v/api/ext/subscriptions/"+sid);
     if(r.code!==0){toast(r.msg||"删除失败","fail");return;}toast("已删除订阅");
   }catch(e){toast("删除失败："+e,"fail");}
+  if(SUB_MG_EDIT===sid)SUB_MG_EDIT=null;
   loadSubMgmt();
 }
 async function subMgRefresh(sid,btn){

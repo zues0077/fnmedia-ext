@@ -11507,7 +11507,8 @@ async def ext_subscriptions_add(request: Request):
         if not name:
             name = {"fantaiying": "饭太硬", "cat_lite": "轻量猫源"}.get(
                 builtin, builtin)
-    ok, msg = config.add_subscription(name, url, interval, builtin=bool(builtin))
+    ok, msg = config.add_subscription(name, url, interval, builtin=bool(builtin),
+                                      standalone=bool(body.get("standalone")))
     if not ok:
         return JSONResponse({"code": 400, "msg": msg}, status_code=400)
     return {"code": 0, "msg": "已添加订阅源", "data": {"id": msg}}

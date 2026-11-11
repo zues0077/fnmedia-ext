@@ -871,8 +871,12 @@ class Config:
             return [dict(s) for s in subs if isinstance(s, dict)]
 
     def add_subscription(self, name: str, url: str, update_interval_h: int = 24,
-                         builtin: bool = False) -> tuple[bool, str]:
-        """新增一个订阅源。url 为空（纯内置）或 http(s)。重名/重 URL 拒绝。"""
+                         builtin: bool = False,
+                         standalone: bool = False) -> tuple[bool, str]:
+        """新增一个订阅源。url 为空（纯内置）或 http(s)。重名/重 URL 拒绝。
+
+        standalone=True：该订阅导入的苹果CMS源同时作为独立媒体库（后续每次
+        定时拉取也遵守此设置）。"""
         name = (name or "").strip()
         url = (url or "").strip()
         if url and not url.startswith(("http://", "https://", "builtin:")):
@@ -895,6 +899,7 @@ class Config:
                 return False, "该订阅地址已存在"
             subs.append({
                 "id": sid, "name": name, "url": url, "builtin": bool(builtin),
+                "standalone": bool(standalone),
                 "update_interval_h": interval, "enabled": True,
                 "last_update": 0, "last_status": "", "fail_count": 0,
                 "last_error": "",

@@ -458,7 +458,9 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         response = await self.client.get("/v/online-admin")
         self.assertEqual(response.status_code, 200)
-        self.assertIn("TVBox / T4", response.text)
+        # 订阅入口已三卡合一为「订阅管理」，关键元素为添加按钮与直播出口
+        self.assertIn("订阅管理", response.text)
+        self.assertIn("添加并更新", response.text)
 
     async def test_season_episode_and_play_info_retain_title_metadata_all_clients(self):
         self.detail_override = {

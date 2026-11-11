@@ -155,6 +155,21 @@ def _fetch_release_sync() -> dict | None:
                       headers={"Accept": "application/vnd.github+json",
                                "User-Agent": "fnmedia-ext-updater"}) as client:
         r = client.get(f"{API_BASE}/latest")
+        if r.status_code == 403:
+            # GitHub 未认证 API 限流（60 次/小时/IP），不是仓库或网络问题；
+            # 页面不该显示触目惊心的 "403"，给可读原因，到点自动恢复。
+            reset = r.headers.get("x-ratelimit-reset") or ""
+            hint = "请稍后自动重试"
+            try:
+                if reset:
+                    mins = max(1, int((int(reset) - time.time()) // 60) + 1)
+                    hint = f"约 {mins} 分钟后自动恢复"
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(
+                f"GitHub 接口限流（每 IP 每小时 60 次，{hint}）")
+        if r.status_code == 404:
+            raise RuntimeError("未找到 Release（仓库暂无发布版本）")
         if r.status_code != 200:
             raise RuntimeError(f"GitHub 返回 {r.status_code}")
         return r.json()

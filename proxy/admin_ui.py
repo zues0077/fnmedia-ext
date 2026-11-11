@@ -410,13 +410,13 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div class="card-title">各源实测表现 <span class="badge" id="prioCount"></span>
           <span style="margin-left:auto" class="muted sm">只读 · 随搜索/播放自动累积</span>
         </div>
-        <p class="card-sub">匹配率＝搜索结果里标题真含关键词的比例；成功率/延迟来自实际搜索；分级 健康/慢/高失败/熔断。样本不足时显示「—」，不参与排序惩罚（按中性值处理）。</p>
+        <p class="card-sub">匹配率＝搜索结果里标题真含关键词的比例；成功率/延迟来自实际搜索；分级 健康/慢/高失败/熔断。样本不足时显示「—」，不参与排序惩罚（按中性值处理）。<strong>置顶</strong>＝永远排最前，<strong>屏蔽</strong>＝沉到最后（不删源、仍参与搜索）；两者互斥。</p>
         <div class="row" style="margin-bottom:8px">
           <input type="text" id="qhFilter" placeholder="筛选源名 / 地址…" style="flex:1;max-width:280px" oninput="renderQuality()"/>
         </div>
         <table>
-          <thead><tr><th>资源站</th><th style="width:86px">匹配率</th><th style="width:86px">成功率</th><th style="width:80px">平均延迟</th><th style="width:76px">状态</th></tr></thead>
-          <tbody id="prioRows"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+          <thead><tr><th>资源站</th><th style="width:80px">匹配率</th><th style="width:76px">成功率</th><th style="width:76px">平均延迟</th><th style="width:70px">状态</th><th style="width:104px">干预</th></tr></thead>
+          <tbody id="prioRows"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -1517,6 +1517,8 @@ function renderQuality(){
   if(!STATUS)return;
   $("preferQ").checked=CFG.prefer_quality_source!==false;
   const health=STATUS.source_health||{};
+  const pinned=new Set(STATUS.source_pinned||[]);
+  const blocked=new Set(STATUS.source_blocked||[]);
   const srcs=CFG.sources||[];
   const q=($("qhFilter")?$("qhFilter").value:"").trim().toLowerCase();
   const list=srcs.filter(s=>!q
@@ -1535,12 +1537,36 @@ function renderQuality(){
     else if(g===1)gs='<span style="color:var(--warn,#d97706)">慢</span>';
     else if(g===2)gs='<span style="color:var(--err,#d64545)">高失败</span>';
     else if(g===3)gs='<span style="color:var(--err,#d64545)">熔断</span>';
+    const isPin=pinned.has(s.id), isBlk=blocked.has(s.id);
     return `<tr>
-      <td><div style="font-weight:500">${esc(s.name)} ${s.enabled?'':'<span class="muted sm">(停用)</span>'}</div>
+      <td><div style="font-weight:500">${esc(s.name)} ${s.enabled?'':'<span class="muted sm">(停用)</span>'}
+        ${isPin?'<span class="tag">置顶</span>':''}${isBlk?'<span class="tag amber">屏蔽</span>':''}</div>
         <div class="meta">${esc(s.api)}</div></td>
-      <td>${mrs}</td><td>${srs}</td><td>${lats}</td><td>${gs}</td></tr>`;
+      <td>${mrs}</td><td>${srs}</td><td>${lats}</td><td>${gs}</td>
+      <td style="white-space:nowrap">
+        <button class="small" style="${isPin?'border-color:var(--accent);color:var(--accent)':''}"
+          onclick="toggleSourcePin('${s.id}',${isPin?'false':'true'})" title="置顶：搜索结果永远排最前">${isPin?'★':'☆'}</button>
+        <button class="small" style="${isBlk?'border-color:var(--danger);color:var(--danger)':''}"
+          onclick="toggleSourceBlock('${s.id}',${isBlk?'false':'true'})" title="屏蔽：搜索结果沉到最后（不删源）">⊘</button>
+      </td></tr>`;
   }).join("");
-  $("prioRows").innerHTML=rows||'<tr><td colspan="5" class="muted">暂无源</td></tr>';
+  $("prioRows").innerHTML=rows||'<tr><td colspan="6" class="muted">暂无源</td></tr>';
+}
+async function toggleSourcePin(sid,on){
+  try{
+    const r=await jpost("/v/api/ext/source/pin",{id:sid,on:on});
+    if(r.code!==0){toast(r.msg||"操作失败","fail");return;}
+    toast(on?"已置顶":"已取消置顶");
+    await loadStatus();renderQuality();
+  }catch(e){toast("操作失败："+e,"fail");}
+}
+async function toggleSourceBlock(sid,on){
+  try{
+    const r=await jpost("/v/api/ext/source/block",{id:sid,on:on});
+    if(r.code!==0){toast(r.msg||"操作失败","fail");return;}
+    toast(on?"已屏蔽（沉底，不删源）":"已取消屏蔽");
+    await loadStatus();renderQuality();
+  }catch(e){toast("操作失败："+e,"fail");}
 }
 async function savePreferQ(){
   const r=await jpost("/v/api/ext/config",{prefer_quality_source:$("preferQ").checked});

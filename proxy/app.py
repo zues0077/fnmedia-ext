@@ -3018,19 +3018,29 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
     prefer_q = bool(config.get().get("prefer_quality_source", True))
     auto_best = bool(config.get().get("auto_best_source", True))
     _now_h = time.time()
+    try:
+        _pinned = config.pinned_ids()
+        _blocked = config.blocked_ids()
+    except Exception:  # noqa: BLE001
+        _pinned, _blocked = set(), set()
 
     def _group_key(g) -> tuple:
         lines_n = sum(len(v) for v in g["lines"].values())
         any_line = next(iter(g["lines"].keys()), "")
-        sk = sourcehealth.source_key_of(any_line) or g["rep"].provider
+        sid_rep = g["rep"].provider
+        sk = sourcehealth.source_key_of(any_line) or sid_rep
         mr = sourcehealth.match_rate(sk) if (prefer_q and sk) else None
         mr_key = 0.5 if mr is None else mr
         rel = int(g.get("rel", 0))
+        # 人工干预（互斥、仅两档）：置顶排最前，屏蔽沉最后；其余全由实测决定
+        pin_rank = 1 if sid_rep in _pinned else 0
+        blk_rank = -1 if sid_rep in _blocked else 0
         if auto_best:
             grade, avg_lat, fail = (sourcehealth.weight(sk, _now_h) if sk
                                     else (1, 5.0, 1.0))
-            return (rel, mr_key, -grade, lines_n, -fail, -avg_lat)
-        return (rel, mr_key, lines_n)
+            return (pin_rank, blk_rank, rel, mr_key, -grade, lines_n,
+                    -fail, -avg_lat)
+        return (pin_rank, blk_rank, rel, mr_key, lines_n)
 
     ordered = sorted(groups.values(), key=_group_key, reverse=True)[:maxn]
     briefs = []
@@ -10607,12 +10617,20 @@ async def ext_status(request: Request):
         health_snap = sourcehealth.snapshot()
     except Exception:  # noqa: BLE001
         health_snap = {}
+    try:
+        pinned = sorted(config.pinned_ids())
+        blocked = sorted(config.blocked_ids())
+    except Exception:  # noqa: BLE001
+        pinned, blocked = [], []
     return {"ok": True,
             "build": BUILD_LABEL,
             "config": {k: v for k, v in config.get().items() if k != "admin_token"},
             "source_priority": priorities,
             # 实测源画像（匹配率/成功率/延迟/分级），供「片源质量」页只读展示
             "source_health": health_snap,
+            # 人工排序干预（互斥两项）
+            "source_pinned": pinned,
+            "source_blocked": blocked,
             "cached_titles": len(store._titles),
             "hot": hot_cache.status(),
             "charts": chart_cache.status(),
@@ -10798,6 +10816,40 @@ async def ext_source_priority(request: Request):
         config.save({"prefer_quality_source": bool(body["prefer_quality_source"])})
     return {"code": 0 if ok else 400, "msg": msg,
             "data": {"source_priority": config.source_priorities()}}
+
+
+@app.post("/v/api/ext/source/pin")
+async def ext_source_pin(request: Request):
+    """置顶某个源（搜索结果永远最前）。与「屏蔽」互斥。"""
+    body = await request.json()
+    sid = str(body.get("id") or "").strip()
+    on = bool(body.get("on"))
+    ok, msg = config.set_source_pin(sid, on)
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    try:
+        _search_cache.clear(); _AGG_CACHE.clear()
+    except Exception:  # noqa: BLE001
+        pass
+    return {"code": 0, "msg": "已置顶" if on else "已取消置顶",
+            "data": {"pinned": sorted(config.pinned_ids())}}
+
+
+@app.post("/v/api/ext/source/block")
+async def ext_source_block(request: Request):
+    """屏蔽某个源（搜索结果沉底，不删源、仍参与搜索）。与「置顶」互斥。"""
+    body = await request.json()
+    sid = str(body.get("id") or "").strip()
+    on = bool(body.get("on"))
+    ok, msg = config.set_source_block(sid, on)
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    try:
+        _search_cache.clear(); _AGG_CACHE.clear()
+    except Exception:  # noqa: BLE001
+        pass
+    return {"code": 0, "msg": "已屏蔽" if on else "已取消屏蔽",
+            "data": {"blocked": sorted(config.blocked_ids())}}
 
 
 def _virtual_lib_list() -> list[dict]:

@@ -234,6 +234,11 @@ DEFAULTS = {
     # 源质量优先级：source_id -> 权重（越高越优先）。未列出的源取内省默认（见
     # providers.source_priority）。热门榜单点击搜源时按 (优先级, 直链数) 排序。
     "source_priority": {},
+    # 人工排序干预（替代已废弃的 100 级权重表，仅两个动作、互斥）：
+    #   source_pinned  ：置顶，搜索结果永远排最前
+    #   source_blocked ：屏蔽，搜索结果沉到最后（仍参与搜索，不删源）
+    "source_pinned": [],
+    "source_blocked": [],
     # 热门资源解析是否优先高质量源（关闭则只按可播直链数）
     "prefer_quality_source": True,
     # 自动优选（上游 v0.2.47）：在源质量权重基础上，叠加实测健康度（死亡/高失败率/
@@ -855,6 +860,66 @@ class Config:
                     except (TypeError, ValueError):
                         continue
             cfg["source_priority"] = out
+            self._persist(cfg)
+            return True, "ok"
+
+    # ---------------- 人工排序干预：置顶 / 屏蔽（互斥，替代 100 级权重表） ----------------
+
+    def pinned_ids(self) -> set:
+        """置顶的源 id 集合。"""
+        self.maybe_reload()
+        with _LOCK:
+            return {x for x in (self._cfg.get("source_pinned") or [])
+                    if isinstance(x, str) and x}
+
+    def blocked_ids(self) -> set:
+        """被屏蔽（沉底）的源 id 集合。"""
+        self.maybe_reload()
+        with _LOCK:
+            return {x for x in (self._cfg.get("source_blocked") or [])
+                    if isinstance(x, str) and x}
+
+    def set_source_pin(self, sid: str, on: bool) -> tuple[bool, str]:
+        """置顶：搜索结果永远排最前。与「屏蔽」互斥（置顶会取消屏蔽）。"""
+        sid = (sid or "").strip()
+        if not sid:
+            return False, "缺少源 id"
+        with _LOCK:
+            cfg = self.get()
+            pin = [x for x in (cfg.get("source_pinned") or [])
+                   if isinstance(x, str) and x]
+            blk = [x for x in (cfg.get("source_blocked") or [])
+                   if isinstance(x, str) and x]
+            if on:
+                if sid not in pin:
+                    pin.append(sid)
+                blk = [x for x in blk if x != sid]
+            else:
+                pin = [x for x in pin if x != sid]
+            cfg["source_pinned"] = pin
+            cfg["source_blocked"] = blk
+            self._persist(cfg)
+            return True, "ok"
+
+    def set_source_block(self, sid: str, on: bool) -> tuple[bool, str]:
+        """屏蔽：搜索结果沉到最后（仍参与搜索，不删源）。与「置顶」互斥。"""
+        sid = (sid or "").strip()
+        if not sid:
+            return False, "缺少源 id"
+        with _LOCK:
+            cfg = self.get()
+            pin = [x for x in (cfg.get("source_pinned") or [])
+                   if isinstance(x, str) and x]
+            blk = [x for x in (cfg.get("source_blocked") or [])
+                   if isinstance(x, str) and x]
+            if on:
+                if sid not in blk:
+                    blk.append(sid)
+                pin = [x for x in pin if x != sid]
+            else:
+                blk = [x for x in blk if x != sid]
+            cfg["source_pinned"] = pin
+            cfg["source_blocked"] = blk
             self._persist(cfg)
             return True, "ok"
 

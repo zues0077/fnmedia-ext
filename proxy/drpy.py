@@ -183,6 +183,16 @@ def play(site: dict, flag: str, vid: str) -> dict:
     return res if isinstance(res, dict) else {"url": str(res)}
 
 
+def sniffer(site: dict) -> dict:
+    """端上嗅探（斗鱼等 lazy:"" + sniffer:1 + play_parse 的站点）。
+
+    sidecar 的 sniffer 方法无参数（见 assets/drpy/sidecar.mjs 分发层），
+    返回站点规则自己声明的嗅探结果；调用方应在 play 返回非直链时用它兜底。
+    """
+    res = _call(site, "sniffer", [])
+    return res if isinstance(res, dict) else {"url": str(res)}
+
+
 # ---------------- 远程 drpyS 订阅源（type=3、规则在 http URL） ----------------
 
 def _read_remote_registry() -> dict:

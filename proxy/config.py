@@ -149,6 +149,10 @@ DEFAULTS = {
     "sources": [dict(s) for s in DEFAULT_SOURCES],
     # 被删除的内置源 id（自定义源删除时直接从 sources 移除）
     "removed_ids": [],
+    # 订阅源管理：多个订阅 URL，各自可设更新间隔，后台定时拉取只增不减。
+    # 每项：{id, name, url, builtin, update_interval_h, enabled, last_update,
+    #       last_status, fail_count, last_error}
+    "subscriptions": [],
     "max_per_keyword": 12,
     "filter_junk": True,
     "junk_keywords": JUNK_KEYWORDS,
@@ -454,7 +458,7 @@ class Config:
                 m["guard_key"] = s.get("guard_key", "") if features.GUARD else ""
                 # <<< PRIVATE:GUARD
                 m["builtin"] = bool(s.get("builtin", False))
-                for key in ("kind", "site_key", "ext", "searchable", "filterable", "indexs", "method", "live"):
+                for key in ("kind", "site_key", "ext", "searchable", "filterable", "indexs", "method", "sub_id", "live"):
                     if key in s:
                         m[key] = s[key]
                 merged.append(m)
@@ -690,7 +694,7 @@ class Config:
         return "custom_" + hashlib.md5(api.strip().encode()).hexdigest()[:10]
 
     def add_source(self, name: str, api: str, enabled: bool = True,
-                   standalone: bool = False) -> tuple[bool, str]:
+                   standalone: bool = False, sub_id: str = "") -> tuple[bool, str]:
         with _LOCK:
             cfg = self.get()
             api = (api or "").strip()
@@ -713,6 +717,8 @@ class Config:
             entry = {"id": sid, "name": name, "api": api,
                      "enabled": bool(enabled), "standalone": bool(standalone),
                      "builtin": False}
+            if sub_id:
+                entry["sub_id"] = sub_id
             cfg["sources"].append(entry)
             self._persist(cfg)
             return True, sid
@@ -785,7 +791,7 @@ class Config:
             return {"candidates": len(sources), "added": len(added),
                     "added_names": added, "duplicate": duplicate}
 
-    def import_live_sources(self, sources: list[dict]) -> dict:
+    def import_live_sources(self, sources: list[dict], sub_id: str = "") -> dict:
         """导入 m3u8 直播源（LunaTV lives / 资源站电视直播源）。
 
         live 源以 kind="live" + live=True 标记入库，与 CMS/T4 源区分；
@@ -818,6 +824,8 @@ class Config:
                     entry["ua"] = str(it["ua"]).strip()
                 if it.get("epg"):
                     entry["epg"] = str(it["epg"]).strip()
+                if sub_id:
+                    entry["sub_id"] = sub_id
                 cfg["sources"].append(entry)
                 existing_ids.add(sid)
                 existing_urls.add(url)
@@ -849,6 +857,118 @@ class Config:
             cfg["source_priority"] = out
             self._persist(cfg)
             return True, "ok"
+
+    # ---------------- 订阅源管理（多订阅 URL，各自定时更新，只增不减） ----------------
+
+    @staticmethod
+    def make_subscription_id(url: str) -> str:
+        return "sub_" + hashlib.md5(url.strip().encode()).hexdigest()[:10]
+
+    def subscriptions(self) -> list[dict]:
+        self.maybe_reload()
+        with _LOCK:
+            subs = self._cfg.get("subscriptions") or []
+            return [dict(s) for s in subs if isinstance(s, dict)]
+
+    def add_subscription(self, name: str, url: str, update_interval_h: int = 24,
+                         builtin: bool = False) -> tuple[bool, str]:
+        """新增一个订阅源。url 为空（纯内置）或 http(s)。重名/重 URL 拒绝。"""
+        name = (name or "").strip()
+        url = (url or "").strip()
+        if url and not url.startswith(("http://", "https://", "builtin:")):
+            return False, "订阅地址需以 http(s):// 开头"
+        if not name:
+            name = "订阅源"
+        try:
+            interval = int(update_interval_h)
+        except (TypeError, ValueError):
+            interval = 24
+        interval = max(1, min(interval, 24 * 7))  # 1h ~ 7天
+        with _LOCK:
+            cfg = self.get()
+            subs = cfg.get("subscriptions") or []
+            sid = self.make_subscription_id(url) if url else "sub_" + hashlib.md5(
+                name.encode()).hexdigest()[:10]
+            if any(s.get("id") == sid for s in subs):
+                return False, "该订阅已存在"
+            if url and any((s.get("url") or "").strip() == url for s in subs):
+                return False, "该订阅地址已存在"
+            subs.append({
+                "id": sid, "name": name, "url": url, "builtin": bool(builtin),
+                "update_interval_h": interval, "enabled": True,
+                "last_update": 0, "last_status": "", "fail_count": 0,
+                "last_error": "",
+            })
+            cfg["subscriptions"] = subs
+            self._persist(cfg)
+            return True, sid
+
+    def update_subscription(self, sid: str, *, name: str | None = None,
+                            url: str | None = None,
+                            update_interval_h: int | None = None,
+                            enabled: bool | None = None) -> tuple[bool, str]:
+        """编辑订阅源：改名/改址/改间隔/启停。"""
+        with _LOCK:
+            cfg = self.get()
+            subs = cfg.get("subscriptions") or []
+            target = next((s for s in subs if s.get("id") == sid), None)
+            if not target:
+                return False, "订阅不存在"
+            if name is not None:
+                nm = str(name).strip()
+                if nm:
+                    target["name"] = nm
+            if url is not None:
+                u = str(url).strip()
+                if u and not u.startswith(("http://", "https://", "builtin:")):
+                    return False, "订阅地址需以 http(s):// 开头"
+                if u and any((s.get("url") or "").strip() == u
+                             for s in subs if s.get("id") != sid):
+                    return False, "该订阅地址已存在"
+                target["url"] = u
+            if update_interval_h is not None:
+                try:
+                    interval = int(update_interval_h)
+                except (TypeError, ValueError):
+                    interval = 24
+                target["update_interval_h"] = max(1, min(interval, 24 * 7))
+            if enabled is not None:
+                target["enabled"] = bool(enabled)
+            cfg["subscriptions"] = subs
+            self._persist(cfg)
+            return True, "ok"
+
+    def remove_subscription(self, sid: str) -> tuple[bool, str]:
+        """删除订阅源（不删除它已导入的源；只停止后续更新）。"""
+        with _LOCK:
+            cfg = self.get()
+            subs = cfg.get("subscriptions") or []
+            if not any(s.get("id") == sid for s in subs):
+                return False, "订阅不存在"
+            cfg["subscriptions"] = [s for s in subs if s.get("id") != sid]
+            self._persist(cfg)
+            return True, "ok"
+
+    def mark_subscription_update(self, sid: str, ok: bool, error: str = "") -> None:
+        """记录一次订阅拉取结果（更新 last_update/last_status/fail_count）。"""
+        import time as _time
+        with _LOCK:
+            cfg = self.get()
+            subs = cfg.get("subscriptions") or []
+            target = next((s for s in subs if s.get("id") == sid), None)
+            if not target:
+                return
+            target["last_update"] = int(_time.time())
+            if ok:
+                target["last_status"] = "ok"
+                target["fail_count"] = 0
+                target["last_error"] = ""
+            else:
+                target["last_status"] = "error"
+                target["fail_count"] = int(target.get("fail_count", 0)) + 1
+                target["last_error"] = str(error)[:200]
+            cfg["subscriptions"] = subs
+            self._persist(cfg, backup=False)
 
     def set_subscription_proxy(self, proxy_url: str) -> tuple[bool, str]:
         """保存「订阅资源抓取」专用代理（空串=直连）。仅用于订阅配置/jar/DRPY脚本，
@@ -991,6 +1111,49 @@ class Config:
             cfg["removed_ids"] = []
             self._persist(cfg)
             self.load()
+            return True, "ok"
+
+    # ---------------- 定期体检（失效三次停用/删除） ----------------
+
+    def sys_disable_source(self, sid: str) -> tuple[bool, str]:
+        """系统体检停用源：置 enabled=False 并打 sys_disabled 标记。
+        与用户手动停用（enabled=False 无标记）区分，恢复时系统可自动启用。"""
+        with _LOCK:
+            cfg = self.get()
+            target = next((s for s in cfg["sources"] if s["id"] == sid), None)
+            if not target:
+                return False, "源不存在"
+            target["enabled"] = False
+            target["sys_disabled"] = True
+            self._persist(cfg)
+            return True, "ok"
+
+    def sys_enable_source(self, sid: str) -> tuple[bool, str]:
+        """系统恢复源（体检发现复活）：清除 sys_disabled 标记并启用。
+        仅对系统停用的源生效；用户手动停用的源（无 sys_disabled）不动。"""
+        with _LOCK:
+            cfg = self.get()
+            target = next((s for s in cfg["sources"] if s["id"] == sid), None)
+            if not target:
+                return False, "源不存在"
+            if not target.get("sys_disabled"):
+                return False, "该源非系统停用"
+            target["enabled"] = True
+            target["sys_disabled"] = False
+            self._persist(cfg)
+            return True, "ok"
+
+    def sys_remove_source(self, sid: str) -> tuple[bool, str]:
+        """系统体检删除源（仅订阅/自定义源，内置源永不删）。"""
+        with _LOCK:
+            cfg = self.get()
+            target = next((s for s in cfg["sources"] if s["id"] == sid), None)
+            if not target:
+                return False, "源不存在"
+            if target.get("builtin"):
+                return False, "内置源不可删除"
+            cfg["sources"] = [s for s in cfg["sources"] if s["id"] != sid]
+            self._persist(cfg)
             return True, "ok"
 
     @staticmethod

@@ -578,6 +578,18 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div id="liveSubInfo" class="muted sm">正在加载…</div>
       </div>
 
+      <div class="card" style="margin-top:14px">
+        <div class="card-title">📚 订阅源管理 <button class="small" style="float:right" onclick="loadSubMgmt()">刷新</button></div>
+        <p class="card-sub">添加多个订阅地址，各自设定时更新间隔（1~168 小时，默认 24h）。后台到点自动拉取，<strong>只增不减</strong>：只补充库里还没有的新源，绝不覆盖你手动启用/改名/停用过的源。定期体检失效 3 次的源：内置源停用、订阅/自定义源删除。</p>
+        <div class="row" style="margin:8px 0;gap:8px;flex-wrap:wrap;align-items:center">
+          <input type="text" id="subMgName" placeholder="订阅名称（可留空）" style="flex:1;min-width:130px"/>
+          <input type="text" id="subMgUrl" placeholder="订阅 URL（http/https）" style="flex:2;min-width:200px"/>
+          <input type="number" id="subMgInterval" value="24" min="1" max="168" title="更新间隔（小时）" style="width:78px"/>
+          <button class="primary small" onclick="subMgAdd()">添加订阅</button>
+        </div>
+        <div id="subMgList"><div class="muted sm">点击「刷新」加载。</div></div>
+      </div>
+
       <!-- >>> PRIVATE:SPIDER -->
       <div class="card" style="margin-top:14px">
         <div class="card-title">已导入的爬虫源 <button class="small" style="float:right" onclick="loadSpiderMgmt()">刷新</button></div>
@@ -961,7 +973,7 @@ async function switchPage(page){
   // >>> PRIVATE:GUARD
   if(page==="pan"){const f=$("panFrame");if(f&&!f.src)f.src=f.dataset.src;}
   // <<< PRIVATE:GUARD
-  if(page==="importsub"){try{if(!CFG)await loadStatus();}catch(e){}try{if(typeof initSubProxy==="function")initSubProxy();}catch(e){}try{loadAdfilter();}catch(e){}try{if(typeof loadSpiderMgmt==="function")loadSpiderMgmt();}catch(e){}try{if(typeof loadDrpyMgmt==="function")loadDrpyMgmt();}catch(e){}try{loadLiveSubscribe();}catch(e){}}
+  if(page==="importsub"){try{if(!CFG)await loadStatus();}catch(e){}try{if(typeof initSubProxy==="function")initSubProxy();}catch(e){}try{loadAdfilter();}catch(e){}try{if(typeof loadSpiderMgmt==="function")loadSpiderMgmt();}catch(e){}try{if(typeof loadDrpyMgmt==="function")loadDrpyMgmt();}catch(e){}try{loadLiveSubscribe();}catch(e){}try{loadSubMgmt();}catch(e){}}
   if(page==="about"){loadUpdate(false);try{loadAdminToken();}catch(e){}}
 }
 $$("[data-page]").forEach(b=>b.addEventListener("click",()=>switchPage(b.dataset.page)));
@@ -2026,6 +2038,84 @@ function copyLiveSubscribe(){
   const v=inp.value;
   if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(v).then(()=>toast("已复制订阅地址"),()=>toast("复制失败，请手动选中复制","fail"));}
   else{inp.select();document.execCommand("copy");toast("已复制订阅地址");}
+}
+/* ---------- 订阅源管理（多订阅 URL，定时拉取，只增不减） ---------- */
+async function jreq(method,p,b){
+  const opt={method,headers:{"Content-Type":"application/json"}};
+  if(b!==undefined)opt.body=JSON.stringify(b);
+  const r=await fetch(p,opt);return r.json();
+}
+async function loadSubMgmt(){
+  const box=$("subMgList");if(!box)return;
+  try{
+    const r=await jget("/v/api/ext/subscriptions");
+    if(r.code!==0){box.innerHTML='<div class="hint">加载失败</div>';return;}
+    const subs=(r.data&&r.data.subscriptions)||[];
+    if(!subs.length){box.innerHTML='<div class="muted sm">还没有订阅源。在上方填地址添加（「按 URL 导入」只导入一次、不会登记为订阅）。</div>';return;}
+    box.innerHTML=subs.map(s=>{
+      const lastTxt=s.last_update?new Date(s.last_update*1000).toLocaleString():"从未";
+      let st='<span class="muted">未拉取</span>';
+      if(s.last_status==="ok")st='<span style="color:var(--ok,#3a9)">正常</span>';
+      else if(s.last_status==="error")st='<span style="color:var(--danger)">失败×'+esc(s.fail_count||1)+'</span>'+(s.last_error?' <span class="muted sm">'+esc(s.last_error)+'</span>':'');
+      return '<div style="margin:8px 0;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:#fbfcfe">'
+        +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+        +'<b>'+esc(s.name||s.id)+'</b>'
+        +(s.builtin?'<span class="tag">内置</span>':'')
+        +'<label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer"><input type="checkbox" '+(s.enabled?'checked':'')+' onchange="subMgToggle(\''+s.id+'\',this.checked)" style="width:14px;height:14px;accent-color:var(--accent)"/>启用</label>'
+        +'<span class="muted sm">间隔 <input type="number" value="'+esc(s.update_interval_h||24)+'" min="1" max="168" style="width:60px" onchange="subMgInterval(\''+s.id+'\',this.value)"/> h</span>'
+        +'<span class="muted sm">已导入 '+esc(s.source_count||0)+' 源</span>'
+        +'<span class="muted sm">上次：'+esc(lastTxt)+'</span>'
+        +'<span class="sm">'+st+'</span>'
+        +'<span style="margin-left:auto;display:flex;gap:6px">'
+        +'<button class="small" onclick="subMgRefresh(\''+s.id+'\',this)">立即拉取</button>'
+        +'<button class="small" style="border-color:var(--danger);color:var(--danger)" onclick="subMgRemove(\''+s.id+'\')">删除</button>'
+        +'</span></div>'
+        +'<div class="muted sm" style="margin-top:4px;word-break:break-all">'+esc(s.url||'')+'</div>'
+        +'</div>';
+    }).join("");
+  }catch(e){box.innerHTML='<div class="hint" style="color:var(--danger)">加载失败：'+esc(String(e))+'</div>';}
+}
+async function subMgAdd(){
+  const name=$("subMgName").value.trim(),url=$("subMgUrl").value.trim();
+  const iv=parseInt($("subMgInterval").value||"24",10);
+  if(!url){toast("请填写订阅 URL","fail");return;}
+  try{
+    const r=await jpost("/v/api/ext/subscriptions",{name,url,update_interval_h:iv});
+    if(r.code!==0){toast(r.msg||"添加失败","fail");return;}
+    $("subMgName").value="";$("subMgUrl").value="";$("subMgInterval").value="24";
+    toast("已添加订阅");loadSubMgmt();
+  }catch(e){toast("添加失败："+e,"fail");}
+}
+async function subMgToggle(sid,on){
+  try{const r=await jpost("/v/api/ext/subscriptions/"+sid,{enabled:on});
+    if(r.code!==0)toast(r.msg||"操作失败","fail");else toast(on?"已启用":"已停用");
+  }catch(e){toast("操作失败："+e,"fail");}
+  loadSubMgmt();
+}
+async function subMgInterval(sid,v){
+  const iv=parseInt(v||"24",10);
+  try{const r=await jpost("/v/api/ext/subscriptions/"+sid,{update_interval_h:iv});
+    if(r.code!==0)toast(r.msg||"保存失败","fail");else toast("间隔已保存 "+iv+"h");
+  }catch(e){toast("保存失败："+e,"fail");}
+  loadSubMgmt();
+}
+async function subMgRemove(sid){
+  if(!confirm("删除该订阅？\n\n只停止后续自动更新，已导入的源不会被删除。"))return;
+  try{const r=await jreq("DELETE","/v/api/ext/subscriptions/"+sid);
+    if(r.code!==0){toast(r.msg||"删除失败","fail");return;}toast("已删除订阅");
+  }catch(e){toast("删除失败："+e,"fail");}
+  loadSubMgmt();
+}
+async function subMgRefresh(sid,btn){
+  const t=btn&&btn.textContent;if(btn){btn.disabled=true;btn.textContent="拉取中…";}
+  try{
+    const r=await jreq("POST","/v/api/ext/subscriptions/"+sid+"/refresh",{});
+    const d=r.data||{};
+    if(r.code!==0)toast(r.msg||"拉取失败","fail");
+    else toast("拉取完成：CMS 新增 "+(d.cms_added||0)+" 源"+(d.live&&d.live.added?("、直播 "+(d.live.added)):""));
+    loadSubMgmt();
+  }catch(e){toast("拉取失败："+e,"fail");}
+  finally{if(btn){btn.disabled=false;btn.textContent=t;}}
 }
 // ---------- 已导入普通爬虫源管理 ----------
 /* >>> PRIVATE:SPIDER */

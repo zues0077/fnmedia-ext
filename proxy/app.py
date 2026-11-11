@@ -2280,6 +2280,22 @@ async def lifespan(app: FastAPI):
     app.state.update_task = asyncio.create_task(
         updater.periodic_loop(app.state.stop_update))
 
+    # 订阅源定时拉取（多订阅 URL，各自间隔，只增不减）
+    import subsched
+    async def _subsched_changed():
+        _search_cache.clear(); _AGG_CACHE.clear()
+        _schedule_routes_refresh()
+    subsched.set_change_hook(_subsched_changed)
+    app.state.stop_subsched = asyncio.Event()
+    app.state.subsched_task = asyncio.create_task(
+        subsched.periodic_loop(app.state.stop_subsched))
+
+    # 定期体检（6h 一轮，连续 3 次失效：内置源停用、订阅/自定义源删除）
+    import healthcheck
+    app.state.stop_healthcheck = asyncio.Event()
+    app.state.healthcheck_task = asyncio.create_task(
+        healthcheck.periodic_loop(app.state.stop_healthcheck))
+
     # >>> PRIVATE:GUARD
     # redroid 加固运行时：常驻模式下插件/开机自启并后台保活（仅启用 guard 特性时）
     try:
@@ -2338,6 +2354,18 @@ async def lifespan(app: FastAPI):
             app.state.stop_update.set()
             app.state.update_task.cancel()
             await app.state.update_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        try:
+            app.state.stop_subsched.set()
+            app.state.subsched_task.cancel()
+            await app.state.subsched_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        try:
+            app.state.stop_healthcheck.set()
+            app.state.healthcheck_task.cancel()
+            await app.state.healthcheck_task
         except (asyncio.CancelledError, Exception):
             pass
         await t4_media.metadata.close()
@@ -7634,6 +7662,15 @@ def _drpy_source_for(picked: dict) -> dict | None:
     return None
 
 
+_DRPY_MEDIA_EXT = (".m3u8", ".mp4", ".flv", ".ts", ".mkv", ".avi", ".m4a", ".mp3")
+
+
+def _is_media_direct(url: str) -> bool:
+    """URL 的 path 是否以媒体扩展名结尾（判断 drpy play 返回的是直链还是播放页）。"""
+    p = str(url or "").split("?", 1)[0].lower()
+    return any(p.endswith(ext) for ext in _DRPY_MEDIA_EXT)
+
+
 async def _resolve_drpy(picked: dict) -> bool:
     """drpyS JS 爬虫：用 Node sidecar 的 playerContent 解析真实播放地址。"""
     vid = picked.get("url", "")
@@ -7650,6 +7687,25 @@ async def _resolve_drpy(picked: dict) -> bool:
         res = await asyncio.to_thread(drpy.play, site, flag, vid)
         url = (res or {}).get("url", "")
         if not url:
+            return False
+        # 斗鱼等 lazy:"" + sniffer:1 + play_parse 站点：play 只返回播放页 URL，
+        # 需再调 sidecar 的 sniffer 拿真实流地址（sidecar 分发层已支持该方法）。
+        # 注意：部分站点 sniffer 只返回布尔标记（如 true）表示「需端上嗅探」，
+        # 不是流地址——只有合法 http(s) 地址才采纳。
+        if not _is_media_direct(url):
+            try:
+                sn = await asyncio.to_thread(drpy.sniffer, site)
+                if isinstance(sn, dict):
+                    sn_url = str(sn.get("url") or "").strip()
+                    if sn_url.startswith(("http://", "https://")):
+                        url = sn_url
+                        if sn.get("header") and not res.get("header"):
+                            res = {**res, "header": sn.get("header")}
+            except Exception:  # noqa: BLE001
+                pass  # 嗅探失败：保留 play 原值
+        # 最终仍不是合法播放地址（如斗鱼只返回需端上嗅探的标记）：解析失败，
+        # 交由上层降级提示，避免把 "True" 之类当直链去代理。
+        if not url.startswith(("http://", "https://")):
             return False
         picked["url"] = url
         picked["drpy"] = False
@@ -11422,6 +11478,73 @@ async def ext_import_tvbox(request: Request):
     }}
 
 
+# ---------------- 订阅源管理（多订阅 URL，定时更新，只增不减） ----------------
+
+@app.get("/v/api/ext/subscriptions")
+async def ext_subscriptions_list(request: Request):
+    """列出所有订阅源 + 各自当前导入的源数量。"""
+    subs = config.subscriptions()
+    srcs = config.all_sources()
+    for s in subs:
+        sid = s.get("id")
+        s["source_count"] = sum(
+            1 for x in srcs if x.get("sub_id") == sid)
+    return {"code": 0, "msg": "", "data": {"subscriptions": subs}}
+
+
+@app.post("/v/api/ext/subscriptions")
+async def ext_subscriptions_add(request: Request):
+    """新增订阅源。可传 url（http(s)）或 builtin 标识（如 fantaiying/cat_lite）。"""
+    body = await request.json()
+    name = str(body.get("name") or "").strip()
+    url = str(body.get("url") or "").strip()
+    builtin = str(body.get("builtin") or "").strip().lower()
+    interval = body.get("update_interval_h", 24)
+
+    if builtin and not url:
+        # 内置订阅：url 存 builtin: 前缀标识
+        url = "builtin:" + builtin
+        if not name:
+            name = {"fantaiying": "饭太硬", "cat_lite": "轻量猫源"}.get(
+                builtin, builtin)
+    ok, msg = config.add_subscription(name, url, interval, builtin=bool(builtin))
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    return {"code": 0, "msg": "已添加订阅源", "data": {"id": msg}}
+
+
+@app.post("/v/api/ext/subscriptions/{sid}")
+async def ext_subscriptions_update(sid: str, request: Request):
+    body = await request.json()
+    kwargs = {}
+    for key in ("name", "url", "update_interval_h", "enabled"):
+        if key in body:
+            kwargs[key] = body[key]
+    if not kwargs:
+        return JSONResponse({"code": 400, "msg": "无更新字段"}, status_code=400)
+    ok, msg = config.update_subscription(sid, **kwargs)
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    return {"code": 0, "msg": "已更新", "data": True}
+
+
+@app.delete("/v/api/ext/subscriptions/{sid}")
+async def ext_subscriptions_remove(sid: str):
+    ok, msg = config.remove_subscription(sid)
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    return {"code": 0, "msg": "已删除订阅源", "data": True}
+
+
+@app.post("/v/api/ext/subscriptions/{sid}/refresh")
+async def ext_subscriptions_refresh(sid: str):
+    """立即拉取某个订阅（只增不减）。"""
+    import subsched
+    result = await subsched.refresh_subscription(sid)
+    return {"code": result.get("code", 0), "msg": result.get("msg", ""),
+            "data": result}
+
+
 @app.post("/v/api/ext/source/import-subscription")
 async def ext_import_subscription(request: Request):
     """统一导入 TVBox / 影视仓 / OK影视 订阅（一个入口，自动分类、导入即可用）。
@@ -11442,6 +11565,8 @@ async def ext_import_subscription(request: Request):
     enable_guard = body.get("enable_guard", "smart")
     if enable_guard not in (True, False, "smart"):
         enable_guard = "smart"
+    # 归属订阅源（多订阅管理）：源记录 sub_id，便于统计与失效删除溯源
+    sub_id = str(body.get("sub_id") or "").strip()
 
     try:
         if body.get("builtin"):
@@ -11512,7 +11637,8 @@ async def ext_import_subscription(request: Request):
         if not pr.get("ok"):
             cms_failed.append(c["name"][:20])
             continue
-        ok, _info = config.add_source(c["name"], c["api"], True, standalone)
+        ok, _info = config.add_source(c["name"], c["api"], True, standalone,
+                                      sub_id=sub_id)
         if ok:
             cms_added.append(c["name"])
             existing.add(key)
@@ -11634,7 +11760,7 @@ async def ext_import_subscription(request: Request):
     live_report = None
     if live_items:
         try:
-            live_report = config.import_live_sources(live_items)
+            live_report = config.import_live_sources(live_items, sub_id=sub_id)
         except Exception as exc:  # noqa: BLE001
             live_report = {"error": f"直播源写入失败：{type(exc).__name__}"}
         try:
@@ -11991,7 +12117,23 @@ if features.DRPY:
             return JSONResponse({"code": 404, "msg": "未知 JS 源"}, status_code=404)
         try:
             res = await asyncio.to_thread(_drpy.play, providers._drpy_site(src), flag, vid)
-            return JSONResponse({"code": 0, "msg": "", "data": res})
+            # 与管理页「测试」/生产播放链路保持一致：play 返回非媒体直链时用 sniffer 兜底
+            sniffed = False
+            url0 = str((res or {}).get("url") or "") if isinstance(res, dict) else ""
+            if url0 and not _is_media_direct(url0):
+                try:
+                    sn = await asyncio.to_thread(_drpy.sniffer, providers._drpy_site(src))
+                    if isinstance(sn, dict):
+                        sn_url = str(sn.get("url") or "").strip()
+                        if sn_url.startswith(("http://", "https://")):
+                            res = {**(res or {}), "url": sn_url}
+                            if sn.get("header") and not (res or {}).get("header"):
+                                res["header"] = sn["header"]
+                            sniffed = True
+                except Exception:  # noqa: BLE001
+                    pass
+            return JSONResponse({"code": 0, "msg": "", "data": res,
+                                 "sniffed": sniffed})
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"code": 500, "msg": str(exc)[:200], "data": None})
 

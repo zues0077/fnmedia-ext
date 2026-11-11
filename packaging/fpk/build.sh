@@ -145,11 +145,13 @@ WORK="$(mktemp -d)"; trap 'rm -rf "${WORK}"' EXIT
 BUILT="$(find "${WORK}" "${STAGE}" -maxdepth 2 -name '*.fpk' -print -quit 2>/dev/null || true)"
 [ -n "${BUILT}" ] || { echo "ERROR: fnpack 未产出 .fpk" >&2; exit 1; }
 mkdir -p "${OUT_DIR}"
-SUFFIX=""; [ "${PUBLIC}" -eq 1 ] && SUFFIX="-public"
-# platform=all 时文件名不带架构后缀（与上游默认包命名一致，如 fnmedia-ext-1.1.0.fpk）；
-# 指定具体架构时显式标注，便于用户识别。
+# 产物命名对齐上游与 proxy/updater.py 的 _pick_asset 正则（自更新依赖它）：
+#   完整版 fnmedia-ext-<ver>-full.fpk —— updater 判定全功能版时【只认这个，无 fallback】
+#   轻量版 fnmedia-ext-<ver>-lite.fpk —— updater 轻量版回退目标（正则含 lite|public）
+# 指定具体架构时再追加 -x86 / -arm（默认 all 不追加，与上游默认包一致）。
+ED_TAG="-full"; [ "${PUBLIC}" -eq 1 ] && ED_TAG="-lite"
 PLAT_SUFFIX=""; [ "${PLATFORM}" != "all" ] && PLAT_SUFFIX="-${PLATFORM}"
-FINAL="${OUT_DIR}/fnmedia-ext-${VERSION}${SUFFIX}${PLAT_SUFFIX}.fpk"
+FINAL="${OUT_DIR}/fnmedia-ext-${VERSION}${ED_TAG}${PLAT_SUFFIX}.fpk"
 mv "${BUILT}" "${FINAL}"
 ( cd "$(dirname "${FINAL}")" && sha256sum "$(basename "${FINAL}")" > "$(basename "${FINAL}").sha256" )
 echo "[fpk] 打包完成: ${FINAL}"

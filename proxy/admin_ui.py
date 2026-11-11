@@ -849,7 +849,8 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div class="card-title">🎬 fnmedia-ext · 飞牛影视在线扩展</div>
         <p class="card-sub">在原生搜索 / 媒体库注入在线影视并直接调用飞牛原生播放器播放。</p>
         <div class="stack sm muted">
-          <div>开发作者：<a href="https://github.com/funwukong/fnmedia-ext" target="_blank" rel="noopener">funwukong</a></div>
+          <div>维护者：<a href="https://github.com/zues0077/fnmedia-ext" target="_blank" rel="noopener">zues0077</a></div>
+          <div>基于上游 <a href="https://github.com/funwukong/fnmedia-ext" target="_blank" rel="noopener">funwukong/fnmedia-ext</a> 的二次开发（Apache-2.0）</div>
         </div>
         <div class="stack sm muted">
           <div>· 热门资源：豆瓣真实榜单四库，点击搜源、优先高质量源播放。</div>
@@ -913,7 +914,7 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
           <div><b>3. 版权归原权利人：</b>第三方接口返回内容的版权归原权利人所有。本项目不依附、不代表任何内容提供方，不对任何第三方内容的合法性、准确性、可用性负责；如涉及版权问题，请联系内容实际提供方处理。</div>
           <div><b>4. 仅供学习交流：</b>本工具仅供学习、研究与个人合法播放自有或已获授权内容使用，<b>不得用于商业用途，不得下载、录制、再传播任何侵权内容</b>。请遵守你所在地的法律法规。</div>
           <div><b>5. 风险与责任：</b>第三方接口可能失效、变更或包含不当内容；使用过程中产生的流量、账号、费用与一切法律责任均由<b>使用者本人</b>承担，与本工具作者无关。请合法、自律使用，并妥善管理设备与访问权限，避免 18 周岁以下人员接触不适宜内容。</div>
-          <div><b>6. 侵权处理：</b>如任何权利人认为本工具的某项技术实现涉及其合法权益，可通过<a href="https://github.com/funwukong/fnmedia-ext" target="_blank" rel="noopener">项目仓库</a> Issue 联系作者 funwukong，核实后将及时处理。</div>
+          <div><b>6. 侵权处理：</b>如任何权利人认为本工具的某项技术实现涉及其合法权益，可通过<a href="https://github.com/zues0077/fnmedia-ext" target="_blank" rel="noopener">项目仓库</a> Issue 联系维护者，核实后将及时处理。</div>
         </div>
       </div>
     </section>

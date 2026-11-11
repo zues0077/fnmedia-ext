@@ -40,7 +40,10 @@ _MAX_KEYS = 2000
 def _blank() -> dict:
     return {"n": 0, "ok": 0, "lat": 0.0, "fails": 0,
             "last_ok": 0.0, "last_fail": 0.0, "dead_until": 0.0,
-            "stream_fails": 0, "stream_dead_until": 0.0}
+            "stream_fails": 0, "stream_dead_until": 0.0,
+            # 搜索匹配率分子/分母：搜索结果里标题真含关键词的比例（0~1）。
+            # 单独累计、不占 search 样本数 n，因为只有「有结果」时才判得出好坏。
+            "mr_sum": 0.0, "mr_n": 0}
 
 
 # level -> (失败计数字段, 死亡截止字段, 触发阈值, 冷却秒数)
@@ -128,12 +131,49 @@ def record(key: str, ok: bool, latency: float = 0.0,
                 s[dead_key] = now + cooldown
 
 
+def record_match_rate(key: str, rate: float) -> None:
+    """单独记一次搜索匹配率（0~1），不增加搜索样本数 n。
+
+    匹配率 = 搜索结果里「标题真含关键词」的比例。低匹配率说明该源在乱返回
+    （脏源/伪装源/采集无关内容），比人工打分更客观，用于搜索排序。
+    只在有结果时才调用——空结果判不出好坏，不该记 0 分。"""
+    key = (key or "").strip()
+    if not key:
+        return
+    try:
+        r = float(rate)
+    except (TypeError, ValueError):
+        return
+    r = min(1.0, max(0.0, r))
+    with _LOCK:
+        s = _STATS.get(key)
+        if s is None:
+            if len(_STATS) >= _MAX_KEYS:
+                old = min(_STATS, key=lambda k: max(
+                    _STATS[k].get("last_ok", 0), _STATS[k].get("last_fail", 0)))
+                _STATS.pop(old, None)
+            s = _blank()
+            _STATS[key] = s
+        s["mr_sum"] = float(s.get("mr_sum", 0.0)) + r
+        s["mr_n"] = int(s.get("mr_n", 0)) + 1
+
+
+def match_rate(key: str) -> float | None:
+    """该源的平均搜索匹配率（0~1）；无匹配率样本返回 None。"""
+    with _LOCK:
+        s = _STATS.get(key)
+        if not s or not int(s.get("mr_n", 0)):
+            return None
+        return float(s.get("mr_sum", 0.0)) / int(s["mr_n"])
+
+
 def stats(key: str) -> dict:
     with _LOCK:
         s = _STATS.get(key)
         if not s:
             return {}
         n = max(1, s.get("n", 0))
+        mrn = int(s.get("mr_n", 0))
         return {
             "key": key,
             "samples": s.get("n", 0),
@@ -143,6 +183,10 @@ def stats(key: str) -> dict:
             "last_ok": s.get("last_ok", 0),
             "last_fail": s.get("last_fail", 0),
             "dead_until": s.get("dead_until", 0),
+            # 平均搜索匹配率；无有效样本为 None（区别于 0 分）
+            "match_rate": (round(s.get("mr_sum", 0.0) / mrn, 3)
+                           if mrn else None),
+            "match_samples": mrn,
         }
 
 

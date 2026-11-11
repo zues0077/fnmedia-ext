@@ -2937,28 +2937,27 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
             if cur is None or nd_new > nd_cur or \
                     (nd_new == nd_cur and len(play) > len(cur)):
                 g["lines"][lkey] = [e.__dict__ for e in play]
-    # 排序：热门资源优先高质量源（源质量权重），同权重再按可播直链总数（跨线路）降序；
-    # 开启「自动优选」时叠加实测健康度（死亡/高失败率/慢源排后，上游 v0.2.47）。
+    # 排序：全部用实测数据，不再有人工权重（人工分值无客观依据且不影响播放选线）。
+    #   ① 搜索匹配率（源可靠性：结果里标题真含关键词的比例）
+    #   ② 健康档（成功率/搜索延迟/熔断）
+    #   ③ 可播直链总数（跨线路）
+    #   ④ 失败率、平均延迟（同级细排）
+    # 开启「自动优选」时叠加健康度；匹配率无样本给中性 0.5，避免惩罚新源。
     prefer_q = bool(config.get().get("prefer_quality_source", True))
     auto_best = bool(config.get().get("auto_best_source", True))
-    overrides = config.get().get("source_priority") or {}
     _now_h = time.time()
 
     def _group_key(g) -> tuple:
         lines_n = sum(len(v) for v in g["lines"].values())
-        if not prefer_q:
-            base = (0, lines_n)
-        else:
-            pr = providers.source_priority({"id": g["rep"].provider}, overrides)
-            base = (pr, lines_n)
+        any_line = next(iter(g["lines"].keys()), "")
+        sk = sourcehealth.source_key_of(any_line) or g["rep"].provider
+        mr = sourcehealth.match_rate(sk) if (prefer_q and sk) else None
+        mr_key = 0.5 if mr is None else mr
         if auto_best:
-            # 用该标题首个线路对应的源 key 取健康权重；不健康源的组整体下沉
-            any_line = next(iter(g["lines"].keys()), "")
-            sk = sourcehealth.source_key_of(any_line)
-            grade, avg_lat, fail = sourcehealth.weight(sk, _now_h) if sk else (1, 5.0, 1.0)
-            # 把健康档放在质量权重之后、直链数之前：高质量死源也不会排到健康源前太多
-            return (base[0], -grade, lines_n, -fail, -avg_lat)
-        return base
+            grade, avg_lat, fail = (sourcehealth.weight(sk, _now_h) if sk
+                                    else (1, 5.0, 1.0))
+            return (mr_key, -grade, lines_n, -fail, -avg_lat)
+        return (mr_key, lines_n)
 
     ordered = sorted(groups.values(), key=_group_key, reverse=True)[:maxn]
     briefs = []
@@ -9509,7 +9508,11 @@ def _line_display_name(t: dict) -> str:
     """播放器线路菜单显示名：网盘线路加 ☁网盘名 前缀，便于区分高质量网盘资源。
 
     网盘线的来源多为 guard-Xxx 这类技术源名，直接展示不友好；改用线路组名里
-    的中文可读部分（去掉 ┃多线 等装饰与 emoji 源前缀）。"""
+    的中文可读部分（去掉 ┃多线 等装饰与 emoji 源前缀）。
+
+    末尾追加速度标注（如「· 1.2MB/s」）：数据来自竞速实测 _LINE_SPEED（1h TTL），
+    零额外探测、不破坏秒播底线；没测过的线路不标注（宁缺勿假）。
+    """
     line = t.get("line", "")
     url = str(t.get("url") or "")
     pv = _pan_match(url) if url else None
@@ -9519,8 +9522,23 @@ def _line_display_name(t: dict) -> str:
         nice = re.sub(r"[┃|].*$", "", group).strip(" 🐌🍓🐻🍉🛡️")
         # 去掉常见纯英文技术源尾巴
         nice = re.sub(r"(guard-|spider-|drpy-)", "", nice, flags=re.I).strip()
-        return f"☁{tag} {nice}".strip() if nice else f"☁{tag} 网盘"
-    return _friendly_line(line)
+        base = f"☁{tag} {nice}".strip() if nice else f"☁{tag} 网盘"
+    else:
+        base = _friendly_line(line)
+    return base + _line_speed_suffix(t)
+
+
+def _line_speed_suffix(t: dict) -> str:
+    """线路菜单的实测速度后缀；无有效观测返回空串。"""
+    try:
+        sp = _line_speed(t)     # KB/s；<=0 表示没有 1h 内的有效观测
+    except Exception:  # noqa: BLE001
+        return ""
+    if sp <= 0:
+        return ""
+    if sp >= 1024:
+        return f" · {sp / 1024:.1f}MB/s"
+    return f" · {int(sp)}KB/s"
 
 
 def _is_media_playlist(text: str) -> bool:
@@ -10512,10 +10530,16 @@ async def ext_status(request: Request):
     overrides = config.get().get("source_priority") or {}
     priorities = {s["id"]: providers.source_priority(s, overrides)
                   for s in config.all_sources()}
+    try:
+        health_snap = sourcehealth.snapshot()
+    except Exception:  # noqa: BLE001
+        health_snap = {}
     return {"ok": True,
             "build": BUILD_LABEL,
             "config": {k: v for k, v in config.get().items() if k != "admin_token"},
             "source_priority": priorities,
+            # 实测源画像（匹配率/成功率/延迟/分级），供「片源质量」页只读展示
+            "source_health": health_snap,
             "cached_titles": len(store._titles),
             "hot": hot_cache.status(),
             "charts": chart_cache.status(),

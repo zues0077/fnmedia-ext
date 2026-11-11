@@ -575,6 +575,17 @@ async def search_source(client: httpx.AsyncClient, source: dict,
     if dropped:
         _log.warning("source search dropped unmappable vods: id=%s dropped=%d error=%s",
                      source.get("id"), dropped, first_err)
+    # 搜索匹配率：结果里标题真含关键词的比例（0~1）。低匹配率＝该源在乱返回，
+    # 搜索排序据此沉底；只在有结果时记（空结果判不出好坏，不记 0 分）。
+    if out and _health_on and _health is not None:
+        try:
+            _kw = (keyword or "").strip().lower()
+            if _kw:
+                _hit = sum(1 for _t in out
+                           if _kw in str(getattr(_t, "title", "") or "").lower())
+                _health.record_match_rate(source.get("id", ""), _hit / len(out))
+        except Exception:  # noqa: BLE001
+            pass
     return out
 
 

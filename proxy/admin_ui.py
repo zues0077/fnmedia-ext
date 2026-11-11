@@ -394,28 +394,30 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
     <!-- ============ 片源质量 ============ -->
 
     <section class="page" id="page-quality">
-      <h2 class="page-title">片源质量优先级</h2>
-      <p class="page-desc">热门资源点击搜源时，按「源质量权重 → 可播直链数」排序，优先选择高质量源。</p>
+      <h2 class="page-title">片源质量（实测）</h2>
+      <p class="page-desc">排序依据全部来自实测，不再使用人工权重：<strong>搜索匹配率</strong>（搜索结果里标题真含关键词的比例，低＝该源在乱返回）→ <strong>健康档</strong>（成功率/延迟/熔断）→ <strong>可播直链数</strong>。播放选线另有竞速机制（实测吞吐，先到先用），不受本页影响。</p>
       <div class="card">
         <label class="switch-row">
           <input type="checkbox" id="preferQ" checked/>
-          <span>热门资源优先高质量源
-            <span class="sub">关闭后只按可播直链总数选择来源</span></span>
+          <span>按实测质量排序
+            <span class="sub">关闭后只按可播直链总数选择来源（不参考匹配率与健康度）</span></span>
         </label>
         <div class="btn-row">
           <button class="primary small" onclick="savePreferQ()">保存</button>
         </div>
       </div>
       <div class="card">
-        <div class="card-title">各源质量权重 <span class="badge" id="prioCount"></span>
-          <button class="small" style="margin-left:auto" onclick="resetPriority()">恢复默认权重</button>
+        <div class="card-title">各源实测表现 <span class="badge" id="prioCount"></span>
+          <span style="margin-left:auto" class="muted sm">只读 · 随搜索/播放自动累积</span>
         </div>
-        <p class="card-sub">数值越大越优先（-100–100，留空/0 用内省默认）。修改后点底部「保存权重」。</p>
+        <p class="card-sub">匹配率＝搜索结果里标题真含关键词的比例；成功率/延迟来自实际搜索；分级 健康/慢/高失败/熔断。样本不足时显示「—」，不参与排序惩罚（按中性值处理）。</p>
+        <div class="row" style="margin-bottom:8px">
+          <input type="text" id="qhFilter" placeholder="筛选源名 / 地址…" style="flex:1;max-width:280px" oninput="renderQuality()"/>
+        </div>
         <table>
-          <thead><tr><th>资源站</th><th style="width:120px">质量权重</th><th>相对优先级</th></tr></thead>
-          <tbody id="prioRows"><tr><td colspan="3" class="muted">加载中…</td></tr></tbody>
+          <thead><tr><th>资源站</th><th style="width:86px">匹配率</th><th style="width:86px">成功率</th><th style="width:80px">平均延迟</th><th style="width:76px">状态</th></tr></thead>
+          <tbody id="prioRows"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
         </table>
-        <div class="btn-row"><button class="primary small" onclick="savePriority()">保存权重</button></div>
       </div>
     </section>
 
@@ -1510,35 +1512,35 @@ async function refreshHot(){
   toast(r.code===0?"榜单已刷新":(r.msg||"刷新失败"),r.code===0?"ok":"fail");
 }
 
-/* ---------- 片源质量 ---------- */
+/* ---------- 片源质量（实测，只读） ---------- */
 function renderQuality(){
   if(!STATUS)return;
   $("preferQ").checked=CFG.prefer_quality_source!==false;
-  PRIO=STATUS.source_priority||{};
-  const ov=CFG.source_priority||{};
-  $("prioCount").textContent=Object.keys(ov).length+" 自定义";
-  const rows=CFG.sources.map(s=>{
-    const eff=PRIO[s.id]||0, custom=ov[s.id];
-    const w=Math.max(4,Math.min(100,(eff+20)));
-    return `<tr data-id="${s.id}">
+  const health=STATUS.source_health||{};
+  const srcs=CFG.sources||[];
+  const q=($("qhFilter")?$("qhFilter").value:"").trim().toLowerCase();
+  const list=srcs.filter(s=>!q
+    || String(s.name||"").toLowerCase().includes(q)
+    || String(s.api||"").toLowerCase().includes(q));
+  const withData=list.filter(s=>health[s.id]).length;
+  $("prioCount").textContent=withData+"/"+list.length+" 有实测数据";
+  const rows=list.map(s=>{
+    const h=health[s.id]||{};
+    const mr=h.match_rate, sr=h.success_rate, lat=h.avg_latency, g=h.grade;
+    const mrs=(mr==null)?'<span class="muted">—</span>':(mr*100).toFixed(0)+'%';
+    const srs=(sr==null)?'<span class="muted">—</span>':(sr*100).toFixed(0)+'%';
+    const lats=(lat==null)?'<span class="muted">—</span>':Number(lat).toFixed(1)+'s';
+    let gs='<span class="muted">—</span>';
+    if(g===0)gs='<span style="color:var(--ok,#3a9)">健康</span>';
+    else if(g===1)gs='<span style="color:var(--warn,#d97706)">慢</span>';
+    else if(g===2)gs='<span style="color:var(--err,#d64545)">高失败</span>';
+    else if(g===3)gs='<span style="color:var(--err,#d64545)">熔断</span>';
+    return `<tr>
       <td><div style="font-weight:500">${esc(s.name)} ${s.enabled?'':'<span class="muted sm">(停用)</span>'}</div>
         <div class="meta">${esc(s.api)}</div></td>
-      <td><input type="number" class="prio-input" min="-100" max="100" data-prio
-        value="${custom!=null?custom:''}" placeholder="${eff}"/></td>
-      <td style="min-width:120px"><div class="prio-bar" style="width:${w}%"></div>
-        <span class="muted sm">${custom!=null?('自定义 '+custom):'默认 '+eff}</span></td></tr>`;
+      <td>${mrs}</td><td>${srs}</td><td>${lats}</td><td>${gs}</td></tr>`;
   }).join("");
-  $("prioRows").innerHTML=rows||'<tr><td colspan="3" class="muted">暂无源</td></tr>';
-}
-function collectPriority(){const m={};$$("[data-prio]").forEach(inp=>{
-  const v=inp.value.trim();if(v!=="")m[inp.closest("tr").dataset.id]=parseInt(v)||0;});return m;}
-async function savePriority(){
-  const r=await jpost("/v/api/ext/source/priority",{priority:collectPriority()});
-  if(r.code===0){toast("权重已保存");await loadStatus();renderQuality();}else toast(r.msg||"保存失败","fail");
-}
-async function resetPriority(){
-  const r=await jpost("/v/api/ext/source/priority",{priority:{}});
-  if(r.code===0){toast("已恢复默认权重");await loadStatus();renderQuality();}else toast("失败","fail");
+  $("prioRows").innerHTML=rows||'<tr><td colspan="5" class="muted">暂无源</td></tr>';
 }
 async function savePreferQ(){
   const r=await jpost("/v/api/ext/config",{prefer_quality_source:$("preferQ").checked});

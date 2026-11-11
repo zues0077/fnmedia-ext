@@ -146,7 +146,10 @@ BUILT="$(find "${WORK}" "${STAGE}" -maxdepth 2 -name '*.fpk' -print -quit 2>/dev
 [ -n "${BUILT}" ] || { echo "ERROR: fnpack 未产出 .fpk" >&2; exit 1; }
 mkdir -p "${OUT_DIR}"
 SUFFIX=""; [ "${PUBLIC}" -eq 1 ] && SUFFIX="-public"
-FINAL="${OUT_DIR}/fnmedia-ext-${VERSION}${SUFFIX}-${PLATFORM}.fpk"
+# platform=all 时文件名不带架构后缀（与上游默认包命名一致，如 fnmedia-ext-1.1.0.fpk）；
+# 指定具体架构时显式标注，便于用户识别。
+PLAT_SUFFIX=""; [ "${PLATFORM}" != "all" ] && PLAT_SUFFIX="-${PLATFORM}"
+FINAL="${OUT_DIR}/fnmedia-ext-${VERSION}${SUFFIX}${PLAT_SUFFIX}.fpk"
 mv "${BUILT}" "${FINAL}"
 ( cd "$(dirname "${FINAL}")" && sha256sum "$(basename "${FINAL}")" > "$(basename "${FINAL}").sha256" )
 echo "[fpk] 打包完成: ${FINAL}"

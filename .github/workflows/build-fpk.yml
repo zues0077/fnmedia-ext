@@ -81,14 +81,12 @@ jobs:
       - name: 冒烟：完整构建启动验证
         run: python3 tools/full_build_smoke.py packaging/fpk/.build/fpk/app/repo
 
-      # 双架构出包：本包为纯 Python + 静态资源（build.sh 只 rsync 源码，
-      # 不打包 site-packages），内容架构无关；这里分别以 platform=x86 / arm
-      # 各打一次，产出两个 manifest 标注不同的 FPK（安装器按 platform 过滤）。
-      - name: 打包(完整构建, x86)
-        run: bash packaging/fpk/build.sh --fnpack "$PWD/.tools/fnpack" --platform x86
-
-      - name: 打包(完整构建, arm)
-        run: bash packaging/fpk/build.sh --fnpack "$PWD/.tools/fnpack" --platform arm
+      # 单包通吃 x86/arm：包内 20 个 wheel 为 16 个纯 Python + 4 个 pydantic_core
+      # （cp311/cp312 × x86_64/aarch64 全覆盖），离线 pip 会按本机架构自动选择；
+      # 唯一 ELF 是 spider-runner/android/ 下给 Android 容器用的 arm .so，不影响宿主。
+      # 故 manifest 用 platform=all（与上游默认包一致），无需分架构出包。
+      - name: 打包(完整构建, platform=all)
+        run: bash packaging/fpk/build.sh --fnpack "$PWD/.tools/fnpack" --platform all
 
       - name: 上传 artifact
         uses: actions/upload-artifact@v4
@@ -153,11 +151,8 @@ jobs:
       - name: 冒烟：剥离后启动验证
         run: python3 tools/post_strip_smoke.py packaging/fpk/.build/fpk/app/repo
 
-      - name: 打包(公开构建,剥离私有特性, x86)
-        run: bash packaging/fpk/build.sh --public --fnpack "$PWD/.tools/fnpack" --platform x86
-
-      - name: 打包(公开构建,剥离私有特性, arm)
-        run: bash packaging/fpk/build.sh --public --fnpack "$PWD/.tools/fnpack" --platform arm
+      - name: 打包(公开构建,剥离私有特性, platform=all)
+        run: bash packaging/fpk/build.sh --public --fnpack "$PWD/.tools/fnpack" --platform all
 
       - name: 上传 artifact
         uses: actions/upload-artifact@v4

@@ -922,6 +922,34 @@ def _runner_post(path: str, payload: dict, timeout: float | None = None):
     return j.get("result")
 
 
+def _runner_probe() -> dict:
+    """纯运行时探测：直接问 runner 的 android 后端，不经过 feature_on 门控。"""
+    try:
+        r = httpx.get(RUNNER_URL + "/health",
+                      timeout=httpx.Timeout(2.0, connect=0.4), trust_env=False)
+        j = r.json()
+        return {"ok": bool(j.get("runtimes", {}).get("android")),
+                "runner": RUNNER_URL, "runtimes": j.get("runtimes", {})}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "runner": RUNNER_URL, "error": str(exc)[:160]}
+
+
+def runner_health(force: bool = False) -> dict:
+    """runner 与 android 后端状态（不带 feature_on 门控）。
+
+    spider 源（csprun）与 guard 加固源共用同一个 redroid 运行时，
+    但 spider 源不应受 guard 是否有站点文件影响。此函数供 spiders.py
+    直接调用，绕过 feature_on 的站点文件门控。
+    """
+    global _health_cache
+    now = time.time()
+    if not force and now - _health_cache[0] < 10:
+        return _health_cache[1]
+    out = _runner_probe()
+    _health_cache = (now, out)
+    return out
+
+
 def health(force: bool = False) -> dict:
     """返回 runner 与 android 后端状态；短时缓存，避免拖垮聚合搜索。"""
     global _health_cache
@@ -931,15 +959,7 @@ def health(force: bool = False) -> dict:
     if not feature_on():
         out = {"ok": False, "reason": "feature-off"}
     else:
-        try:
-            # 连接被拒（runner 未部署）应瞬时返回，只有真机响应慢才用满超时。
-            r = httpx.get(RUNNER_URL + "/health",
-                          timeout=httpx.Timeout(2.0, connect=0.4), trust_env=False)
-            j = r.json()
-            out = {"ok": bool(j.get("runtimes", {}).get("android")),
-                   "runner": RUNNER_URL, "runtimes": j.get("runtimes", {})}
-        except Exception as exc:  # noqa: BLE001
-            out = {"ok": False, "runner": RUNNER_URL, "error": str(exc)[:160]}
+        out = _runner_probe()
     _health_cache = (now, out)
     return out
 

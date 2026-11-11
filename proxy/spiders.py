@@ -327,7 +327,9 @@ def available() -> bool:
         return False
     try:
         import guard as _g
-        return bool(_g.available())
+        # spider 源共用 redroid 运行时，但不应受 guard 站点文件门控影响：
+        # 用 runner_health()（纯运行时探测）而非 _g.available()（依赖 feature_on）。
+        return bool(_g.runner_health().get("ok"))
     except Exception:
         return False
 
@@ -336,7 +338,7 @@ def _runtime_up(force: bool = True) -> bool:
     """android 运行时是否真就绪。强制刷新，避免 health 10s 缓存误判崩溃后仍 True。"""
     try:
         import guard as _g
-        return bool(_g.health(force=force).get("ok"))
+        return bool(_g.runner_health(force=force).get("ok"))
     except Exception:  # noqa: BLE001
         return available()
 

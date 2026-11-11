@@ -1558,11 +1558,12 @@ function renderSources(){
   $("srcRows").innerHTML=srcs.length?srcs.map(src=>{
     let extraCell="",extraTag="";
     // >>> PRIVATE:ADULT
+    const adOk=!!(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc));
     extraCell=FEAT_ADULT?`
-      <label title="🔞 限制级独立库（18+）：与主库隔离、不进全局搜索；开启即表示你已年满 18 周岁并自行承担责任"
-        style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:pointer;margin-left:4px">
+      <label title="${adOk?'🔞 限制级独立库（18+）：与主库隔离、不进全局搜索；开启即表示你已年满 18 周岁并自行承担责任':'需先「启用」并勾选「库」后才能标记 🔞（WASM 自研站不支持独立库）'}"
+        style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:${adOk?'pointer':'not-allowed'};margin-left:4px;${adOk?'':'opacity:.55'}">
         <input type="checkbox" class="ad" ${src.adult?"checked":""}
-         ${(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc))?"":"disabled"} style="width:15px;height:15px;accent-color:#be123c"/>🔞</label>`:"";
+         ${adOk?"":"disabled"} style="width:15px;height:15px;accent-color:#be123c${adOk?'':';opacity:.35'}"/>18</label>`:"";
     // <<< PRIVATE:ADULT
     // >>> PRIVATE:DDUO
     extraTag=(FEAT_DDUO&&src.xsrc&&(src.api||"").indexOf("guard://")!==0)?'<span class="tag amber" title="非苹果CMS自研站，WASM实时解码">WASM</span>':'';
@@ -1570,12 +1571,12 @@ function renderSources(){
     return `<tr data-id="${src.id}">
       <td><input type="checkbox" class="en" ${src.enabled?"checked":""} style="accent-color:var(--accent);width:16px;height:16px"/></td>
       <td style="white:nowrap">
-        <label title="把该资源站单独生成一张媒体库卡片" style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:pointer">
+        <label title="${(src.enabled&&src.kind!=="t4"&&!(FEAT_DDUO&&src.xsrc))?'把该资源站单独生成一张媒体库卡片':'需先「启用」；WASM 自研站不支持独立库'}" style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:${(src.enabled&&src.kind!=="t4"&&!(FEAT_DDUO&&src.xsrc))?'pointer':'not-allowed'}">
           <input type="checkbox" class="sa" ${src.standalone?"checked":""}
-           ${(src.enabled&&src.kind!=="t4"&&!(FEAT_DDUO&&src.xsrc))?"":"disabled"} style="width:15px;height:15px;accent-color:var(--accent)"/>库</label>
-        <label title="非过滤：独立库内不按标题/备注过滤解说/预告/花絮" style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:pointer;margin-left:4px">
+           ${(src.enabled&&src.kind!=="t4"&&!(FEAT_DDUO&&src.xsrc))?"":"disabled"} style="width:15px;height:15px;accent-color:var(--accent);${(src.enabled&&src.kind!=="t4"&&!(FEAT_DDUO&&src.xsrc))?'':'opacity:.35'}"/>库</label>
+        <label title="${(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc))?'非过滤：独立库内不按标题/备注过滤解说/预告/花絮':'需先「启用」并勾选「库」后才能设置（WASM 自研站不支持）'}" style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:${(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc))?'pointer':'not-allowed'};margin-left:4px">
           <input type="checkbox" class="lf" ${src.loose_filter?"checked":""}
-           ${(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc))?"":"disabled"} style="width:15px;height:15px;accent-color:var(--warn)"/>非过滤</label>
+           ${(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc))?"":"disabled"} style="width:15px;height:15px;accent-color:var(--warn);${(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc))?'':'opacity:.35'}"/>非过滤</label>
         ${extraCell}
       </td>
       <td><div style="font-weight:500">${esc(src.name)}${src.kind==="t4"?'<span class="tag">T4</span>':''}${extraTag}${src.builtin?'':'<span class="tag amber">自定义</span>'}${src.standalone?'<span class="tag">媒体库</span>':''}</div>
@@ -1611,7 +1612,7 @@ async function toggleEnable(id,on){
   try{r=await jpost("/v/api/ext/config",{sources});}
   catch(e){toast("保存失败","fail");renderSources();return;}
   if(r.code===0){CFG.sources.find(x=>x.id===id).enabled=on;
-    $("srcCount").textContent=CFG.sources.filter(x=>x.enabled).length+"/"+CFG.sources.length+" 启用";toast(on?"已启用":"已停用");}
+    $("srcCount").textContent=CFG.sources.filter(x=>x.enabled).length+"/"+CFG.sources.length+" 启用";toast(on?"已启用":"已停用");renderSources();}
   else{toast(r.msg||"保存失败","fail");renderSources();}
 }
 async function toggleStandalone(id,on){

@@ -2834,6 +2834,70 @@ async def _aggregate_briefs(keyword: str, maxn: int | None = None,
         _AGG_INFLIGHT.pop(cache_key, None)
 
 
+def _chars_in_order(hay: str, needle: str) -> bool:
+    """needle 的字符是否按顺序出现在 hay 里（允许间隔）。
+
+    例：「后浪」可匹配「后来的浪潮」。需 needle 非空。"""
+    n = len(needle)
+    if not n:
+        return False
+    i = 0
+    for ch in hay:
+        if ch == needle[i]:
+            i += 1
+            if i == n:
+                return True
+    return False
+
+
+def _lev_similarity(a: str, b: str) -> float:
+    """1 - Levenshtein(a,b)/max(len)；范围 0~1。
+
+    长度差 >8 时直接返回 0（中文片名差异这么大时相似度必然很低，
+    跳过 O(n*m) 的 DP 计算）。"""
+    la, lb = len(a), len(b)
+    if not la or not lb or abs(la - lb) > 8:
+        return 0.0
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        ai = a[i - 1]
+        for j in range(1, lb + 1):
+            v = prev[j] + 1
+            w = cur[j - 1] + 1
+            if w < v:
+                v = w
+            x = prev[j - 1] + (0 if ai == b[j - 1] else 1)
+            if x < v:
+                v = x
+            cur[j] = v
+        prev = cur
+    return 1.0 - prev[lb] / max(la, lb)
+
+
+def _title_relevance(title: str, keyword: str) -> int:
+    """片名与搜索词的相关性分（0~100），参考 LunaTV search-ranking.ts 分档。
+
+    100 完全匹配 / 80 开头匹配 / 60 含完整关键词 / 20~40 字符按序模糊 / 0~15 部分字符。
+    去空格、忽略大小写，适配中文。聚合搜索按此分排序，避免「庆余年之XX」
+    或源乱返回的无关条目盖过正片。
+    """
+    t = (title or "").strip().lower().replace(" ", "")
+    q = (keyword or "").strip().lower().replace(" ", "")
+    if not t or not q:
+        return 0
+    if t == q:
+        return 100
+    if t.startswith(q):
+        return 80
+    if q in t:
+        return 60
+    if _chars_in_order(t, q):
+        return 20 + int(_lev_similarity(t, q) * 20)      # 20~40
+    hit = sum(1 for ch in q if ch in t)
+    return int(hit / len(q) * 15)                        # 0~15
+
+
 async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
                                    fast_only: bool = False,
                                    timeout: float | None = None,
@@ -2926,8 +2990,15 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
         key = _group_key_for(nt, t.year)
         g = groups.get(key)
         if g is None:
-            g = {"rep": t, "lines": {}}
+            g = {"rep": t, "lines": {},
+                 # 标题相关性只算一次并缓存（同组归一化标题基本相同）
+                 "rel": _title_relevance(t.title, keyword)}
             groups[key] = g
+        else:
+            # 同组内取最高相关性，避免首个源的标题写法偏差影响整组
+            _r = _title_relevance(t.title, keyword)
+            if _r > g.get("rel", 0):
+                g["rel"] = _r
         for lname, play in playable_by_line.items():
             lkey = f"{t.provider}::{lname}"
             # 同 key 保留直链更多（更优）者；否则集数更多者
@@ -2938,6 +3009,7 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
                     (nd_new == nd_cur and len(play) > len(cur)):
                 g["lines"][lkey] = [e.__dict__ for e in play]
     # 排序：全部用实测数据，不再有人工权重（人工分值无客观依据且不影响播放选线）。
+    #   ⓪ 标题相关性（片名与搜索词的匹配档位：完全=100 / 开头=80 / 包含=60 / 模糊=20~40）
     #   ① 搜索匹配率（源可靠性：结果里标题真含关键词的比例）
     #   ② 健康档（成功率/搜索延迟/熔断）
     #   ③ 可播直链总数（跨线路）
@@ -2953,11 +3025,12 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
         sk = sourcehealth.source_key_of(any_line) or g["rep"].provider
         mr = sourcehealth.match_rate(sk) if (prefer_q and sk) else None
         mr_key = 0.5 if mr is None else mr
+        rel = int(g.get("rel", 0))
         if auto_best:
             grade, avg_lat, fail = (sourcehealth.weight(sk, _now_h) if sk
                                     else (1, 5.0, 1.0))
-            return (mr_key, -grade, lines_n, -fail, -avg_lat)
-        return (mr_key, lines_n)
+            return (rel, mr_key, -grade, lines_n, -fail, -avg_lat)
+        return (rel, mr_key, lines_n)
 
     ordered = sorted(groups.values(), key=_group_key, reverse=True)[:maxn]
     briefs = []

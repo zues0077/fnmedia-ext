@@ -454,7 +454,7 @@ class Config:
                 m["guard_key"] = s.get("guard_key", "") if features.GUARD else ""
                 # <<< PRIVATE:GUARD
                 m["builtin"] = bool(s.get("builtin", False))
-                for key in ("kind", "site_key", "ext", "searchable", "filterable", "indexs", "method"):
+                for key in ("kind", "site_key", "ext", "searchable", "filterable", "indexs", "method", "live"):
                     if key in s:
                         m[key] = s[key]
                 merged.append(m)
@@ -710,10 +710,10 @@ class Config:
             if any(s["id"] == sid or s.get("api", "").rstrip("/").lower() == norm
                    for s in cfg["sources"]):
                 return False, "该资源站地址已存在"
-            cfg["sources"].append(
-                {"id": sid, "name": name, "api": api,
-                 "enabled": bool(enabled), "standalone": bool(standalone),
-                 "builtin": False})
+            entry = {"id": sid, "name": name, "api": api,
+                     "enabled": bool(enabled), "standalone": bool(standalone),
+                     "builtin": False}
+            cfg["sources"].append(entry)
             self._persist(cfg)
             return True, sid
 
@@ -784,6 +784,55 @@ class Config:
                 self._persist(cfg)
             return {"candidates": len(sources), "added": len(added),
                     "added_names": added, "duplicate": duplicate}
+
+    def import_live_sources(self, sources: list[dict]) -> dict:
+        """导入 m3u8 直播源（LunaTV lives / 资源站电视直播源）。
+
+        live 源以 kind="live" + live=True 标记入库，与 CMS/T4 源区分；
+        id 用「live_ + url md5」生成，避免与其它源 id 冲突。
+        返回 {candidates, added, added_names, duplicate}。
+        """
+        with _LOCK:
+            cfg = self.get()
+            existing_ids = {s["id"] for s in cfg["sources"]}
+            existing_urls = {str(s.get("api", "")).strip() for s in cfg["sources"]}
+            added, duplicate = [], 0
+            for it in sources:
+                if not isinstance(it, dict):
+                    continue
+                url = str(it.get("url") or "").strip()
+                name = str(it.get("name") or "").strip()
+                if not url.startswith(("http://", "https://")):
+                    continue
+                sid = "live_" + hashlib.md5(url.encode()).hexdigest()[:10]
+                if sid in existing_ids or url in existing_urls:
+                    duplicate += 1
+                    continue
+                entry = {
+                    "id": sid, "name": name or url.split("/")[2],
+                    "api": url, "enabled": True,
+                    "kind": "live", "live": True,
+                    "builtin": False, "standalone": False,
+                }
+                if it.get("ua"):
+                    entry["ua"] = str(it["ua"]).strip()
+                if it.get("epg"):
+                    entry["epg"] = str(it["epg"]).strip()
+                cfg["sources"].append(entry)
+                existing_ids.add(sid)
+                existing_urls.add(url)
+                added.append(entry["name"])
+            if added:
+                self._persist(cfg)
+            return {"candidates": len(sources), "added": len(added),
+                    "added_names": added, "duplicate": duplicate}
+
+    def live_sources(self) -> list[dict]:
+        """当前库内所有 m3u8 直播源（live=True）。"""
+        self.maybe_reload()
+        with _LOCK:
+            return [dict(s) for s in self._cfg["sources"]
+                    if s.get("live") and s.get("enabled")]
 
     def set_source_priority(self, mapping: dict) -> tuple[bool, str]:
         """整体保存源优先级（id -> 整数权重），忽略未知源与非法值。"""

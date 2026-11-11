@@ -82,6 +82,89 @@ def _b64_try(text: str) -> str | None:
     return None
 
 
+# Base58（比特币字母表，无 0/O/I/l），LunaTV 订阅链接用它编码整段 JSON。
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_INDEX = {c: i for i, c in enumerate(_B58_ALPHABET)}
+
+
+def _b58_decode(text: str) -> str | None:
+    """把 Base58 编码的整段文本解码成原始字符串（LunaTV 订阅配置）。
+
+    输入应是纯 Base58 字符串（无换行/花括号/引号，含大段字符）。
+    解码后按 JSON 文本使用（含 api_site/lives 等 LunaTV 顶层字段）。
+    """
+    s = (text or "").strip()
+    if not s or len(s) < 8:
+        return None
+    # 若含 JSON 结构字符则不是 Base58 包裹，直接返回 None
+    if any(ch in s for ch in "\n{}[]\"'=:/"):
+        return None
+    if any(ch not in _B58_INDEX for ch in s):
+        return None
+    num = 0
+    for ch in s:
+        num = num * 58 + _B58_INDEX[ch]
+    if num == 0:
+        return None
+    raw = num.to_bytes((num.bit_length() + 7) // 8, "big")
+    # 前导 '1' 对应零字节（Base58 前导零）
+    leading = len(s) - len(s.lstrip("1"))
+    raw = b"\x00" * leading + raw
+    try:
+        out = raw.decode("utf-8", "ignore")
+    except Exception:  # noqa: BLE001
+        return None
+    if not out.lstrip().startswith(("{", "[")):
+        return None
+    return out
+
+
+def _lunatv_sites(cfg: dict) -> list[dict]:
+    """把 LunaTV 配置的 api_site（对象字典）与 lives（对象字典）转成 sites 列表。
+
+    LunaTV 顶层：{cache_time, api_site:{key:{name,api,detail,_comment}},
+                    custom_category:[...], lives:{key:{name,url,ua?,epg?}}}。
+    - api_site：标准苹果 CMS V10（/api.php/provide/vod），转成 type=1 CMS 站点；
+    - lives：m3u8 直播源，转成带 _live 标记的站点（由 M3U 聚合端点统一输出）。
+    """
+    sites: list[dict] = []
+    api_site = cfg.get("api_site")
+    if isinstance(api_site, dict):
+        for key, v in api_site.items():
+            if not isinstance(v, dict):
+                continue
+            api = str(v.get("api") or "").strip()
+            name = str(v.get("name") or key).strip()
+            if not api:
+                continue
+            sites.append({
+                "key": str(key),
+                "name": name,
+                "api": api,
+                "type": 1,
+                "detail": str(v.get("detail") or "").strip(),
+            })
+    lives = cfg.get("lives")
+    if isinstance(lives, dict):
+        for key, v in lives.items():
+            if not isinstance(v, dict):
+                continue
+            url = str(v.get("url") or "").strip()
+            name = str(v.get("name") or key).strip()
+            if not url:
+                continue
+            sites.append({
+                "key": f"live_{key}",
+                "name": name,
+                "api": url,          # m3u8 直播流地址
+                "type": 1,
+                "_live": True,
+                "ua": str(v.get("ua") or "").strip(),
+                "epg": str(v.get("epg") or "").strip(),
+            })
+    return sites
+
+
 def _strip_jsonc(text: str) -> str:
     """字符串感知地去掉 // 与 /* */ 注释（不破坏 URL 里的 //）。"""
     out: list[str] = []
@@ -242,6 +325,12 @@ def parse_config_text(text: str) -> dict | None:
         cfg = _json_loads_dict(decoded)
         if cfg is not None:
             return cfg
+    # Base58 包裹（LunaTV 订阅链接：整段 Base58 编码的 JSON）
+    decoded = _b58_decode(text)
+    if decoded:
+        cfg = _json_loads_dict(decoded)
+        if cfg is not None:
+            return cfg
     # FongMi 加密订阅（hex 密文）
     dec = _fongmi_decrypt(text)
     if dec:
@@ -315,8 +404,16 @@ def classify_site(site: dict) -> tuple[str, dict | None]:
 
 
 def extract_sites(config: dict) -> list[dict]:
+    """提取站点列表：支持 TVBox 的 sites[] 与 LunaTV 的 api_site/lives 对象字典。"""
     sites = config.get("sites")
-    return [s for s in sites if isinstance(s, dict)] if isinstance(sites, list) else []
+    if isinstance(sites, list):
+        out = [s for s in sites if isinstance(s, dict)]
+        if out:
+            return out
+    # LunaTV 格式：api_site（对象字典）+ lives（对象字典），无 sites 字段
+    if isinstance(config.get("api_site"), dict) or isinstance(config.get("lives"), dict):
+        return _lunatv_sites(config)
+    return []
 
 
 def sub_urls(config: dict, base: str = "") -> list[str]:
@@ -453,6 +550,8 @@ def classify_subscription(sites: list[dict], spider: str = "",
                由 Node sidecar 直接跑远程脚本
       t4     : 远程 T4 源（type=4），{name,api,kind,site_key,ext,enabled,
                searchable,filterable,indexs,method}，由 T4 服务端解析，可搜可播
+      live   : m3u8 直播源（LunaTV lives），{key,name,url,ua,epg}，
+               由 M3U 聚合端点（/v/api/ext/live/subscribe.m3u）统一输出
       skipped: [{name,reason}]
     """
     cms: list[dict] = []
@@ -462,12 +561,15 @@ def classify_subscription(sites: list[dict], spider: str = "",
     # T4 远程源（type=4）：由 T4 服务端解析，可搜可播；地址不是 http(s) 也收录
     # （标 invalid），别静默丢进 skipped 让人找不到。
     t4: list[dict] = []
+    # m3u8 直播源（LunaTV lives 的 _live 标记站点）
+    live: list[dict] = []
     skipped: list[dict] = []
     seen_cms: set[str] = set()
     seen_guard: set[str] = set()
     seen_csp: set[str] = set()
     seen_drpy: set[str] = set()
     seen_t4: set[str] = set()
+    seen_live: set[str] = set()
     count: dict[str, int] = {}
     skip_seen: set[str] = set()
     jar_url = _spider_jar_url(spider, base)
@@ -485,6 +587,21 @@ def classify_subscription(sites: list[dict], spider: str = "",
         name = str(s.get("name") or s.get("key") or s.get("api") or "").strip()
         api = str(s.get("api") or "").strip()
         t = str(s.get("type", 1))
+
+        # 0) m3u8 直播源（LunaTV lives 的 _live 标记站点）
+        if s.get("_live"):
+            url = api
+            if url in seen_live:
+                continue
+            seen_live.add(url)
+            live.append({
+                "key": str(s.get("key") or f"live_{len(live) + 1}"),
+                "name": name,
+                "url": url,
+                "ua": str(s.get("ua") or "").strip(),
+                "epg": str(s.get("epg") or "").strip(),
+            })
+            continue
 
         # 1) 加固爬虫 csp_*Guard
         if is_guard_site(s):
@@ -591,7 +708,7 @@ def classify_subscription(sites: list[dict], spider: str = "",
         cms.append(norm)
 
     return {"cms": cms, "guard": guard, "csp": csp, "drpy": drpy, "t4": t4,
-            "skipped": skipped, "jar_url": jar_url}
+            "live": live, "skipped": skipped, "jar_url": jar_url}
 
 
 async def load_subscription_full(url: str | None = None,

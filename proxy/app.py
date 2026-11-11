@@ -2819,7 +2819,7 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
     # 可选特性源不进入全局搜索（公开构建下该开关恒关，等价于不过滤）。
     sources = [s for s in config.enabled_sources()
                if not (features.ADULT and s.get("adult"))
-               and (include_t4 or s.get("kind") != "t4")]
+               and (include_t4 or s.get("kind") not in ("t4", "live"))]
     if fast_only:
         sources = [s for s in sources
                    if not s.get("guard") and not s.get("spider_src")
@@ -11228,7 +11228,8 @@ def _is_pure_cms(s: dict) -> bool:
     """纯苹果 CMS 源（非 jar 爬虫 / 加固 / 小雅 / dduo / DRPY / T4）。
     移植上游 v0.2.69/71（CMS 源导入/导出、批量体检共用）。"""
     if s.get("guard") or s.get("spider_src") or s.get("catvod") \
-            or s.get("xsrc") or s.get("drpy") or s.get("t4"):
+            or s.get("xsrc") or s.get("drpy") or s.get("t4") \
+            or s.get("live") or s.get("kind") == "live":
         return False
     if str(s.get("id", "")).startswith(("spider-", "guard-", "drpy-", "t4-")):
         return False
@@ -11628,9 +11629,23 @@ async def ext_import_subscription(request: Request):
         drpy_report = {"skipped_build": True}
     # <<< PRIVATE:DRPY
 
+    # ---------- m3u8 直播源（LunaTV lives）：导入为在线直播资源 ----------
+    live_items = groups.get("live", [])
+    live_report = None
+    if live_items:
+        try:
+            live_report = config.import_live_sources(live_items)
+        except Exception as exc:  # noqa: BLE001
+            live_report = {"error": f"直播源写入失败：{type(exc).__name__}"}
+        try:
+            config.load()
+        except Exception:
+            pass
+
     if cms_added or t4_report["added"] or (guard_report and guard_report.get("enabled_count")) \
             or (csp_report and csp_report.get("added")) \
-            or (drpy_report and drpy_report.get("added")):
+            or (drpy_report and drpy_report.get("added")) \
+            or (live_report and live_report.get("added")):
         _search_cache.clear(); _AGG_CACHE.clear()
         _schedule_routes_refresh()
 
@@ -11647,11 +11662,45 @@ async def ext_import_subscription(request: Request):
         "guard": guard_report,
         "csp": csp_report,
         "drpy": drpy_report,
+        "live": live_report,
         "runtime": runtime,
         "skipped": len(skipped),
         "skipped_detail": skipped[:60],
         "ad_rules_added": ad_rules_added,
     }}
+
+
+@app.get("/v/api/ext/live/status")
+async def ext_live_status():
+    """直播源状态：当前聚合进订阅的频道数。供管理台「电视直播订阅」卡片展示。"""
+    lives = config.live_sources()
+    return {"code": 0, "msg": "", "data": {"count": len(lives)}}
+
+
+@app.get("/v/api/ext/live/subscribe.m3u")
+async def ext_live_subscribe_m3u():
+    """把当前库内所有 m3u8 直播源聚合为一份标准 IPTV 播放列表（M3U）。
+
+    供飞牛影视「电视直播」媒体库的 URL 导入使用：复制本地址，到飞牛影视
+    「新增媒体库 → 内容类型电视直播 → URL 导入」粘贴即可，由飞牛原生播放。
+    live 源（LunaTV lives / 资源站电视直播源）统一在此输出，不重复造播放轮子。
+    """
+    lives = config.live_sources()
+    lines = ["#EXTM3U"]
+    for s in lives:
+        name = str(s.get("name") or "").strip() or "未命名频道"
+        url = str(s.get("api") or "").strip()
+        if not url:
+            continue
+        attrs = ""
+        if s.get("epg"):
+            attrs += f' tvg-name="{name}"'
+        lines.append(f"#EXTINF:-1{attrs},{name}")
+        lines.append(url)
+    body = "\n".join(lines) + "\n"
+    return Response(body, media_type="application/vnd.apple.mpegurl; charset=utf-8",
+                    headers={"Content-Disposition":
+                             'inline; filename="fnmedia-live.m3u"'})
 
 
 @app.get("/v/api/ext/adfilter/status")

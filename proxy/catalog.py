@@ -296,7 +296,7 @@ class Catalog:
     # -------------------------------------------------- 分类表 / 路由
     async def refresh_routes(self, sources: list[dict]) -> dict[str, Any]:
         # T4 browsing is not CMS deep crawling; never pre-expand cloud plugins.
-        sources = [s for s in sources if s.get("kind") != "t4"]
+        sources = [s for s in sources if s.get("kind") not in ("t4", "live")]
         if self._refreshing:
             return self.status()
         self._refreshing = True

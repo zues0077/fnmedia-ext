@@ -1177,7 +1177,7 @@ async def search_all(keyword: str, sources=None,
     enabled = [s for s in sources if s.get("enabled")]
     # T4 源不排在所有普通源后面：T4/普通交错，最多 8 路并发。
     remote = [s for s in enabled if s.get("kind") == "t4"]
-    legacy = [s for s in enabled if s.get("kind") != "t4"]
+    legacy = [s for s in enabled if s.get("kind") not in ("t4", "live")]
     scheduled = [s for pair in zip_longest(remote, legacy)
                  for s in pair if s is not None]
     if budget is None:

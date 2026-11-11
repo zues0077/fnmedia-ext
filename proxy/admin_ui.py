@@ -568,6 +568,16 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div id="subResult"></div>
       </div>
 
+      <div class="card" style="margin-top:14px">
+        <div class="card-title">📺 电视直播订阅 <button class="small" style="float:right" onclick="loadLiveSubscribe()">刷新</button></div>
+        <p class="card-sub">把库内已导入的 m3u8 直播源（LunaTV <code>lives</code> / 资源站电视直播源）聚合为一份标准 IPTV 播放列表。复制下方地址，到<strong>飞牛影视 → 新增媒体库 → 内容类型选「电视直播」→ URL 导入</strong>粘贴即可，由飞牛原生播放。</p>
+        <div class="row" style="margin:8px 0">
+          <input type="text" id="liveSubUrl" readonly placeholder="正在生成订阅地址…" style="flex:1;font-family:monospace;font-size:12px"/>
+          <button class="small" id="liveSubCopyBtn" onclick="copyLiveSubscribe()">📋 复制订阅地址</button>
+        </div>
+        <div id="liveSubInfo" class="muted sm">正在加载…</div>
+      </div>
+
       <!-- >>> PRIVATE:SPIDER -->
       <div class="card" style="margin-top:14px">
         <div class="card-title">已导入的爬虫源 <button class="small" style="float:right" onclick="loadSpiderMgmt()">刷新</button></div>
@@ -951,7 +961,7 @@ async function switchPage(page){
   // >>> PRIVATE:GUARD
   if(page==="pan"){const f=$("panFrame");if(f&&!f.src)f.src=f.dataset.src;}
   // <<< PRIVATE:GUARD
-  if(page==="importsub"){try{if(!CFG)await loadStatus();}catch(e){}try{if(typeof initSubProxy==="function")initSubProxy();}catch(e){}try{loadAdfilter();}catch(e){}try{if(typeof loadSpiderMgmt==="function")loadSpiderMgmt();}catch(e){}try{if(typeof loadDrpyMgmt==="function")loadDrpyMgmt();}catch(e){}}
+  if(page==="importsub"){try{if(!CFG)await loadStatus();}catch(e){}try{if(typeof initSubProxy==="function")initSubProxy();}catch(e){}try{loadAdfilter();}catch(e){}try{if(typeof loadSpiderMgmt==="function")loadSpiderMgmt();}catch(e){}try{if(typeof loadDrpyMgmt==="function")loadDrpyMgmt();}catch(e){}try{loadLiveSubscribe();}catch(e){}}
   if(page==="about"){loadUpdate(false);try{loadAdminToken();}catch(e){}}
 }
 $$("[data-page]").forEach(b=>b.addEventListener("click",()=>switchPage(b.dataset.page)));
@@ -1860,6 +1870,7 @@ async function importSubscription(kind){
     try{await loadGuard();}catch(e){}
     try{await loadSpiderMgmt();}catch(e){}
     try{await loadDrpyMgmt();}catch(e){}
+    try{loadLiveSubscribe();}catch(e){}
   }catch(e){out.innerHTML='<div class="hint" style="color:var(--danger)">导入出错：'+esc(String(e))+'</div>';}
 }
 async function subToggleGuard(key,on){
@@ -1883,6 +1894,7 @@ async function importFantaiying(){
     try{await loadGuard();}catch(e){}
     try{await loadSpiderMgmt();}catch(e){}
     try{await loadDrpyMgmt();}catch(e){}
+    try{loadLiveSubscribe();}catch(e){}
   }catch(e){out.innerHTML='<div class="hint" style="color:var(--danger)">导入出错：'+esc(String(e))+'</div>';}
 }
 function goDeploy(){switchPage("tvbox");setTimeout(()=>{const b=$("scInstallAll");if(b)b.click();},80);}
@@ -1974,6 +1986,14 @@ function renderSubResult(d){
     h+='<div class="muted sm" style="padding:4px 2px">脚本若 401/下载失败，可在下方「已导入的远程 JS 爬虫」处重试。</div></div>';
   }
   if(dr && dr.error){h+='<div class="hint" style="color:var(--danger)">远程JS导入失败：'+esc(dr.error)+'</div>';}
+  // 电视直播源（LunaTV lives）
+  const lv=d.live||{};
+  if(lv && (lv.added||0)>0){
+    h+='<div class="subgrp"><div class="subgrp-t">📺 电视直播源　新增 '+lv.added+' · 已存在 '+(lv.duplicate||0)+'</div>';
+    (lv.added_names||[]).forEach(n=>{h+='<div class="subrow ok"><span>＋ '+esc(n)+'</span><span class="tag">已聚合进订阅</span></div>';});
+    h+='<div class="muted sm" style="padding:4px 2px">已并入下方「电视直播订阅」，去飞牛影视「电视直播」媒体库 URL 导入即可播放。</div></div>';
+  }
+  if(lv && lv.error){h+='<div class="hint" style="color:var(--danger)">直播源写入失败：'+esc(lv.error)+'</div>';}
   // 跳过
   if(skips.length){
     h+='<details class="subgrp" style="margin-top:8px"><summary class="subgrp-t" style="cursor:pointer">⏭️ 跳过 '+ (d.skipped||skips.length) +' 个（网盘/直播/无法识别/探测失败）</summary>';
@@ -1982,6 +2002,30 @@ function renderSubResult(d){
     h+='</details>';
   }
   $("subResult").innerHTML=h;
+}
+/* ---------- 电视直播订阅（M3U 聚合） ---------- */
+function liveSubscribeUrl(){
+  // 用当前页面 origin 拼直播订阅地址（同源部署，无需额外配置）
+  return location.origin + "/v/api/ext/live/subscribe.m3u";
+}
+async function loadLiveSubscribe(){
+  const inp=$("liveSubUrl"), info=$("liveSubInfo");
+  if(!inp)return;
+  inp.value=liveSubscribeUrl();
+  try{
+    const r=await jget("/v/api/ext/live/status");
+    const d=r.data||{};
+    const n=d.count||0;
+    info.innerHTML=n?("当前共 <b>"+n+"</b> 个直播频道已聚合进订阅。"):"暂无直播频道：先在上方「导入订阅」导一份含 lives 的 LunaTV 订阅，或从资源站添加电视直播源。";
+  }catch(e){
+    info.innerHTML='加载失败：'+esc(String(e));
+  }
+}
+function copyLiveSubscribe(){
+  const inp=$("liveSubUrl");if(!inp||!inp.value)return;
+  const v=inp.value;
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(v).then(()=>toast("已复制订阅地址"),()=>toast("复制失败，请手动选中复制","fail"));}
+  else{inp.select();document.execCommand("copy");toast("已复制订阅地址");}
 }
 // ---------- 已导入普通爬虫源管理 ----------
 /* >>> PRIVATE:SPIDER */

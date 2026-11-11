@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # fnmedia-ext FPK 打包：组装骨架 + 项目主体 → fnpack build → dist/*.fpk
-# 用法：packaging/fpk/build.sh [--public] [--stage-only DIR] [--fnpack /path] [--out dist]
-#   --public  公开包：只含通用公开能力（在全功能源码树上会先执行构建期裁剪）
+# 用法：packaging/fpk/build.sh [--public] [--platform x86|arm|all] [--stage-only DIR] [--fnpack /path] [--out dist]
+#   --public    公开包：只含通用公开能力（在全功能源码树上会先执行构建期裁剪）
+#   --platform  manifest 的 platform 字段；默认 all（本包为纯 Python + 静态资源，
+#               不含架构相关二进制，all 即可同时覆盖 x86/arm；显式指定用于分别发布）
 set -euo pipefail
 
 FPK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,15 +12,21 @@ VERSION="$(head -n1 "${REPO_ROOT}/VERSION" | tr -d '[:space:]')"
 [ -n "${VERSION}" ] || { echo "ERROR: 无法读取 VERSION" >&2; exit 1; }
 
 FNPACK_BIN="${FNPACK:-}"; STAGE=""; STAGE_ONLY=0; OUT_DIR="${REPO_ROOT}/dist"; PUBLIC=0
+PLATFORM="all"
 while [ $# -gt 0 ]; do
   case "$1" in
     --stage-only) STAGE_ONLY=1; STAGE="$2"; shift 2 ;;
     --fnpack) FNPACK_BIN="$2"; shift 2 ;;
     --out) OUT_DIR="$2"; shift 2 ;;
     --public) PUBLIC=1; shift ;;
+    --platform) PLATFORM="$2"; shift 2 ;;
     *) echo "未知参数: $1" >&2; exit 1 ;;
   esac
 done
+case "${PLATFORM}" in
+  x86|arm|loongarch|risc-v|all) ;;
+  *) echo "ERROR: --platform 非法值 '${PLATFORM}'（合法：x86/arm/loongarch/risc-v/all）" >&2; exit 1 ;;
+esac
 [ -n "${STAGE}" ] || STAGE="${FPK_DIR}/.build/fpk"
 command -v rsync >/dev/null 2>&1 || { echo "ERROR: 需要 rsync" >&2; exit 1; }
 
@@ -85,7 +93,8 @@ printf '"""构建期生成：管理页自报构建身份用（勿手改）。"""
 echo "[fpk] 构建戳: ${VERSION} ${BUILD_TIME} ${BUILD_SHA}"
 
 MANIFEST_VER="$(echo "${VERSION}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
-sed "s/@VERSION@/${MANIFEST_VER}/" "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
+sed -e "s/@VERSION@/${MANIFEST_VER}/" -e "s/@PLATFORM@/${PLATFORM}/" \
+  "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
 cp "${FPK_DIR}/ICON.PNG" "${FPK_DIR}/ICON_256.PNG" "${STAGE}/" 2>/dev/null || true
 cp -a "${FPK_DIR}/app/ui/." "${STAGE}/app/ui/"
 cp -a "${FPK_DIR}/cmd" "${STAGE}/cmd"
@@ -137,7 +146,7 @@ BUILT="$(find "${WORK}" "${STAGE}" -maxdepth 2 -name '*.fpk' -print -quit 2>/dev
 [ -n "${BUILT}" ] || { echo "ERROR: fnpack 未产出 .fpk" >&2; exit 1; }
 mkdir -p "${OUT_DIR}"
 SUFFIX=""; [ "${PUBLIC}" -eq 1 ] && SUFFIX="-public"
-FINAL="${OUT_DIR}/fnmedia-ext-${VERSION}${SUFFIX}.fpk"
+FINAL="${OUT_DIR}/fnmedia-ext-${VERSION}${SUFFIX}-${PLATFORM}.fpk"
 mv "${BUILT}" "${FINAL}"
 ( cd "$(dirname "${FINAL}")" && sha256sum "$(basename "${FINAL}")" > "$(basename "${FINAL}").sha256" )
 echo "[fpk] 打包完成: ${FINAL}"

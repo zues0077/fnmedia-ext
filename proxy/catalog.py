@@ -360,6 +360,12 @@ class Catalog:
         sources = [s for s in sources
                    if _src_kind(s) not in ("drpy", "spider")
                    or str(s.get("id") or "") in scopes]
+        # 非 CMS 源只拉分类表、**不做建库前的探测**：sidecar 是串行的，一个源
+        # 5 个分类 × 每类最多 9 个叶子候选，能把整轮刷新（调用方给 90 秒）
+        # 直接顶超时，结果所有库都建不出来。路由用分类表直接建（页数按上限
+        # 估算），首屏翻页时按实际返回自然收敛。
+        lazy_ids = {str(s.get("id") or "") for s in sources
+                    if _src_kind(s) in ("drpy", "spider")}
         if self._refreshing:
             return self.status()
         self._refreshing = True
@@ -378,6 +384,8 @@ class Catalog:
             all_by_cat: dict[tuple[str, str], list[dict]] = {}
             order: list[tuple[str, str]] = []
             for sid, classes in self._classes.items():
+                if sid in lazy_ids or _src_kind(self._source_by_id(sid) or {}) in ("drpy", "spider"):
+                    continue          # 非 CMS 源不预探（见上）
                 per_cat: dict[str, list[dict]] = {}
                 for cl in classes:
                     cat = cl.get("cat")
@@ -634,6 +642,16 @@ class Catalog:
         # 只报实际找到的数，没找到就是 0。
         if cat == "uhd" and not self._routes.get(self._scope_key(scope, cat)):
             return self.dense_count(cat, scope)
+        # 非 CMS 独立库（drpy / csp 爬虫）建库时不预探页数，路由里的页数只是
+        # 上限估算，按它算 total 会虚高几千条：库里其实没内容，界面却显示
+        # 20000 条然后一直翻空页。只报已实际翻到的条数。
+        if scope != AGG_SCOPE:
+            try:
+                import config as _cfg
+                if _cfg.source_type(self._source_by_id(scope) or {}) in ("drpy", "spider"):
+                    return self.dense_count(cat, scope)
+            except Exception:  # noqa: BLE001
+                pass
         return self.pagecount(cat, scope) * PAGE_SIZE
 
     def routes_stale(self) -> bool:

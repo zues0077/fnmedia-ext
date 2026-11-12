@@ -11555,11 +11555,18 @@ async def ext_source_standalone(request: Request):
     sid = body.get("id", "")
     on = bool(body.get("standalone"))
     target = next((s for s in config.all_sources() if s["id"] == sid), None)
-    # >>> PRIVATE:DDUO
-    if features.DDUO and target and target.get("xsrc"):
-        return JSONResponse({"code": 400, "msg": "多多影视为非标准源，不支持独立媒体库"},
-                            status_code=400)
-    # <<< PRIVATE:DDUO
+    # 只有「有分类接口且还没有自己专属库」的类型才能建独立库。
+    # WASM 站没有分类接口；网盘已有「小雅库」；加固源已有加固专题库。
+    # 之前这里一刀切拒绝所有 xsrc，把 drpy / csp 爬虫也挡在外面（而它们的
+    # 分类接口其实是有的）。
+    if on and target is not None:
+        _st = cfgmod.source_type(target)
+        if _st in ("dduo", "catvod", "guard"):
+            return JSONResponse({"code": 400, "msg": {
+                "dduo": "WASM 站只有搜索/详情接口，没有分类接口，无法建库",
+                "catvod": "网盘源已有「小雅库」，无需再建独立库",
+                "guard": "加固源已有「加固影视」专题库",
+            }[_st]}, status_code=400)
     ok, info = config.set_standalone(sid, on)
     if not ok:
         return JSONResponse({"code": 404, "msg": info}, status_code=404)

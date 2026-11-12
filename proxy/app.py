@@ -10700,6 +10700,63 @@ async def ext_cache_clear(request: Request):
             "msg": "已清除：" + "、".join(done) + ("，服务重启中" if need_restart else "")}
 
 
+# --------------------------------------------------------------- 分类规则库
+# 「一份规则，所有源共用」：分类名的归属是全局唯一的，跟哪个源无关。
+# 规则落盘 state/classify_rules.json，内置默认规则不写盘（升级能带新规则走）。
+# 认不出来的分类名进「未归类池」，页面点一下归类就写回规则，下次建库全源生效。
+@app.get("/v/api/ext/classify/rules")
+async def ext_classify_rules(request: Request):
+    snap = catalogmod.rules_snapshot()
+    pool = catalog.unclassified()
+    cats = [{"id": c, "title": catalogmod.catalog_title(c)}
+            for c, _, _ in catalogmod.CATALOG_CATEGORIES]
+    cats.append({"id": catalogmod.ADULT_CAT,
+                 "title": catalogmod.catalog_title(catalogmod.ADULT_CAT)})
+    # 池子里带上示例源名，页面不用再翻一遍配置
+    try:
+        names = {s["id"]: (s.get("name") or s["id"]) for s in config.all_sources()}
+    except Exception:  # noqa: BLE001
+        names = {}
+    for it in pool.get("items") or []:
+        it["sample_names"] = [names.get(x, x) for x in (it.get("sample") or [])]
+    return {"code": 0, "data": {"rules": snap, "unclassified": pool, "cats": cats}}
+
+
+@app.post("/v/api/ext/classify/rule")
+async def ext_classify_rule(request: Request):
+    """增改/删除一条规则。
+
+    body: {name, cat, exact?, delete?}
+      - cat 为库 id → 归入该库；cat 为空/__drop__ → 确认丢弃（不再进未归类池）；
+      - delete=true → 删除这条自定义规则，回落默认规则。
+    """
+    body = await request.json()
+    name = str(body.get("name") or "").strip()
+    exact = bool(body.get("exact", True))
+    if body.get("delete"):
+        ok, msg = catalogmod.del_rule(name, exact)
+    else:
+        cat = body.get("cat")
+        if not isinstance(cat, str):
+            cat = None
+        else:
+            cat = cat.strip()
+            if cat in ("", "__drop__", "drop", "none", "null"):
+                cat = None
+        ok, msg = catalogmod.set_rule(name, cat, exact)
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    _schedule_routes_refresh()
+    return {"code": 0, "msg": msg, "data": catalogmod.rules_snapshot()}
+
+
+@app.post("/v/api/ext/classify/rebuild")
+async def ext_classify_rebuild(request: Request):
+    """按当前规则重建分类路由。后台跑，旧库在整表替换前一直可用。"""
+    _schedule_routes_refresh()
+    return {"code": 0, "msg": "已开始按当前规则重建，几十秒后刷新查看"}
+
+
 # --------------------------------------------------------------- 管理令牌：状态 / 登录 / 轮换
 # 注意：admin_token 历史上只生成、从不校验；本模块只提供校验/轮换/限流
 # 检查点，不给既有 /v/api/ext/* 接口加鉴权门。用户决定（2026-11-09，
@@ -11615,8 +11672,9 @@ async def ext_source_adult(request: Request):
     target = next((s for s in config.all_sources() if s["id"] == sid), None)
     if not target:
         return JSONResponse({"code": 404, "msg": "源不存在"}, status_code=404)
-    if on and not target.get("standalone"):
-        return JSONResponse({"code": 400, "msg": "请先把该源设为独立媒体库"}, status_code=400)
+    # 18 是「源级内容授权」，作用在全局 🔞福利 库的分类归集上，与是否建独立库
+    # 无关——以前这里强制要求 standalone，导致「只想要福利内容、不想多一张库卡」
+    # 的用户被堵死。解绑后不勾「库」也能标 18。
     ok, info = config.set_adult(sid, on)
     if not ok:
         return JSONResponse({"code": 404, "msg": info}, status_code=404)
@@ -13823,6 +13881,15 @@ refresh();
         """mode=sites：可浏览加固源及其分类；hot：聚合各源首页推荐；
         category：某源某分类一页。均返回海报卡片（含可直接播放的 m3u8）。"""
         if not _guard.available():
+            # 分清两种「不可用」，别都甩一句「运行时未就绪」——实测 503 的真因
+            # 往往是「一个加固源都没有」（feature_on 要求 sites.json 或 imported.json
+            # 存在），此时容器其实是活的，提示人启动运行时会让人白折腾。
+            if not _guard.feature_on():
+                return JSONResponse(
+                    {"code": 503, "data": None,
+                     "msg": "还没有任何加固源：加固源不随插件内置，请用下方「导入加固源」"
+                            "导入一份含 csp_*Guard 的配置（TVBox type=3 DexGuard 源）后才能浏览"},
+                    status_code=503)
             return JSONResponse({"code": 503, "msg": "加固运行时未就绪，请先在本页启动 Android 运行时",
                                  "data": None}, status_code=503)
         limit = max(1, min(int(limit or 60), 120))

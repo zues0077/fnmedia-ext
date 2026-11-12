@@ -145,3 +145,25 @@ def test_reset_removes_disk_file(monkeypatch, tmp_path):
     cat.reset()
     assert not f.exists()
     assert cat._routes == {} and cat._classes == {}
+
+
+def test_hot_worker_never_reloads_disk():
+    """load_disk 只许在启动时读一次，_hot_worker 循环体里不能出现。
+
+    实测踩过的坑（2026-11-12）：把读盘块放进 _hot_worker 的 while 循环后，
+    日志每 5 分钟重复打印一次；而且每轮都用磁盘旧表覆盖内存里的 _classes/
+    _routes，运行期刚 rescue 出来的路由被回滚，_fallbacks 却不跟着回滚。
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "proxy" / "app.py"
+           ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
+               and n.name == "_hot_worker"), None)
+    assert fn is not None, "app.py 里找不到 _hot_worker"
+    body = ast.get_source_segment(src, fn) or ""
+    # 只禁「调用」，注释里提到 load_disk 是允许的（那里专门写了为什么不能调）
+    assert "load_disk(" not in body, "_hot_worker 循环里不许再调 load_disk"

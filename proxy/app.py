@@ -2232,6 +2232,13 @@ async def lifespan(app: FastAPI):
     app.state.ext = httpx.AsyncClient(
         timeout=httpx.Timeout(30), trust_env=False, follow_redirects=True)
     app.state.stop_hot = asyncio.Event()
+    # >>> OPTIONAL:DISK CACHE
+    # 启动只读一次上次落盘：重启后立刻有分类路由可用，不用空等一轮建库。
+    # 必须放在这里、不能放 _hot_worker 的循环体里 —— 那里每 5 分钟跑一轮，
+    # 会用磁盘旧表覆盖运行期刚刷新/刚 rescue 出来的路由。
+    if config.get().get("catalog_library_enabled", True) and catalog.load_disk():
+        _log.info("catalog routes restored from disk")
+    # <<< OPTIONAL:DISK CACHE
     app.state.hot_task = asyncio.create_task(_hot_worker(app))
 
     # 网盘转存缓存定时清理（默认保留 6h，每小时检查；配置关闭则不跑）。
@@ -2402,14 +2409,8 @@ async def _hot_worker(app: FastAPI):
                 _log.warning("chart refresh timed out; keeping previous cache")
             except Exception as exc:
                 _log.warning("chart refresh failed, keeping previous cache: %s", exc)
-        # >>> OPTIONAL:DISK CACHE
-        # 先读上次落盘的分类表与路由：重启后秒开，不用空等一轮建库。
-        # 缓存新鲜（< CLASS_REFRESH）时下面这轮刷新会被跳过，重启连网络风暴都没有；
-        # 缓存过期则先顶上旧表、再后台重建，用户看到的是「上次的库」而不是空海报墙。
-        # 整层可摘除（catalog.DISK_CACHE=False 或删掉本块），摘了就是旧行为。
-        if catalog_on and catalog.load_disk():
-            _log.info("catalog routes restored from disk")
-        # <<< OPTIONAL:DISK CACHE
+        # 落盘只在启动时读一次（见 lifespan 的 DISK CACHE 块）。这里绝不能再
+        # load_disk：循环每 5 分钟跑一轮，会把运行期刚刷新的路由用磁盘旧表覆盖回去。
         if catalog_on and catalog.routes_stale():
             try:
                 await asyncio.wait_for(

@@ -33,6 +33,42 @@ PAGE_TTL = 10 * 60
 # 空页（多为慢源抖动超时）只短缓存，避免该页被长时间冻结
 EMPTY_TTL = 15
 HTTP_TIMEOUT = 12.0
+# 非苹果 CMS 源（drpy / csp 爬虫）多数不回 pagecount，用这个估算值兜底：
+# 翻到末页时返回空列表，_extend_dense 连续 3 个空页就停，不会真翻 30 页。
+XSRC_DEFAULT_PAGES = 30
+# 非 CMS 源的分类表要走 sidecar 再去源站首页，慢源首访常超 12 秒（实测
+# csp 爬虫首拉 0.6~12s+）。建库是一次性动作，给宽一点的 25 秒，别让首访抖动
+# 直接把独立库判成「没有分类」。
+XSRC_CLASS_TIMEOUT = 25.0
+
+
+def _src_kind(source: dict) -> str:
+    """源真实类型（统一口径见 config.source_type）。"""
+    try:
+        import config as _cfg
+        return _cfg.source_type(source)
+    except Exception:  # noqa: BLE001
+        return "cms"
+
+
+def _xsrc_fn(kind: str, name: str):
+    """取 providers 里某私有类型的独立库适配函数。
+
+    适配函数写在 providers 的 PRIVATE 块里：公开构建剥离后这里取到 None，
+    调用方按「该类型不支持」降级，不会因缺符号崩。
+    """
+    return getattr(providers, f"_xsrc_{name}_{kind}", None)
+
+
+def _map_vod_any(v: dict, source: dict):
+    """按源类型把列表项映射成 OnlineTitle（苹果 CMS / drpy / csp 各有各的字段）。"""
+    kind = _src_kind(source)
+    if kind in ("drpy", "spider"):
+        fn = _xsrc_fn(kind, "map")
+        if fn is not None:
+            return fn(source, v)
+        return None
+    return providers._map_vod(v, source)
 
 # 大类 -> 展示名 / MediaDB category
 CATALOG_CATEGORIES = [
@@ -219,6 +255,14 @@ def classify_source_class(name: str, adult_allowed: bool) -> str | None:
 
 
 async def _fetch_class_list(client: httpx.AsyncClient, source: dict) -> list[dict]:
+    # 非苹果 CMS 源（drpy / csp 爬虫）没有 ac=list，走各自 sidecar 的 home()。
+    kind = _src_kind(source)
+    if kind in ("drpy", "spider"):
+        fn = _xsrc_fn(kind, "classes")
+        if fn is None:
+            return []
+        cls = await asyncio.wait_for(fn(source), timeout=XSRC_CLASS_TIMEOUT)
+        return cls if isinstance(cls, list) else []
     base = source["api"].split("/at/json")[0].split("?")[0]
     r = await client.get(base, params={"ac": "list"},
                          headers={"User-Agent": "Mozilla/5.0"}, timeout=HTTP_TIMEOUT)
@@ -232,6 +276,18 @@ async def _fetch_category_page(client: httpx.AsyncClient, source: dict,
                                type_id, page: int,
                                timeout: float = HTTP_TIMEOUT) -> tuple[list, int]:
     """返回 (本页 vod 列表, 该分类总页数)。"""
+    # 非苹果 CMS 源：drpy / csp 爬虫的分类接口在各自 sidecar 里（同步调用放线程）。
+    kind = _src_kind(source)
+    if kind in ("drpy", "spider"):
+        fn = _xsrc_fn(kind, "page")
+        if fn is None:
+            return [], 0
+        try:
+            lst, pc = await asyncio.wait_for(
+                asyncio.to_thread(fn, source, type_id, page), timeout=timeout)
+        except Exception:  # noqa: BLE001
+            return [], 0
+        return (lst or []), int(pc or 0) or XSRC_DEFAULT_PAGES
     base = source["api"].split("/at/json")[0].split("?")[0]
     # 注意：分类深翻不能带 h 参数（部分源加 h 后返回空/pagecount=0）。
     r = await client.get(base, params={"ac": "detail", "t": type_id, "pg": page},
@@ -297,6 +353,13 @@ class Catalog:
     async def refresh_routes(self, sources: list[dict]) -> dict[str, Any]:
         # T4 browsing is not CMS deep crawling; never pre-expand cloud plugins.
         sources = [s for s in sources if s.get("kind") not in ("t4", "live")]
+        scopes = set(self.standalone_scopes())
+        # drpy / csp 爬虫只服务「独立媒体库」：它们每页 20~40 条、靠 sidecar 串行，
+        # 混进海量四库只会挤掉规范源。没人勾「库」时连分类表都不拉——每个源
+        # 一次 home()，103 个源一起拉会把刷新拖到分钟级。
+        sources = [s for s in sources
+                   if _src_kind(s) not in ("drpy", "spider")
+                   or str(s.get("id") or "") in scopes]
         if self._refreshing:
             return self.status()
         self._refreshing = True
@@ -379,7 +442,8 @@ class Catalog:
                 cats = CATS + ([ADULT_CAT] if _welfare_on() else [])
                 for cat in cats:
                     if scope == AGG_SCOPE:
-                        rs = [probed[(cat, sid)] for (c2, sid) in probed if c2 == cat]
+                        rs = [probed[(cat, sid)] for (c2, sid) in probed
+                              if c2 == cat and self._agg_ok(sid)]
                         rs.sort(key=lambda r: -(r.get("pagecount") or 0))
                         # 聚合：首选最深的源，并附带其余可深翻源做回退
                         out[cat] = rs
@@ -476,6 +540,15 @@ class Catalog:
             return next((s for s in config.all_sources() if s["id"] == sid), None)
         except Exception:
             return None
+
+    def _agg_ok(self, sid: str) -> bool:
+        """该源能否进跨源聚合的海量四库：只收苹果 CMS 深翻源。
+
+        drpy / csp 爬虫只做独立库（页小、慢、靠 sidecar），混进四库会把
+        规范源挤掉，也会让海量库分页忽多忽少。
+        """
+        src = self._source_by_id(sid)
+        return bool(src) and _src_kind(src) not in ("drpy", "spider")
 
     def cat_for_source_type(self, source_id: str, type_id) -> str | None:
         """(source_id, type_id) → 该源分类路由的 cat；路由未加载/无匹配返回 None。
@@ -735,7 +808,7 @@ class Catalog:
         briefs = []
         for v in vods:
             try:
-                t = providers._map_vod(v, source)
+                t = _map_vod_any(v, source)
             except Exception:
                 continue
             if not t or not t.title:

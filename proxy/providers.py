@@ -290,6 +290,14 @@ class Episode:
     # 加固爬虫：播放前由 Android runner 的 playerContent 解析（公开构建恒 False）
     guard: bool = False
     # <<< PRIVATE:GUARD
+    # >>> PRIVATE:SPIDER
+    # 普通 csp 爬虫：url 是 vod_id/playUrl，播放前由 Java sidecar 的
+    # playerContent 解析（公开构建恒 False）。
+    # 2026-11-12：此前 _spider_map_item 传了 spider_src=True 但 Episode 没有
+    # 这个字段 → 每个 csp 源在「搜索结果 → 剧集」映射时就抛 TypeError，
+    # 95 个爬虫源永远搜不出任何条目。
+    spider_src: bool = False
+    # <<< PRIVATE:SPIDER
 
 
 @dataclass
@@ -877,6 +885,66 @@ async def probe_source_quality(source: dict, *, timeout: float = 25.0,
     return out
 
 
+def _quality(state: str, *, lat_ms=0, count=0, error: str = "", hit: int = 0,
+             direct: int = 0, keyword: str = "") -> dict:
+    """构造与 probe_source_quality 同构的探测结果（各类型探测共用）。"""
+    return {"state": state, "ok": state in ("ok", "limited"), "status": 0,
+            "lat_ms": int(lat_ms), "list_count": int(count), "hit": int(hit),
+            "direct": int(direct), "keyword": keyword or "", "error": error}
+
+
+async def probe_any_source(source: dict, *, keyword: str = "",
+                           timeout: float = 25.0) -> dict:
+    """按源**真实类型**探测（管理页「测试」与定时巡检共用）。
+
+    为什么要分派：`probe_source_quality` 只认苹果 CMS 的 `ac=list` JSON。
+    对非 CMS 源它会给出误导性结论（实测：dduo 恒 unsupported、小雅
+    `catvod://` 直接判 invalid 并立刻停用）。这里按类型走各自的轻量接口：
+      cms    → ac=list + 关键词命中（原逻辑不动）
+      t4     → t4.probe（真机服务端）
+      dduo   → 搜索接口（WASM 站没有 ac=list）
+      drpy   → Node sidecar 的 home() 分类表
+      spider → Java sidecar 的 home() 分类表
+      catvod → 小雅 home() 分类表
+      guard  → Android runner 的 home()（巡检不跑，只服务手动测速）
+    各类型探测函数放在对应 PRIVATE 块里；公开构建里取不到 → unsupported
+    （不计失败，避免把「本构建没有该运行时」当成源死了）。
+    """
+    try:
+        import config as _cfgmod
+        st = _cfgmod.source_type(source)
+    except Exception:  # noqa: BLE001
+        st = "cms"
+    kw = keyword or ""
+    if st == "live":
+        return _quality("unsupported", error="直播源走 m3u8 探测")
+    if st == "t4":
+        try:
+            r = await probe_source(source.get("api") or "",
+                                   keyword=kw or PROBE_HOT_KEYWORDS[0],
+                                   timeout=timeout, source=source)
+        except Exception as exc:  # noqa: BLE001
+            return _quality("fail", error=type(exc).__name__, keyword=kw)
+        return _quality("ok" if r.get("ok") else "fail",
+                        lat_ms=r.get("elapsed_ms") or 0,
+                        count=r.get("count") or 0,
+                        error=r.get("error") or "", keyword=kw)
+    if st in ("dduo", "drpy", "spider", "catvod", "guard"):
+        fn = globals().get(f"_probe_{st}_source")
+        if fn is None:
+            return _quality("unsupported", error="当前构建不含该类型运行时",
+                            keyword=kw)
+        try:
+            return await asyncio.wait_for(fn(source, kw, timeout),
+                                          timeout=timeout + 3)
+        except asyncio.TimeoutError:
+            return _quality("fail", lat_ms=timeout * 1000, error="超时",
+                            keyword=kw)
+        except Exception as exc:  # noqa: BLE001
+            return _quality("unsupported", error=type(exc).__name__, keyword=kw)
+    return await probe_source_quality(source, timeout=timeout, keyword=keyword)
+
+
 # >>> PRIVATE:DDUO
 # ---------------- 多多影视（非标准源，仅完整构建） ----------------
 def _dduo_root(source: dict) -> str:
@@ -997,6 +1065,18 @@ async def dduo_probe_source(source: dict, keyword: str = "庆余年",
                 "count": 0, "sample": "", "error": type(exc).__name__}
 
 
+async def _probe_dduo_source(source: dict, keyword: str, timeout: float) -> dict:
+    """巡检/测试用：多多源按搜索接口探测（它没有 ac=list 接口）。"""
+    r = await dduo_probe_source(source, keyword=keyword or PROBE_HOT_KEYWORDS[0],
+                                timeout=timeout)
+    ok = bool(r.get("ok"))
+    cnt = int(r.get("count") or 0)
+    return _quality("ok" if ok else "fail",
+                    lat_ms=r.get("elapsed_ms") or 0, count=cnt,
+                    error=r.get("error") or "",
+                    hit=1 if (ok and cnt > 0) else 0, keyword=keyword)
+
+
 # <<< PRIVATE:DDUO
 
 
@@ -1056,6 +1136,40 @@ async def xiaoya_search_source(client, source: dict,
         if t.title and t.sources:
             out.append(t)
     return out
+
+
+async def _probe_catvod_source(source: dict, keyword: str, timeout: float) -> dict:
+    """巡检/测试用：小雅网盘按 catvod home() 分类表判活。
+
+    之前巡检把 `catvod://xiaoya` 当苹果 CMS 地址探测 → 判「地址非法」→
+    一启用就被立刻停用（误杀）。登录/凭证类失败算 unsupported 不计失败。
+    """
+    import catvod as _cv
+    if not _cv.available():
+        return _quality("unsupported", error="catvod 运行时不可用", keyword=keyword)
+    t0 = time.monotonic()
+    try:
+        tok = await _cv.xiaoya_token()
+        home = await asyncio.to_thread(_cv.home, True, tok)
+        ms = int((time.monotonic() - t0) * 1000)
+        cls = (home.get("class") if isinstance(home, dict) else None) or []
+        if isinstance(cls, dict):
+            cls = list(cls.values())
+        if cls:
+            return _quality("ok", lat_ms=ms, count=len(cls), keyword=keyword)
+        return _quality("unsupported", lat_ms=ms, error="首页无分类",
+                        keyword=keyword)
+    except Exception as exc:  # noqa: BLE001
+        nm = type(exc).__name__
+        msg = str(exc).lower()
+        conn = nm in _CONN_ERROR_NAMES or any(
+            k in msg for k in ("timeout", "timed out", "econn", "unknownhost",
+                               "nxdomain", "enotfound", "getaddrinfo",
+                               "connection"))
+        auth = any(k in msg for k in ("登录", "密码", "token", "401", "403"))
+        return _quality("fail" if (conn and not auth) else "unsupported",
+                        lat_ms=int((time.monotonic() - t0) * 1000),
+                        error=nm, keyword=keyword)
 
 
 # <<< PRIVATE:CATVOD
@@ -1122,6 +1236,68 @@ async def drpy_search_source(client, source: dict,
         if t.title and t.sources:
             out.append(t)
     return out
+
+
+async def _probe_drpy_source(source: dict, keyword: str, timeout: float) -> dict:
+    """巡检/测试用：JS 源按 Node sidecar 的 home() 分类表判活。
+
+    没有 ac=list 可打，规则脚本本身也没有统一健康接口；home() 能拿到分类
+    即说明运行时/规则/站点三者都通。规则报错（业务级）算 unsupported 不计
+    失败，只有连接级错误才计 fail。
+    """
+    import drpy as _drpym
+    if not _drpym.available():
+        return _quality("unsupported", error="JS 运行时不可用（缺 Node/规则脚本）",
+                        keyword=keyword)
+    t0 = time.monotonic()
+    try:
+        home = await asyncio.to_thread(_drpym.home, _drpy_site(source))
+        ms = int((time.monotonic() - t0) * 1000)
+        cls = (home.get("class") if isinstance(home, dict) else None) or []
+        if isinstance(cls, dict):
+            cls = list(cls.values())
+        if cls:
+            return _quality("ok", lat_ms=ms, count=len(cls), keyword=keyword)
+        return _quality("unsupported", lat_ms=ms,
+                        error="首页无分类（规则可能已失效）", keyword=keyword)
+    except Exception as exc:  # noqa: BLE001
+        nm = type(exc).__name__
+        msg = str(exc).lower()
+        conn = nm in _CONN_ERROR_NAMES or any(
+            k in msg for k in ("timeout", "timed out", "econn", "unknownhost",
+                               "nxdomain", "enotfound", "getaddrinfo"))
+        return _quality("fail" if conn else "unsupported",
+                        lat_ms=int((time.monotonic() - t0) * 1000),
+                        error=nm, keyword=keyword)
+
+
+# ---- 独立库适配（catalog 通过 getattr 取用；公开构建无此块 → 自然降级） ----
+async def _xsrc_classes_drpy(source: dict) -> list[dict]:
+    """JS 源的家庭分类表（Node sidecar home()），供独立媒体库建路由。"""
+    import drpy
+    home = await asyncio.to_thread(drpy.home, _drpy_site(source))
+    cls = (home.get("class") if isinstance(home, dict) else None) or []
+    if isinstance(cls, dict):
+        cls = list(cls.values())
+    return cls if isinstance(cls, list) else []
+
+
+def _xsrc_page_drpy(source: dict, type_id, page: int) -> tuple[list, int]:
+    """JS 源某分类某页 → (vod 列表, 总页数)。规则多数不回 pagecount，回 0 由调用方兜底。"""
+    import drpy
+    res = drpy.category(_drpy_site(source), type_id, page)
+    if not isinstance(res, dict):
+        return [], 0
+    lst = res.get("list") or []
+    try:
+        pc = int(res.get("pagecount") or 0)
+    except (TypeError, ValueError):
+        pc = 0
+    return (lst if isinstance(lst, list) else []), pc
+
+
+def _xsrc_map_drpy(source: dict, v: dict):
+    return _drpy_map_item(source, v)
 
 
 # <<< PRIVATE:DRPY
@@ -1193,6 +1369,35 @@ async def guard_search_source(client, source: dict, keyword: str) -> list[Online
     return out
 
 
+async def _probe_guard_source(source: dict, keyword: str, timeout: float) -> dict:
+    """管理页「测试」用：加固源按 home() 分类表判活。
+
+    加固源 api 是 `guard://<key>`，绝不能走苹果 CMS 探测（会被判「地址非法」）。
+    巡检本身不覆盖加固源（占用真机设备），这里只服务手动测速。
+    """
+    import guard as _g
+    conf = _guard_conf(source)
+    if not conf:
+        return _quality("unsupported", error="未找到该加固源配置", keyword=keyword)
+    if not _g.available():
+        return _quality("unsupported", error="加固运行时不可用（redroid 未就绪）",
+                        keyword=keyword)
+    t0 = time.monotonic()
+    try:
+        home = await asyncio.to_thread(_g.home, conf)
+        ms = int((time.monotonic() - t0) * 1000)
+        cls = (home.get("class") if isinstance(home, dict) else None) or []
+        if isinstance(cls, dict):
+            cls = list(cls.values())
+        if cls:
+            return _quality("ok", lat_ms=ms, count=len(cls), keyword=keyword)
+        return _quality("unsupported", lat_ms=ms, error="首页无分类",
+                        keyword=keyword)
+    except Exception as exc:  # noqa: BLE001
+        return _quality("unsupported", lat_ms=int((time.monotonic() - t0) * 1000),
+                        error=type(exc).__name__, keyword=keyword)
+
+
 # <<< PRIVATE:GUARD
 
 
@@ -1256,6 +1461,75 @@ async def spider_search_source(client, source: dict, keyword: str) -> list[Onlin
         if t.title and t.vod_id:
             out.append(t)
     return out
+
+
+async def _probe_spider_source(source: dict, keyword: str, timeout: float) -> dict:
+    """巡检/测试用：csp 爬虫按 Java sidecar 的 home() 分类表判活。
+
+    与 drpy 同理：没有 ac=list，规则报错算业务级（unsupported 不计失败），
+    只有连接级错误才计 fail；运行时缺失（未部署 redroid/jar）也不计失败。
+    """
+    import spiders as _spm
+    conf = _spider_conf(source)
+    if not conf:
+        return _quality("unsupported", error="未找到该爬虫配置（jar 未导入）",
+                        keyword=keyword)
+    if not _spm.available():
+        return _quality("unsupported", error="爬虫运行时不可用", keyword=keyword)
+    t0 = time.monotonic()
+    try:
+        home = await asyncio.to_thread(_spm.home, conf)
+        ms = int((time.monotonic() - t0) * 1000)
+        cls = (home.get("class") if isinstance(home, dict) else None) or []
+        if isinstance(cls, dict):
+            cls = list(cls.values())
+        if cls:
+            return _quality("ok", lat_ms=ms, count=len(cls), keyword=keyword)
+        return _quality("unsupported", lat_ms=ms,
+                        error="首页无分类（规则可能已失效）", keyword=keyword)
+    except Exception as exc:  # noqa: BLE001
+        nm = type(exc).__name__
+        msg = str(exc).lower()
+        conn = nm in _CONN_ERROR_NAMES or any(
+            k in msg for k in ("timeout", "timed out", "econn", "unknownhost",
+                               "nxdomain", "enotfound", "getaddrinfo"))
+        return _quality("fail" if conn else "unsupported",
+                        lat_ms=int((time.monotonic() - t0) * 1000),
+                        error=nm, keyword=keyword)
+
+
+# ---- 独立库适配（catalog 通过 getattr 取用；公开构建无此块 → 自然降级） ----
+async def _xsrc_classes_spider(source: dict) -> list[dict]:
+    """csp 爬虫的家庭分类表（Java sidecar home()），供独立媒体库建路由。"""
+    import spiders
+    conf = _spider_conf(source)
+    if not conf:
+        return []
+    home = await asyncio.to_thread(spiders.home, conf)
+    cls = (home.get("class") if isinstance(home, dict) else None) or []
+    if isinstance(cls, dict):
+        cls = list(cls.values())
+    return cls if isinstance(cls, list) else []
+
+
+def _xsrc_page_spider(source: dict, type_id, page: int) -> tuple[list, int]:
+    import spiders
+    conf = _spider_conf(source)
+    if not conf:
+        return [], 0
+    res = spiders.category(conf, type_id, page)
+    if not isinstance(res, dict):
+        return [], 0
+    lst = res.get("list") or []
+    try:
+        pc = int(res.get("pagecount") or 0)
+    except (TypeError, ValueError):
+        pc = 0
+    return (lst if isinstance(lst, list) else []), pc
+
+
+def _xsrc_map_spider(source: dict, v: dict):
+    return _spider_map_item(source, v)
 
 
 # <<< PRIVATE:SPIDER

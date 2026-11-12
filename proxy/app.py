@@ -3008,11 +3008,15 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
                if not (features.ADULT and s.get("adult"))
                and (include_t4 or s.get("kind") not in ("t4", "live"))]
     if fast_only:
+        # 快路径只排掉「要重型运行时」的源：加固（redroid 真机）、csp 爬虫（按 jar
+        # 起 JVM）、drpy（Node sidecar 单线程串行）。dduo 是普通 HTTP + 本地 WASM
+        # 解码，天然够快，之前把 id=dduo 一起排除导致「启用了却搜不到」，已放行。
         sources = [s for s in sources
                    if not s.get("guard") and not s.get("spider_src")
                    and not str(s.get("id", "")).startswith(("spider-", "drpy-"))
+                   and not s.get("drpy")
                    and s.get("api")
-                   and s.get("id") not in ("dduo", "xiaoya")]
+                   and s.get("id") != "xiaoya"]
     # 巡检结果回流（第 3 批）：按质量字典序排序，只取前 N 个进入搜索。
     # search_all 是 8 路并发 + 命中 25 条提前返回，源排在第几位直接决定它
     # 有没有机会出结果。N=0 表示只排序不截断。
@@ -3023,8 +3027,9 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
     except (TypeError, ValueError):
         _top_n = 0
     ranked = config.rank_sources(sources)
-    head = ranked[:_top_n] if _top_n > 0 else ranked
-    tail = ranked[len(head):]
+    # 纯质量排序 + 截断会让非 CMS 类型全被挤出首轮（实测 167 启用源 head(40)
+    # 全是 cms，92 spider + 8 drpy 永远搜不到），这里改按类型保底名额。
+    head, tail = cfgmod.pick_head(ranked, _top_n)
     sources = head
     # 总预算：此前只在有 T4 源时传 5.0s，无 T4 时 budget=None，search_all
     # 等全部源完成——最慢源（加固 8s / CMS 12s / 爬虫 25s 单源超时）拖死
@@ -5698,8 +5703,6 @@ async def search_list(request: Request):
             _task.cancel()
             _task.add_done_callback(lambda t: t.cancelled() or t.exception())
             online = partial.get("cards") or []
-            if online:
-                _log.info("online search partial: %d cards (8.5s cap)", len(online))
             if online:
                 _log.info("online search partial: %d cards (8.5s cap)", len(online))
         except Exception as exc:
@@ -10796,9 +10799,17 @@ async def ext_status(request: Request):
         blocked = sorted(config.blocked_ids())
     except Exception:  # noqa: BLE001
         pinned, blocked = [], []
+    # 管理页要按「真实类型」打标签（WASM/JS/JAR/网盘/加固），不能再靠前端用
+    # xsrc 一刀切。这里只给响应副本补 stype，不写进配置文件。
+    _cfg = {k: v for k, v in config.get().items() if k != "admin_token"}
+    try:
+        _cfg["sources"] = [{**s, "stype": cfgmod.source_type(s)}
+                           for s in (_cfg.get("sources") or [])]
+    except Exception:  # noqa: BLE001
+        pass
     return {"ok": True,
             "build": BUILD_LABEL,
-            "config": {k: v for k, v in config.get().items() if k != "admin_token"},
+            "config": _cfg,
             "source_priority": priorities,
             # 实测源画像（匹配率/成功率/延迟/分级），供「片源质量」页只读展示
             "source_health": health_snap,
@@ -11726,6 +11737,15 @@ async def ext_source_restore_one(request: Request):
     return {"code": 0, "msg": "已恢复"}
 
 
+def _probe_payload(q: dict) -> dict:
+    """把 providers.probe_any_source 的质量结构转成管理页「测试」按钮的形状。"""
+    return {"ok": bool(q.get("ok")), "status": int(q.get("status") or 0),
+            "elapsed_ms": int(q.get("lat_ms") or 0),
+            "count": int(q.get("list_count") or 0),
+            "direct": int(q.get("direct") or 0), "sample": "",
+            "error": "" if q.get("ok") else (q.get("error") or "失败")}
+
+
 @app.post("/v/api/ext/source/test")
 async def ext_source_test(request: Request):
     body = await request.json()
@@ -11737,15 +11757,11 @@ async def ext_source_test(request: Request):
             return JSONResponse({"code": 404, "msg": "源不存在"}, status_code=404)
         api = src["api"]
     keyword = (body.get("keyword") or "庆余年").strip()
-    # >>> PRIVATE:DDUO
-    if features.DDUO:
-        xsrc = next((s for s in config.all_sources() if s.get("xsrc")
-                     and (s["id"] == sid or (not sid and s["api"] == api))), None)
-        if xsrc:
-            result = await providers.dduo_probe_source(xsrc, keyword=keyword)
-            return {"code": 0, "msg": "", "data": result}
-    # <<< PRIVATE:DDUO
-    result = await providers.probe_source(api, keyword=keyword, source=src)
+    # 按真实类型探测（WASM/JS/JAR/网盘各走自己的接口），不再一律当苹果 CMS。
+    if src:
+        q = await providers.probe_any_source(src, keyword=keyword)
+        return {"code": 0, "msg": "", "data": _probe_payload(q)}
+    result = await providers.probe_source(api, keyword=keyword)
     return {"code": 0, "msg": "", "data": result}
 
 
@@ -11753,11 +11769,9 @@ async def ext_source_test(request: Request):
 async def ext_source_test_all(request: Request):
     """并发探测全部源，返回 [{id,name,...result}]。"""
     async def one(s):
-        r = await providers.probe_source(s["api"], source=s)
-        # >>> PRIVATE:DDUO
-        if features.DDUO and s.get("xsrc"):
-            r = await providers.dduo_probe_source(s)
-        # <<< PRIVATE:DDUO
+        q = await providers.probe_any_source(
+            s, keyword=providers.PROBE_HOT_KEYWORDS[0])
+        r = _probe_payload(q)
         r.update(id=s["id"], name=s["name"], enabled=bool(s.get("enabled")),
                  builtin=bool(s.get("builtin")))
         return r
@@ -12113,6 +12127,8 @@ async def ext_import_subscription(request: Request):
     import tvbox as tvboxmod
     body = await request.json()
     standalone = bool(body.get("standalone"))
+    # csp 爬虫默认不导入：要下载/分发 jar、每个源占真机运行时，属于用户显式选择。
+    include_csp = bool(body.get("include_csp"))
     enable_guard = body.get("enable_guard", "smart")
     if enable_guard not in (True, False, "smart"):
         enable_guard = "smart"
@@ -12263,7 +12279,10 @@ async def ext_import_subscription(request: Request):
     csp_report = None
     drpy_report = None
     # >>> PRIVATE:SPIDER
-    if features.GUARD and csp_items:
+    if csp_items and not include_csp:
+        # 手动勾选语义：不勾就只报候选数，不下载 jar、不占运行时。
+        csp_report = {"skipped_manual": True, "candidates": len(csp_items)}
+    elif features.GUARD and csp_items:
         import spiders as _spm
         # 先尝试下载该订阅的 spider jar（失败则源登记为缺 jar，可手动补传）
         jar_status = None

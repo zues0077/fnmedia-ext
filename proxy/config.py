@@ -54,6 +54,78 @@ def clamp_main_ready_budget(raw) -> float:
     return min(max(v, MAIN_READY_BUDGET_MIN), MAIN_READY_BUDGET_MAX)
 
 
+# 源真实类型（唯一判定口径）。管理页标签、巡检探测、独立库、排序保底都走这里，
+# 不要再各写一套 flags 判断：2026-11-12 管理页用 `FEAT_DDUO && src.xsrc` 一刀切，
+# 把 246 上 102 个非 WASM 源（8 drpy + 92 spider + 1 网盘 + dduo）全标成了 WASM。
+SOURCE_TYPES = ("cms", "dduo", "catvod", "drpy", "spider", "guard", "t4", "live")
+
+
+def source_type(s: dict) -> str:
+    """按源自身标记判定真实类型，顺序即优先级（一个源只可能属于一类）。"""
+    if not isinstance(s, dict):
+        return "cms"
+    if s.get("kind") == "t4" or s.get("t4"):
+        return "t4"
+    if s.get("kind") == "live" or s.get("live"):
+        return "live"
+    if s.get("drpy"):
+        return "drpy"
+    if s.get("spider_src"):
+        return "spider"
+    if s.get("guard"):
+        return "guard"
+    if s.get("catvod"):
+        return "catvod"
+    if s.get("xsrc"):
+        return "dduo"
+    return "cms"
+
+
+# 排序截断时每种类型的保底名额。全局搜索只取前 N 个源（默认 40），纯按质量
+# 排序会让 92 个 spider + 8 个 drpy 全部落在 40 名之后、永远没机会出结果
+# （2026-11-12 实测 167 启用源 head(40) 全是 cms）。保底只保证「有机会被搜到」，
+# 名额之外的排序仍是原字典序，不引入权重。
+TYPE_RESERVE = 3
+
+
+def pick_head(ranked: list[dict], top_n) -> tuple[list[dict], list[dict]]:
+    """按类型保底截断排序结果，返回 (head, tail)。
+
+    top_n <= 0 或大于等于全部源数时不截断。非 cms 类型各保底 TYPE_RESERVE 个
+    （该类型不足则全取），剩余名额按原排序补满；head 内部顺序与原排序一致，
+    所以「置顶/屏蔽/状态/延迟」的既有优先级完全不变。
+    """
+    try:
+        n = int(top_n)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0 or n >= len(ranked):
+        return list(ranked), []
+    order = {id(s): i for i, s in enumerate(ranked)}
+
+    reserved: list[dict] = []
+    for t in SOURCE_TYPES:
+        if t == "cms":
+            continue
+        group = [s for s in ranked if source_type(s) == t]
+        reserved.extend(group[:TYPE_RESERVE])
+    if len(reserved) > n:
+        # 类型过多（少见）：保底名额本身超预算时，仍按原排序取前 n 个
+        reserved.sort(key=lambda s: order[id(s)])
+        reserved = reserved[:n]
+    picked = {id(s) for s in reserved}
+    head = list(reserved)
+    for s in ranked:
+        if len(head) >= n:
+            break
+        if id(s) not in picked:
+            head.append(s)
+            picked.add(id(s))
+    head.sort(key=lambda s: order[id(s)])
+    tail = [s for s in ranked if id(s) not in picked]
+    return head, tail
+
+
 def parse_config_version(raw):
     """解析存量 config_version：返回 int，无法确定时返回 None。
 

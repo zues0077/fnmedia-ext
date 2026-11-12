@@ -637,6 +637,10 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
             <input type="checkbox" id="subMgStandalone" style="width:15px;height:15px;accent-color:var(--accent)"/>
             苹果CMS源同时「作为独立媒体库」</label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"
+            title="csp 爬虫要下 jar 并占用真机运行时，默认不导入；勾上才随本次导入一起写入">
+            <input type="checkbox" id="subMgCsp" style="width:15px;height:15px;accent-color:var(--warn)"/>
+            同时导入 csp 爬虫（默认不导入）</label>
           <a href="javascript:;" class="muted sm" style="text-decoration:underline" onclick="toggleSubPaste()">粘贴配置 JSON 导入（仅一次）</a>
           <!-- >>> PRIVATE:SPIDER -->
           <button class="small" style="border-color:var(--accent);color:var(--accent)" onclick="importFantaiying()" title="官方维护、在线影视+网盘聚合；自动解密、智能跳过 x86 会崩溃的加固源">⚡ 一键饭太硬</button>
@@ -1606,7 +1610,7 @@ function renderQuality(){
     else if(g===3)gs='<span style="color:var(--err,#d64545)">熔断</span>';
     const isPin=pinned.has(s.id), isBlk=blocked.has(s.id);
     return `<tr>
-      <td><div style="font-weight:500">${esc(s.name)} ${s.enabled?'':'<span class="muted sm">(停用)</span>'}
+      <td><div style="font-weight:500">${esc(s.name)} ${s.enabled?'':'<span class="muted sm">'+(s.sys_disabled?'(巡检停用)':(s.builtin?'(默认关闭)':'(停用)'))+'</span>'}
         ${isPin?'<span class="tag">置顶</span>':''}${isBlk?'<span class="tag amber">屏蔽</span>':''}</div>
         <div class="meta">${esc(s.api)}</div></td>
       <td>${mrs}</td><td>${srs}</td><td>${lats}</td><td>${gs}</td>
@@ -1662,7 +1666,9 @@ function srcQ(src){
   if(q.lat_ms)b.push("延迟 "+(q.lat_ms/1000).toFixed(1)+"s");
   if(q.ok_rate!=null)b.push("可用率 "+Math.round(q.ok_rate*100)+"%");
   if(src&&src.fail_count)b.push("失败 "+src.fail_count);
+  // 三种「没开」要说清区别：内置默认关闭 ≠ 用户手动停用 ≠ 巡检自动停用。
   if(src&&src.sys_disabled)b.push('<span style="color:var(--danger)">已自动停用'+(src.disabled_reason?("："+esc(src.disabled_reason)):"")+'</span>');
+  else if(src&&!src.enabled&&src.builtin)b.push('<span class="muted">内置源，默认关闭；左上勾选即启用</span>');
   return b.length?(" · "+b.join(" · ")):"";
 }
 function renderSources(){
@@ -1676,29 +1682,44 @@ function renderSources(){
   if(pi)pi.textContent=`第 ${SRC_PAGE}/${pages} 页 · 本页 ${srcs.length} 条 · 筛选后 ${srcsAll.length} 条`;
   $("srcRows").innerHTML=srcs.length?srcs.map(src=>{
     let extraCell="",extraTag="";
+    // 按真实类型打标签（后端在状态接口里补 stype：cms/dduo/catvod/drpy/spider/guard/t4/live）。
+    // 之前用 `FEAT_DDUO && src.xsrc` 一刀切，把 JS 源、jar 爬虫、网盘全标成了 WASM。
+    const st=src.stype||"cms";
+    const TAG={dduo:["WASM","自研 WASM 站：搜索/播放实时解码；没有分类接口，不能建独立库","amber"],
+               catvod:["网盘","网盘直链站（catvod）；已有「小雅库」，不走分类深翻",""],
+               drpy:["JS","JS 爬虫规则（drpy，Node 运行时）",""],
+               spider:["JAR","Java 爬虫（csp，真机运行时）",""],
+               guard:["加固","DexGuard 加固爬虫（安卓真机运行时）","amber"]};
+    const tg=TAG[st];
+    if(tg)extraTag='<span class="tag '+(tg[2]||"")+'" title="'+tg[1]+'">'+tg[0]+'</span>';
+    // 独立库能力：cms / drpy / csp 可以建；dduo 没有分类接口、catvod 已有小雅库、
+    // guard 已有加固专题库，都锁定并说明原因（不再含糊地说「WASM 不支持」）。
+    const libOk=!!(src.enabled&&src.kind!=="t4"&&st!=="dduo"&&st!=="catvod"&&st!=="guard");
+    const libWhy=libOk?"把该资源站单独生成一张媒体库卡片":
+      (src.kind==="t4"?"T4 源在「T4 选片库」里浏览":
+       st==="dduo"?"WASM 站只有搜索/详情接口，没有分类接口，无法建库":
+       st==="catvod"?"网盘源已有「小雅库」，无需再建":
+       st==="guard"?"加固源已有「加固影视」专题库":"需先「启用」");
     // >>> PRIVATE:ADULT
-    const adOk=!!(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc));
+    const adOk=!!(src.enabled&&src.standalone&&libOk);
     extraCell=FEAT_ADULT?`
-      <label title="${adOk?'🔞 限制级独立库（18+）：与主库隔离、不进全局搜索；开启即表示你已年满 18 周岁并自行承担责任':'需先「启用」并勾选「库」后才能标记 🔞（WASM 自研站不支持独立库）'}"
+      <label title="${adOk?'🔞 限制级独立库（18+）：与主库隔离、不进全局搜索；开启即表示你已年满 18 周岁并自行承担责任':'需先「启用」并勾选「库」后才能标记 🔞（'+(libOk?'需先建库':libWhy)+'）'}"
         style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:${adOk?'pointer':'not-allowed'};margin-left:4px;${adOk?'':'opacity:.55'}">
         <input type="checkbox" class="ad" ${src.adult?"checked":""}
          ${adOk?"":"disabled"} style="width:15px;height:15px;accent-color:#be123c${adOk?'':';opacity:.35'}"/>18</label>`:"";
     // <<< PRIVATE:ADULT
-    // >>> PRIVATE:DDUO
-    extraTag=(FEAT_DDUO&&src.xsrc&&(src.api||"").indexOf("guard://")!==0)?'<span class="tag amber" title="非苹果CMS自研站，WASM实时解码">WASM</span>':'';
-    // <<< PRIVATE:DDUO
     return `<tr data-id="${src.id}">
       <td><input type="checkbox" class="en" ${src.enabled?"checked":""} style="accent-color:var(--accent);width:16px;height:16px"/></td>
       <td style="white:nowrap">
-        <label title="${(src.enabled&&src.kind!=="t4"&&!(FEAT_DDUO&&src.xsrc))?'把该资源站单独生成一张媒体库卡片':'需先「启用」；WASM 自研站不支持独立库'}" style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:${(src.enabled&&src.kind!=="t4"&&!(FEAT_DDUO&&src.xsrc))?'pointer':'not-allowed'}">
+        <label title="${libWhy}" style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:${libOk?'pointer':'not-allowed'}">
           <input type="checkbox" class="sa" ${src.standalone?"checked":""}
-           ${(src.enabled&&src.kind!=="t4"&&!(FEAT_DDUO&&src.xsrc))?"":"disabled"} style="width:15px;height:15px;accent-color:var(--accent);${(src.enabled&&src.kind!=="t4"&&!(FEAT_DDUO&&src.xsrc))?'':'opacity:.35'}"/>库</label>
-        <label title="${(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc))?'非过滤：独立库内不按标题/备注过滤解说/预告/花絮':'需先「启用」并勾选「库」后才能设置（WASM 自研站不支持）'}" style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:${(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc))?'pointer':'not-allowed'};margin-left:4px">
+           ${libOk?"":"disabled"} style="width:15px;height:15px;accent-color:var(--accent);${libOk?'':'opacity:.35'}"/>库</label>
+        <label title="${(src.enabled&&src.standalone&&libOk)?'非过滤：独立库内不按标题/备注过滤解说/预告/花絮':('需先「启用」并勾选「库」后才能设置（'+(libOk?'需先建库':libWhy)+'）')}" style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:${(src.enabled&&src.standalone&&libOk)?'pointer':'not-allowed'};margin-left:4px">
           <input type="checkbox" class="lf" ${src.loose_filter?"checked":""}
-           ${(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc))?"":"disabled"} style="width:15px;height:15px;accent-color:var(--warn);${(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc))?'':'opacity:.35'}"/>非过滤</label>
+           ${(src.enabled&&src.standalone&&libOk)?"":"disabled"} style="width:15px;height:15px;accent-color:var(--warn);${(src.enabled&&src.standalone&&libOk)?'':'opacity:.35'}"/>非过滤</label>
         ${extraCell}
       </td>
-      <td><div style="font-weight:500">${esc(src.name)}${src.kind==="t4"?'<span class="tag">T4</span>':''}${extraTag}${src.builtin?'':'<span class="tag amber">自定义</span>'}${src.standalone?'<span class="tag">媒体库</span>':''}${(src.verified===false)?'<span class="tag wait" title="订阅导入后尚未巡检验证。已正常参与搜索，无需等待；巡检通过后会自动转为已验证，连续失败才会被自动禁用">待验证</span>':''}</div>
+      <td><div style="font-weight:500">${esc(src.name)}${src.enabled?'':'<span class="muted sm">'+(src.sys_disabled?' (巡检停用)':(src.builtin?' (默认关闭)':' (停用)'))+'</span>'}${src.kind==="t4"?'<span class="tag">T4</span>':''}${extraTag}${src.builtin?'':'<span class="tag amber">自定义</span>'}${src.standalone?'<span class="tag">媒体库</span>':''}${(src.verified===false)?'<span class="tag wait" title="订阅导入后尚未巡检验证。已正常参与搜索，无需等待；巡检通过后会自动转为已验证，连续失败才会被自动禁用">待验证</span>':''}</div>
         <div class="meta">${esc(src.api)}${srcQ(src)}</div></td>
       <td class="st wait" data-st>未测</td>
       <td><button class="small" data-test>测试</button></td>
@@ -2025,7 +2046,7 @@ async function toggleAdfilterSps(on){
 }
 async function importSubscription(kind){
   const standalone=$("subMgStandalone").checked;
-  const payload={standalone:standalone,enable_guard:"smart"};
+  const payload={standalone:standalone,enable_guard:"smart",include_csp:!!($("subMgCsp")&&$("subMgCsp").checked)};
   if(kind==="url"){payload.url=$("subMgUrl").value.trim();if(!payload.url){toast("请填写订阅 URL","fail");return;}}
   else{payload.text=$("subText").value.trim();if(!payload.text){toast("请粘贴配置 JSON","fail");return;}}
   const out=$("subResult");out.innerHTML='<div class="muted sm">正在解析订阅并探测源，请稍候…</div>';
@@ -2307,7 +2328,11 @@ async function subMgAdd(){
         const rr=await jreq("POST","/v/api/ext/subscriptions/"+sid+"/refresh",{});
         const d=rr.data||{};
         if(rr.code!==0)toast("首次拉取失败："+(rr.msg||"")+"（可点「立即更新」重试）","fail");
-        else toast("添加成功：CMS 新增 "+(d.cms_added||0)+" 源"+(d.live&&d.live.added?("、直播 "+(d.live.added)):""));
+        else toast("添加成功：CMS 新增 "+(d.cms_added||0)+" 源"
+          +(d.drpy&&d.drpy.added?("、JS "+(d.drpy.added||0)):"")
+          +(d.t4&&d.t4.added?("、T4 "+(d.t4.added||0)):"")
+          +(d.csp_pending?("（另有 "+d.csp_pending+" 个 csp 爬虫未导入，需要时在「导入订阅」里勾选）"):"")
+          +(d.live&&d.live.added?("、直播 "+(d.live.added)):""));
       }catch(e){toast("首次拉取出错，可稍后点「立即更新」重试","fail");}
       
       loadSubMgmt();

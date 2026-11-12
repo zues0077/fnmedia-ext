@@ -61,6 +61,14 @@ def _builtin_url(sub: dict) -> str:
     return ""
 
 
+# >>> PRIVATE:DRPY
+def _drpy_module():
+    """延迟取 drpy 模块：公开构建剥离本块后取不到，按「无 JS 运行时」跳过。"""
+    import drpy
+    return drpy
+# <<< PRIVATE:DRPY
+
+
 async def _load_sites(sub: dict):
     """拉取订阅并返回 (raw_sites, spider, base, used_url)。失败抛异常。"""
     import tvbox as tvboxmod
@@ -106,6 +114,12 @@ async def refresh_subscription(sub_id: str) -> dict:
     groups = tvboxmod.classify_subscription(raw_sites, spider, base)
     cms_cands = groups.get("cms", [])
     live_items = groups.get("live", [])
+    # 2026-11-12：此前只消费 cms/live，订阅里的 drpy 与 t4 全被静默丢弃
+    # （实测 cluntop 87 源丢 1 drpy、niubihu1 135 源丢 5 drpy + 1 t4）。
+    # csp 爬虫仍需人工确认（要下载/分发 jar、占用真机运行时），只统计待导入数。
+    drpy_items = groups.get("drpy", [])
+    t4_items = groups.get("t4", [])
+    csp_pending = len(groups.get("csp", []))
 
     # ---------- 苹果 CMS：探测 + 只增不减 ----------
     existing = {s.get("api", "").rstrip("/").lower()
@@ -143,7 +157,33 @@ async def refresh_subscription(sub_id: str) -> dict:
         except Exception as exc:  # noqa: BLE001
             live_report = {"error": f"直播源写入失败：{type(exc).__name__}"}
 
-    changed = bool(added_names) or (live_report and live_report.get("added"))
+    # ---------- T4 远程源（服务器端解析，可搜可播） ----------
+    t4_report = None
+    if t4_items:
+        try:
+            t4_report = cfg.import_t4_sources(t4_items)
+        except Exception as exc:  # noqa: BLE001
+            t4_report = {"error": f"T4 源写入失败：{type(exc).__name__}"}
+
+    # ---------- 远程 drpyS（Node sidecar 跑规则脚本，仅完整构建） ----------
+    drpy_report = None
+    if drpy_items:
+        loader = globals().get("_drpy_module")
+        if loader is None:
+            drpy_report = {"skipped_build": True}
+        else:
+            try:
+                res = loader().import_remote(drpy_items, "smart")
+                drpy_report = {"added": res.get("added", 0),
+                               "updated": res.get("updated", 0)}
+                cfg.load()          # 让新导入的源立刻出现在 all_sources()
+            except Exception as exc:  # noqa: BLE001
+                drpy_report = {"error": f"DRPY 写入失败：{type(exc).__name__}"}
+
+    changed = (bool(added_names)
+               or (live_report and live_report.get("added"))
+               or (t4_report and t4_report.get("added"))
+               or (drpy_report and drpy_report.get("added")))
     if changed:
         await _notify_changed()
 
@@ -158,6 +198,10 @@ async def refresh_subscription(sub_id: str) -> dict:
         "cms_pending": len(added_names),
         "cms_failed": 0,
         "live": live_report,
+        "t4": t4_report,
+        "drpy": drpy_report,
+        # csp 爬虫不自动导入（要下 jar + 占真机运行时），这里只报个数
+        "csp_pending": csp_pending,
     }
 
 

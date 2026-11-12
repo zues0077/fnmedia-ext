@@ -219,8 +219,10 @@ async def _probe(source: dict, timeout: float, keyword: str) -> dict:
     if source.get("kind") == "t4":
         return await _probe_t4(source, timeout)
     import providers
-    return await providers.probe_source_quality(
-        source, timeout=timeout, keyword=keyword)
+    # 按真实类型分派：drpy/spider/catvod/dduo 各有自己的轻量探测口，
+    # 不能再一律打苹果 CMS 的 ac=list（会把 catvod:// 判成「地址非法」误杀）。
+    return await providers.probe_any_source(
+        source, keyword=keyword, timeout=timeout)
 
 
 def _label(res: dict) -> str:
@@ -444,10 +446,10 @@ async def _scan_once_inner(*, force: bool = False) -> dict:
                 "skipped": "巡检已关闭"}
 
     sources = cfg.all_sources()
-    # 只巡检「可探测」的源：CMS/T4/直播；加固、爬虫、DRPY 有各自运行时健康。
-    probes = [s for s in sources
-              if s.get("api") and not s.get("guard") and not s.get("spider_src")
-              and not s.get("drpy")]
+    # 只巡检「可独立探测」的源：CMS/T4/直播/DRPY/爬虫/小雅/dduo 都有对应的轻量
+    # 探测口（见 providers.probe_any_source）。加固源（redroid 真机）有各自的
+    # 运行时健康与专题页，仍然排除，避免把设备占用当源质量。
+    probes = [s for s in sources if s.get("api") and not s.get("guard")]
     active = [s for s in probes if s.get("enabled")]
     relay = [s for s in probes if not s.get("enabled") and s.get("sys_disabled")]
 

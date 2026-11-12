@@ -234,7 +234,9 @@ class AggCacheTests(unittest.IsolatedAsyncioTestCase):
                                            refresh=True)
             await appmod._aggregate_briefs("快源片", fast_only=False,
                                            refresh=True)
-        self.assertEqual(sorted(seen_calls[0]), ["dead-src", "good-src"])
+        # 快路径只排掉要重型运行时的源（加固/爬虫/drpy/网盘）；dduo 是普通
+        # HTTP + 本地 WASM 解码，必须参与——之前被误排除，用户「启用了却搜不到」。
+        self.assertEqual(sorted(seen_calls[0]), ["dduo", "dead-src", "good-src"])
         self.assertEqual(sorted(seen_calls[1]),
                          ["dduo", "dead-src", "drpy-x", "good-src",
                           "guard-src", "spider-x", "xiaoya"])

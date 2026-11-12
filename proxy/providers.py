@@ -587,6 +587,35 @@ def _map_vod(v: dict, source: dict) -> OnlineTitle | None:
     )
 
 
+# 成人内容判别词（2026-11-13 实测）：正常苹果CMS 源搜这两个词 0~3 条，
+# 成人源稳定 20 条；阈值 8 能干净区分（量子资源最多 3 条，不会误伤）。
+_ADULT_PROBE_TOKENS = ("无码", "麻豆")
+_ADULT_PROBE_THRESHOLD = 8
+_ADULT_PROBE_ID = "__adult_probe__"
+
+
+async def looks_adult_api(api: str, threshold: int = _ADULT_PROBE_THRESHOLD) -> bool:
+    """按内容判断某个苹果CMS 站是否成人源。
+
+    名字看不出（美少女/水机/香奶/湿妹/AV…）时用这个：搜「无码」「麻豆」，
+    命中数 ≥ threshold 即认定。只在「名字没判出来且即将新增」的源上调用，
+    代价是每源最多 2 个请求。
+    """
+    api = (api or "").strip()
+    if not api.startswith(("http://", "https://")):
+        return False
+    for kw in _ADULT_PROBE_TOKENS:
+        try:
+            async with netutil.async_client(timeout=10) as c:
+                out = await search_source(
+                    c, {"id": _ADULT_PROBE_ID, "api": api}, kw)
+        except Exception:  # noqa: BLE001
+            continue
+        if len(out) >= threshold:
+            return True
+    return False
+
+
 def _site_root(api: str) -> str:
     p = urllib.parse.urlparse(api)
     return f"{p.scheme}://{p.netloc}/"

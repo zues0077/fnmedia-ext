@@ -221,6 +221,7 @@ async def refresh_subscription(sub_id: str, *, preview: bool = False,
     # 真正失效的源由巡检自动禁用，不再拖慢导入、不再误杀。
     standalone = bool(sub.get("standalone"))
     adult_auto: list[str] = []
+    adult_pending: list[tuple[str, str, str]] = []
     for c in cms_cands:
         key = c["api"].rstrip("/").lower()
         if key in existing:
@@ -232,17 +233,40 @@ async def refresh_subscription(sub_id: str, *, preview: bool = False,
             added_names.append(c["name"])
             existing.add(key)
             # 成人站自动打 18（2026-11-13）：进「🔞福利」库，不混进普通搜索。
-            # 保守判定，导入后用户可随时取消。
+            # 名字判不出的（美少女/水机/香奶/湿妹/AV…）在循环后按内容再判。
             try:
                 import catalog as _catalog
                 if _catalog.looks_adult_source(c["name"]) and cfg.set_adult(sid, True)[0]:
                     adult_auto.append(c["name"])
+                else:
+                    adult_pending.append((sid, c["name"], c["api"]))
             except Exception:  # noqa: BLE001
                 pass
         else:
             dup += 1
         if len(added_names) >= 200:      # 上限从 60 放宽到 200
             break
+    if adult_pending:
+        import providers as _providers
+        sem2 = asyncio.Semaphore(6)
+
+        async def _adult_check(item):
+            sid, nm, api = item
+            async with sem2:
+                try:
+                    return sid, nm, await _providers.looks_adult_api(api)
+                except Exception:  # noqa: BLE001
+                    return sid, nm, False
+
+        for sid, nm, hit in await asyncio.gather(
+                *[_adult_check(x) for x in adult_pending]):
+            if not hit:
+                continue
+            try:
+                if cfg.set_adult(sid, True)[0]:
+                    adult_auto.append(nm)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---------- m3u8 直播源 ----------
     live_report = None

@@ -12360,6 +12360,7 @@ async def ext_import_subscription(request: Request):
     cms_added, cms_dup = [], 0
     cms_failed: list[tuple[str, str]] = []
     cms_adult_auto: list[str] = []
+    cms_adult_pending: list[tuple[str, str, str]] = []
     sem = asyncio.Semaphore(8)
 
     async def _probe(c):
@@ -12394,10 +12395,34 @@ async def ext_import_subscription(request: Request):
                 if catalogmod.looks_adult_source(c["name"]):
                     if config.set_adult(sid, True)[0]:
                         cms_adult_auto.append(c["name"])
+                else:
+                    # 名字看不出（美少女/水机/香奶/湿妹/AV…）→ 落地后按内容再判
+                    cms_adult_pending.append((sid, c["name"], c["api"]))
             except Exception:  # noqa: BLE001
                 pass
         else:
             cms_dup += 1
+    # 名字判不出的新增源：按内容判定（搜「无码/麻豆」，正常站 0~3 条、成人站 20 条）
+    if cms_adult_pending:
+        sem2 = asyncio.Semaphore(6)
+
+        async def _adult_check(item):
+            sid, nm, api = item
+            async with sem2:
+                try:
+                    return sid, nm, await providers.looks_adult_api(api)
+                except Exception:  # noqa: BLE001
+                    return sid, nm, False
+
+        for sid, nm, hit in await asyncio.gather(
+                *[_adult_check(x) for x in cms_adult_pending]):
+            if not hit:
+                continue
+            try:
+                if config.set_adult(sid, True)[0]:
+                    cms_adult_auto.append(nm)
+            except Exception:  # noqa: BLE001
+                pass
     for nm, why in cms_failed:
         skipped.append({"name": nm[:24], "reason": f"探测不可达（{why[:24]}）"})
     if len(cms_cands) > len(probe_list):

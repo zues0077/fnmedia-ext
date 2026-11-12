@@ -11957,37 +11957,10 @@ async def ext_import_subscription(request: Request):
     }}
 
 
-@app.get("/v/api/ext/live/status")
-async def ext_live_status():
-    """直播源状态：当前聚合进订阅的频道数。供管理台「电视直播订阅」卡片展示。"""
-    lives = config.live_sources()
-    return {"code": 0, "msg": "", "data": {"count": len(lives)}}
-
-
-@app.get("/v/api/ext/live/subscribe.m3u")
-async def ext_live_subscribe_m3u():
-    """把当前库内所有 m3u8 直播源聚合为一份标准 IPTV 播放列表（M3U）。
-
-    供飞牛影视「电视直播」媒体库的 URL 导入使用：复制本地址，到飞牛影视
-    「新增媒体库 → 内容类型电视直播 → URL 导入」粘贴即可，由飞牛原生播放。
-    live 源（LunaTV lives / 资源站电视直播源）统一在此输出，不重复造播放轮子。
-    """
-    lives = config.live_sources()
-    lines = ["#EXTM3U"]
-    for s in lives:
-        name = str(s.get("name") or "").strip() or "未命名频道"
-        url = str(s.get("api") or "").strip()
-        if not url:
-            continue
-        attrs = ""
-        if s.get("epg"):
-            attrs += f' tvg-name="{name}"'
-        lines.append(f"#EXTINF:-1{attrs},{name}")
-        lines.append(url)
-    body = "\n".join(lines) + "\n"
-    return Response(body, media_type="application/vnd.apple.mpegurl; charset=utf-8",
-                    headers={"Content-Disposition":
-                             'inline; filename="fnmedia-live.m3u"'})
+# 电视直播出口（/v/api/ext/live/status、/live/subscribe.m3u）已移除：
+# 飞牛影视不认内网 IP 的 IPTV 订阅地址，且实测多数直播源（斗鱼/订阅来的 drpy）
+# 只能给出网页地址、出不了可播直链。live 数据层（config.live_sources /
+# import_live_sources）保留，便于将来若找到可用出口再挂回来。
 
 
 @app.get("/v/api/ext/adfilter/status")

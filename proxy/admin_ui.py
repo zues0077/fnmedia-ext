@@ -545,7 +545,7 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
       </div>
       <div class="card">
         <div class="card-title">📚 订阅管理
-          <button class="small" style="float:right" onclick="loadSubMgmt();loadLiveSubscribe()">刷新</button></div>
+          <button class="small" style="float:right" onclick="loadSubMgmt()">刷新</button></div>
         <p class="card-sub">贴订阅地址即可，格式<strong>自动识别</strong>：TVBox / base64 / LunaTV（Base58，
           <code>api_site</code> 视频源 + <code>lives</code> 直播源）/ 饭太硬 / T4 / 多订阅聚合，无需区别添加。
           视频源与直播源自动分流；能直接播放的源自动启用，P2P/磁力/云盘等慢源与 jar/脚本未就绪的导入后默认关闭。</p>
@@ -572,16 +572,6 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         </div>
         <div id="subResult"></div>
         <div id="subMgList" style="margin-top:10px"><div class="muted sm">正在加载订阅…</div></div>
-
-        <div style="border-top:1px dashed var(--line);margin-top:14px;padding-top:12px">
-          <div class="card-title" style="font-size:14px;margin-bottom:4px">📺 电视直播出口</div>
-          <p class="card-sub" style="margin-bottom:6px">把订阅里解析出的 m3u8 直播源聚合为一份标准 IPTV 播放列表，交给飞牛原生播放（本扩展不碰播放链路）。</p>
-          <div class="row" style="margin:6px 0">
-            <input type="text" id="liveSubUrl" readonly placeholder="正在生成订阅地址…" style="flex:1;font-family:monospace;font-size:12px"/>
-            <button class="small" id="liveSubCopyBtn" onclick="copyLiveSubscribe()">📋 复制订阅地址</button>
-          </div>
-          <div id="liveSubInfo" class="muted sm">正在加载…</div>
-        </div>
       </div>
 
       <!-- >>> PRIVATE:SPIDER -->
@@ -968,7 +958,7 @@ async function switchPage(page){
   // >>> PRIVATE:GUARD
   if(page==="pan"){const f=$("panFrame");if(f&&!f.src)f.src=f.dataset.src;}
   // <<< PRIVATE:GUARD
-  if(page==="importsub"){try{if(!CFG)await loadStatus();}catch(e){}try{if(typeof initSubProxy==="function")initSubProxy();}catch(e){}try{loadAdfilter();}catch(e){}try{if(typeof loadSpiderMgmt==="function")loadSpiderMgmt();}catch(e){}try{if(typeof loadDrpyMgmt==="function")loadDrpyMgmt();}catch(e){}try{loadLiveSubscribe();}catch(e){}try{loadSubMgmt();}catch(e){}}
+  if(page==="importsub"){try{if(!CFG)await loadStatus();}catch(e){}try{if(typeof initSubProxy==="function")initSubProxy();}catch(e){}try{loadAdfilter();}catch(e){}try{if(typeof loadSpiderMgmt==="function")loadSpiderMgmt();}catch(e){}try{if(typeof loadDrpyMgmt==="function")loadDrpyMgmt();}catch(e){}try{loadSubMgmt();}catch(e){}}
   if(page==="about"){loadUpdate(false);try{loadAdminToken();}catch(e){}}
 }
 $$("[data-page]").forEach(b=>b.addEventListener("click",()=>switchPage(b.dataset.page)));
@@ -1903,7 +1893,7 @@ async function importSubscription(kind){
     try{await loadGuard();}catch(e){}
     try{await loadSpiderMgmt();}catch(e){}
     try{await loadDrpyMgmt();}catch(e){}
-    try{loadLiveSubscribe();}catch(e){}
+    
   }catch(e){out.innerHTML='<div class="hint" style="color:var(--danger)">导入出错：'+esc(String(e))+'</div>';}
 }
 async function subToggleGuard(key,on){
@@ -1927,7 +1917,7 @@ async function importFantaiying(){
     try{await loadGuard();}catch(e){}
     try{await loadSpiderMgmt();}catch(e){}
     try{await loadDrpyMgmt();}catch(e){}
-    try{loadLiveSubscribe();}catch(e){}
+    
   }catch(e){out.innerHTML='<div class="hint" style="color:var(--danger)">导入出错：'+esc(String(e))+'</div>';}
 }
 function goDeploy(){switchPage("tvbox");setTimeout(()=>{const b=$("scInstallAll");if(b)b.click();},80);}
@@ -2024,7 +2014,7 @@ function renderSubResult(d){
   if(lv && (lv.added||0)>0){
     h+='<div class="subgrp"><div class="subgrp-t">📺 电视直播源　新增 '+lv.added+' · 已存在 '+(lv.duplicate||0)+'</div>';
     (lv.added_names||[]).forEach(n=>{h+='<div class="subrow ok"><span>＋ '+esc(n)+'</span><span class="tag">已聚合进订阅</span></div>';});
-    h+='<div class="muted sm" style="padding:4px 2px">已并入下方「📺 电视直播出口」，去飞牛影视「电视直播」媒体库 URL 导入即可播放。</div></div>';
+    h+='<div class="muted sm" style="padding:4px 2px">（注：该版本未启用电视直播出口，直播源仅记录，不做 M3U 聚合。）</div></div>';
   }
   if(lv && lv.error){h+='<div class="hint" style="color:var(--danger)">直播源写入失败：'+esc(lv.error)+'</div>';}
   // 跳过
@@ -2035,30 +2025,6 @@ function renderSubResult(d){
     h+='</details>';
   }
   $("subResult").innerHTML=h;
-}
-/* ---------- 电视直播订阅（M3U 聚合） ---------- */
-function liveSubscribeUrl(){
-  // 用当前页面 origin 拼直播订阅地址（同源部署，无需额外配置）
-  return location.origin + "/v/api/ext/live/subscribe.m3u";
-}
-async function loadLiveSubscribe(){
-  const inp=$("liveSubUrl"), info=$("liveSubInfo");
-  if(!inp)return;
-  inp.value=liveSubscribeUrl();
-  try{
-    const r=await jget("/v/api/ext/live/status");
-    const d=r.data||{};
-    const n=d.count||0;
-    info.innerHTML=n?("当前共 <b>"+n+"</b> 个直播频道已聚合进订阅。"):"暂无直播频道：先在上方「导入订阅」导一份含 lives 的 LunaTV 订阅，或从资源站添加电视直播源。";
-  }catch(e){
-    info.innerHTML='加载失败：'+esc(String(e));
-  }
-}
-function copyLiveSubscribe(){
-  const inp=$("liveSubUrl");if(!inp||!inp.value)return;
-  const v=inp.value;
-  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(v).then(()=>toast("已复制订阅地址"),()=>toast("复制失败，请手动选中复制","fail"));}
-  else{inp.select();document.execCommand("copy");toast("已复制订阅地址");}
 }
 /* ---------- 订阅源管理（多订阅 URL，定时拉取，只增不减） ---------- */
 async function jreq(method,p,b){
@@ -2172,7 +2138,7 @@ async function subMgSaveEdit(sid){
         if(rr.code!==0)toast("重新拉取失败："+(rr.msg||"")+"（可点「立即更新」重试）","fail");
         else toast("重新拉取完成：CMS 新增 "+(d.cms_added||0)+" 源"+(d.live&&d.live.added?("、直播 "+(d.live.added)):""));
       }catch(e){toast("重新拉取出错，可点「立即更新」重试","fail");}
-      try{loadLiveSubscribe();}catch(e){}
+      
       loadSubMgmt();
     }
   }catch(e){toast("保存失败："+e,"fail");}
@@ -2197,7 +2163,7 @@ async function subMgAdd(){
         if(rr.code!==0)toast("首次拉取失败："+(rr.msg||"")+"（可点「立即更新」重试）","fail");
         else toast("添加成功：CMS 新增 "+(d.cms_added||0)+" 源"+(d.live&&d.live.added?("、直播 "+(d.live.added)):""));
       }catch(e){toast("首次拉取出错，可稍后点「立即更新」重试","fail");}
-      try{loadLiveSubscribe();}catch(e){}
+      
       loadSubMgmt();
     }else toast("已添加订阅");
   }catch(e){toast("添加失败："+e,"fail");}

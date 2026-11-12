@@ -125,3 +125,32 @@ def test_bare_play_url_without_name_is_kept():
     out3 = providers._parse_play(
         "线路1", "", "第1集$https://a.com/1.m3u8#第2集$https://a.com/2.m3u8", "https://x/")
     assert [e.title for e in out3["线路1"]] == ["第1集", "第2集"]
+
+
+class _DummyClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def test_looks_adult_api_by_content(monkeypatch):
+    """名字判不出时按内容判：搜「无码/麻豆」，成人站 20 条、正常站 0~3 条。"""
+    import asyncio as _asyncio
+
+    async def fake_search(client, source, kw):
+        n = 20 if kw == "无码" else 0
+        return [object()] * n
+
+    monkeypatch.setattr(providers, "search_source", fake_search)
+    monkeypatch.setattr(providers.netutil, "async_client",
+                        lambda timeout=None: _DummyClient())
+    assert _asyncio.run(providers.looks_adult_api("https://a.com/api.php")) is True
+
+    async def few(client, source, kw):
+        return [object()] * 3          # 量子资源这类正常站的实际命中
+
+    monkeypatch.setattr(providers, "search_source", few)
+    assert _asyncio.run(providers.looks_adult_api("https://a.com/api.php")) is False
+    assert _asyncio.run(providers.looks_adult_api("csp_XBPQ")) is False

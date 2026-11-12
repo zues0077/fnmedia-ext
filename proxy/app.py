@@ -152,11 +152,19 @@ def _self_url(url: str) -> str:
 # brief，每次返回仍按当前查看者重新过滤建卡，不会把先搜者的可见范围
 # 漏给后搜者）。缓存键仍区分请求参数（keyword·fast_only·include_t4）。
 _AGG_CACHE: dict[str, tuple[float, list]] = {}
-_AGG_INFLIGHT: dict[str, asyncio.Future] = {}
+# 单飞：run_key -> 共享扇出任务（asyncio.Task）。此前存的是裸 Future，靠
+# 「等它的那个请求自己算出结果再 set_result」解决；一旦该请求被外层
+# wait_for 取消，except 分支接不住 CancelledError，future 永久悬挂，同关键词
+# 上的其它请求就一起卡死（2026-11-12 压测发现的「下一句搜索变慢」）。
+# 现在改由独立任务承载，等待方各自 shield + 自己的截止时间。
+_AGG_TASKS: dict[str, asyncio.Task] = {}
+_AGG_SINKS: dict[str, list] = {}     # run_key -> [进度回调]（超时兜底用）
+_AGG_SNAP: dict[str, list] = {}      # run_key -> 最近一次阶段结果
 AGG_CACHE_TTL = 180
 _AGG_CACHE_MAX = 800
 # 旧名字保留为同一对象的别名（不产生第二层存储）：既有测试、管理端点
 # （缓存计数/清空）仍引用 _search_cache / _search_inflight。
+_AGG_INFLIGHT = _AGG_TASKS
 _search_cache = _AGG_CACHE
 _search_inflight = _AGG_INFLIGHT
 T4_STREAM_READY_BUDGET = 8.0
@@ -2773,6 +2781,88 @@ async def forward_upstream_streaming(request: Request) -> Response:
 # search_all 内已有早返回（≥25 结果且过 0.8s 即取消慢源），预算只在冷门词/
 # 结果不足时兜底。显式 timeout（如媒体库搜索的 6.0s）优先，不被该值覆盖。
 _AGGREGATE_SEARCH_BUDGET = 5.0
+# 前 N 个源回不到这么多条结果时，用剩余源补搜一轮（冷门片兜底）。
+_SEARCH_FALLBACK_MIN = 8
+_SEARCH_FALLBACK_BUDGET = 2.5
+# 尾部余量（秒）：取消在途源请求 + 跨源合并 + 入库要花的时间。第一轮预算与
+# 兜底轮预算之和不得超过「总预算 - 该余量」，否则调用方的等待上限（搜索页
+# 8.5s）会卡在合并之前，阶段结果来不及发布（2026-11-12 实机复现）。
+_SEARCH_TAIL_RESERVE = 0.5
+
+
+def _search_budgets(total: float) -> tuple[float, float]:
+    """把一次聚合的**总预算**拆成 (第一轮预算, 兜底轮预留)。
+
+    兜底轮预留不超过 _SEARCH_FALLBACK_BUDGET，也不超过总预算的四分之一
+    （至少 1s）；第一轮至少 2s，保证快源有足够时间出结果。总预算很小时
+    （如 5s 默认值）两轮之和仍等于总预算，不会把调用方拖过自己的上限。
+    """
+    reserve = min(_SEARCH_FALLBACK_BUDGET, max(1.0, total * 0.25))
+    return max(2.0, total - reserve), reserve
+
+
+def _agg_publish(run_key: str, briefs: list[dict]) -> None:
+    """发布一次「阶段结果」：先入库（保证超时兜底拿到的卡片 guid 可反查），
+    再通知所有正在等这个关键词的搜索请求。
+
+    调用点在 __aggregate_briefs_inner 里：第一轮（前 N 个源）合并完一次、
+    覆盖兜底合并完一次。第一轮通常在 3~6s 回来，而外层搜索的上限是 8.5s，
+    兜底轮又要 2.5s——此前超时整批丢弃，实测 0.5% 的并发搜索变成 0 条。"""
+    try:
+        store.remember_merged(briefs)
+    except Exception:  # noqa: BLE001
+        pass
+    _AGG_SNAP[run_key] = briefs
+    for sink in list(_AGG_SINKS.get(run_key) or ()):
+        try:
+            sink(briefs)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _agg_drop_sink(run_key: str, sink) -> None:
+    sinks = _AGG_SINKS.get(run_key)
+    if sinks is None:
+        return
+    try:
+        sinks.remove(sink)
+    except ValueError:
+        pass
+    if not sinks:
+        _AGG_SINKS.pop(run_key, None)
+        task = _AGG_TASKS.get(run_key)
+        if task is None or task.done():
+            _AGG_SNAP.pop(run_key, None)
+
+
+def _agg_run_done(run_key: str, task: asyncio.Task) -> None:
+    if _AGG_TASKS.get(run_key) is task:
+        _AGG_TASKS.pop(run_key, None)
+    try:
+        task.exception()      # 标记已读取，避免无人等待时的 never-retrieved 警告
+    except (asyncio.CancelledError, Exception):  # noqa: B014
+        pass
+    if not _AGG_SINKS.get(run_key):
+        _AGG_SINKS.pop(run_key, None)
+        _AGG_SNAP.pop(run_key, None)
+
+
+async def _aggregate_run(cache_key: str, run_key: str, keyword: str,
+                         maxn: int | None, fast_only: bool, timeout: float | None,
+                         *, include_t4: bool, visible, write_cache: bool):
+    """共享扇出任务体：跑完聚合 → 写缓存 → 返回 brief 列表。
+
+    与调用方解耦（调用方只 shield 等待），因此任何单个请求到点取消都不会
+    影响这次扇出，结果照常进缓存供后续请求命中。"""
+    result = await __aggregate_briefs_inner(
+        keyword, maxn, fast_only, timeout, include_t4=include_t4,
+        visible=visible, on_stage=lambda briefs: _agg_publish(run_key, briefs))
+    if write_cache:
+        _AGG_CACHE[cache_key] = (time.time(), result)
+        if len(_AGG_CACHE) > _AGG_CACHE_MAX:
+            for _old in list(_AGG_CACHE)[:_AGG_CACHE_MAX // 2]:
+                _AGG_CACHE.pop(_old, None)
+    return result
 
 
 async def _aggregate_briefs(keyword: str, maxn: int | None = None,
@@ -2780,7 +2870,8 @@ async def _aggregate_briefs(keyword: str, maxn: int | None = None,
                             timeout: float | None = None,
                             *, include_t4: bool = True,
                             refresh: bool = False,
-                            visible=None, viewer_key: str = "") -> list[dict]:
+                            visible=None, viewer_key: str = "",
+                            on_stage=None) -> list[dict]:
     """聚合搜索所有启用源 → 跨源合并 → 去噪/去无直链 → brief 列表（已入库）。
 
     结果进绑定聚合缓存池（按 片名·fast·t4 区分），TTL 内同片名的多次绑定/回源/
@@ -2794,44 +2885,47 @@ async def _aggregate_briefs(keyword: str, maxn: int | None = None,
     未过滤 brief，但聚合本身已被该查看者的早返回截断），故缓存键须按
     viewer_key 分账号——否则受限账号先搜会把截断结果留给管理员。
     不带 visible 时 viewer_key 为空，缓存键与旧行为完全一致。
+
+    on_stage：可选回调 ``list[brief] -> None``，聚合过程中的两次合并结果
+    （第一轮 / 覆盖兜底后）都会推给它。调用方到点取消时可以用它拿到的
+    最后一版做兜底返回，而不是整批 0 条。扇出本身与调用方解耦，取消只
+    断开等待，不中断计算。
     """
     cache_key = f"{keyword}\x00{int(bool(fast_only))}\x00{int(bool(include_t4))}"
     if viewer_key:
         cache_key += f"\x00{viewer_key}"
-    loop = asyncio.get_event_loop()
     _hit = None if refresh else _AGG_CACHE.get(cache_key)
     if _hit and (time.time() - _hit[0]) < AGG_CACHE_TTL:
         return [dict(b) for b in _hit[1]]
-    _fut = None if refresh else _AGG_INFLIGHT.get(cache_key)
-    if _fut is not None and not _fut.done():
-        try:
-            return [dict(b) for b in await _fut]
-        except Exception:
-            pass  # 前次扇出失败则自己重试
-    fut = loop.create_future()
-    _AGG_INFLIGHT[cache_key] = fut
+    # refresh 的扇出不与正常请求共用单飞槽（旧语义：必须绕开旧在途任务）。
+    run_key = cache_key if not refresh else cache_key + "\x00r"
+    if on_stage is not None:
+        _AGG_SINKS.setdefault(run_key, []).append(on_stage)
+        _snap = _AGG_SNAP.get(run_key)
+        if _snap:
+            try:
+                on_stage(_snap)
+            except Exception:  # noqa: BLE001
+                pass
+    task = _AGG_TASKS.get(run_key)
+    if task is not None and task.done():
+        task = None
+    if task is None:
+        task = asyncio.ensure_future(
+            _aggregate_run(cache_key, run_key, keyword, maxn, fast_only, timeout,
+                           include_t4=include_t4, visible=visible,
+                           write_cache=not refresh))
+        _AGG_TASKS[run_key] = task
+        task.add_done_callback(lambda t, k=run_key: _agg_run_done(k, t))
     try:
-        result = await __aggregate_briefs_inner(
-            keyword, maxn, fast_only, timeout, include_t4=include_t4,
-            visible=visible)
-        # remember_merged 幂等：命中缓存路径也已入库，这里再确保 store 有这些 brief
-        try:
-            store.remember_merged(result)
-        except Exception:
-            pass
-        _AGG_CACHE[cache_key] = (time.time(), result)
-        if len(_AGG_CACHE) > _AGG_CACHE_MAX:
-            for _old in list(_AGG_CACHE)[:_AGG_CACHE_MAX // 2]:
-                _AGG_CACHE.pop(_old, None)
-        if not fut.done():
-            fut.set_result(result)
+        # shield：本请求被 wait_for 取消时只脱离等待，共享扇出继续跑完并进
+        # 缓存；否则取消会连带杀掉别人的结果，且旧实现在这里留下了永不
+        # set_result 的 future。
+        result = await asyncio.shield(task)
         return [dict(b) for b in result]
-    except Exception as exc:
-        if not fut.done():
-            fut.set_exception(exc)
-        raise
     finally:
-        _AGG_INFLIGHT.pop(cache_key, None)
+        if on_stage is not None:
+            _agg_drop_sink(run_key, on_stage)
 
 
 def _chars_in_order(hay: str, needle: str) -> bool:
@@ -2902,12 +2996,13 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
                                    fast_only: bool = False,
                                    timeout: float | None = None,
                                    *, include_t4: bool = True,
-                                   visible=None) -> list[dict]:
+                                   visible=None, on_stage=None) -> list[dict]:
     """聚合搜索所有启用源 → 跨源合并 → 去噪/去无直链 → brief 列表（已入库）。
     fast_only=True 时只查秒回的标准 CMS 直链源（跳过加固/drpy 等慢源），供播放
     失败时快速回源，避免被 redroid 慢源拖到网关超时。
     visible：按查看者判定的 OnlineTitle 可见回调，透传给 search_all，
-    只影响早返回决策，不改聚合与过滤分层。"""
+    只影响早返回决策，不改聚合与过滤分层。
+    on_stage：可选回调，第一轮合并完、兜底轮合并完各推一次（供超时兜底）。"""
     # 可选特性源不进入全局搜索（公开构建下该开关恒关，等价于不过滤）。
     sources = [s for s in config.enabled_sources()
                if not (features.ADULT and s.get("adult"))
@@ -2918,6 +3013,19 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
                    and not str(s.get("id", "")).startswith(("spider-", "drpy-"))
                    and s.get("api")
                    and s.get("id") not in ("dduo", "xiaoya")]
+    # 巡检结果回流（第 3 批）：按质量字典序排序，只取前 N 个进入搜索。
+    # search_all 是 8 路并发 + 命中 25 条提前返回，源排在第几位直接决定它
+    # 有没有机会出结果。N=0 表示只排序不截断。
+    # 前 N 个命中不足时（冷门片只有少数源有），自动用剩余源补搜一轮 —— 见下方
+    # 「覆盖兜底」，避免「为了快把片源找没了」。
+    try:
+        _top_n = int(config.get().get("search_top_n") or 0)
+    except (TypeError, ValueError):
+        _top_n = 0
+    ranked = config.rank_sources(sources)
+    head = ranked[:_top_n] if _top_n > 0 else ranked
+    tail = ranked[len(head):]
+    sources = head
     # 总预算：此前只在有 T4 源时传 5.0s，无 T4 时 budget=None，search_all
     # 等全部源完成——最慢源（加固 8s / CMS 12s / 爬虫 25s 单源超时）拖死
     # 全局搜索，外层 wait_for 到点还会把已拿到的部分结果一并丢掉。现在无
@@ -2926,14 +3034,50 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
     # 预算只传一个参数：显式 timeout 即总预算，否则用 5.0s 兜底。
     # （旧写法 budget=None if timeout is not None else ... 是死三元：
     # search_all 内又会把 None 还原成 timeout。）
-    budget = timeout if timeout is not None else _AGGREGATE_SEARCH_BUDGET
-    titles = await providers.search_all(keyword, sources, budget=budget,
+    # 总预算：timeout 是**整个聚合**的预算（含覆盖兜底那一轮），默认 5.0s。
+    # 拆法：先给第一轮（前 N 个源）留大头，剩下的留给兜底轮与「取消在途请求
+    # + 合并」的尾部开销，保证调用方的等待上限（搜索页 8.5s）到点之前一定
+    # 已经发布过一版阶段结果，不会出现「超时 → 整批 0 条」。
+    total = float(timeout) if timeout is not None else _AGGREGATE_SEARCH_BUDGET
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    stage1, reserve = _search_budgets(total)
+    titles = await providers.search_all(keyword, sources, budget=stage1,
                                         visible=visible)
     if maxn is None:
         maxn = int(config.get().get("max_per_keyword", 12))
-    # 跨源同名合并：同 规范化片名+年份 聚成一个条目，每个来源各成一条
-    # 播放线路（供播放器「切换线路」）；过滤解说/预告/无直链。
-    loose_ids = {s["id"] for s in sources if s.get("loose_filter")}
+    # 第一轮结果先合并/入库/发布：外层搜索 8.5s 到点时，至少能拿到这一版
+    # （快源 3~6s 就回来），而不是整批 0 条。
+    merged = _merge_online_titles(titles, ranked, keyword, maxn)
+    if on_stage is not None:
+        on_stage(merged)
+    # 覆盖兜底：前 N 个源只回了很少结果（冷门片/新片），说明「有这部片的源」
+    # 很可能排在 N 之后。此时用剩余源补搜一轮，结果合并。热门片会在第一轮就
+    # 命中 25 条提前返回，不会触发兜底，所以常态速度不受影响。
+    left = total - (loop.time() - started) - _SEARCH_TAIL_RESERVE
+    if tail and len(titles) < _SEARCH_FALLBACK_MIN and left > 0.6:
+        try:
+            extra = await providers.search_all(
+                keyword, tail,
+                budget=min(left, reserve, _SEARCH_FALLBACK_BUDGET),
+                visible=visible)
+            if extra:
+                merged = _merge_online_titles(
+                    list(titles) + list(extra), ranked, keyword, maxn)
+                if on_stage is not None:
+                    on_stage(merged)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("search fallback skipped: %s", exc)
+    return merged
+
+
+def _merge_online_titles(titles: list, ranked: list[dict], keyword: str,
+                         maxn: int) -> list[dict]:
+    """跨源合并：同名同年的结果聚成一条，各来源成一条可切换线路。
+
+    纯函数（不写 store，不发布阶段结果），异常输入沿用原逻辑：
+    解说/预告/无直链的标题被丢弃，T4 卡片不参与同名合并。"""
+    loose_ids = {s["id"] for s in ranked if s.get("loose_filter")}
     # T4 search cards intentionally have no episode list. Never merge them by name.
     # T4 与普通源一次遍历分流（此前 remote / titles 各全量扫一遍）。
     remote = []
@@ -3069,13 +3213,14 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
         except Exception:  # noqa: BLE001
             pass
         briefs.append(brief)
-    return store.remember_merged((remote + briefs)[:maxn])
+    return (remote + briefs)[:maxn]
 
 
 async def online_search(keyword: str, client: httpx.AsyncClient,
                         timeout: float | None = None,
                         fast_only: bool = True,
-                        request: Request | None = None) -> list:
+                        request: Request | None = None,
+                        partial: dict | None = None) -> list:
     """在线搜索：聚合 brief → 按查看者可打开的库过滤 → 建卡。
 
     过滤是独立的一层（libfilter.filter_briefs），不改 search_all /
@@ -3084,6 +3229,9 @@ async def online_search(keyword: str, client: httpx.AsyncClient,
     缓存卡片会把先搜者的可见范围漏给后搜者，故每次返回时都按当前
     request 重新过滤、重新建卡；查看者上下文（_ViewerCtx）每请求一个。
     request 为 None（无查看者上下文）时全部隐藏（与身份默认无关）。
+
+    partial：可选 dict，聚合每出一版 brief 就把**已过滤、已建卡**的结果写进
+    partial["cards"]。调用方（search_list）到点取消时用它兜底，避免整批 0 条。
 
     早返回按可见数计（P0-1）：把按查看者判定的可见回调传给
     _aggregate_briefs/search_all，快源先回的隐藏库标题不再触发早返回
@@ -3110,9 +3258,21 @@ async def online_search(keyword: str, client: httpx.AsyncClient,
                     gkey_of=_ctx.gkey_of_source)
             except Exception:
                 return False
+
+    def _publish(raw_briefs, _ctx=ctx):
+        """阶段结果 → 过滤 → 建卡，写进调用方的 partial（异常不影响扇出）。"""
+        if partial is None:
+            return
+        try:
+            partial["cards"] = [_search_card(b) for b in libfiltermod.filter_briefs(
+                raw_briefs, _ctx.can_open_key, gkey_of=_ctx.gkey_of_source)]
+        except Exception:  # noqa: BLE001
+            pass
+
     briefs = await _aggregate_briefs(
         keyword, fast_only=fast_only, timeout=timeout,
-        visible=visible, viewer_key=viewer_key)
+        visible=visible, viewer_key=viewer_key,
+        on_stage=_publish if partial is not None else None)
     return [_search_card(b) for b in libfiltermod.filter_briefs(
         briefs, ctx.can_open_key, gkey_of=ctx.gkey_of_source)]
 
@@ -5521,17 +5681,31 @@ async def search_list(request: Request):
     # 子账号权限：未获“在线片源”授权的账号只搜本地，不注入在线结果
     _viewer = fnusersmod.resolve(request)
     if q and _should_online(q) and vlibsmod.account_online_allowed(_viewer):
+        # 8 个源并发聚合实测 6~8s，6s 预算会把在线结果整体丢掉（只剩本地库）。
+        # 8.5s 是**本请求**的等待上限：到点只断开等待（shield），共享扇出继续跑
+        # 完并进缓存，同时用 partial 里最后一版阶段结果兜底返回——此前这里直接
+        # online=[]，4 路并发时 0.5% 的搜索整批丢结果（2026-11-12 压测）。
+        partial: dict = {}
+        _task = asyncio.ensure_future(
+            online_search(q, ext_client(request), timeout=6.0,
+                          request=request, partial=partial))
         try:
-            # 8 个源并发聚合实测 6~8s，6s 预算会把在线结果整体丢掉（只剩本地库）
-            online = await asyncio.wait_for(
-                online_search(q, ext_client(request), timeout=6.0,
-                              request=request), timeout=8.5)
+            online = await asyncio.wait_for(asyncio.shield(_task), timeout=8.5)
         except asyncio.TimeoutError:
-            online = []
+            # 只发取消，不等它收尾：等的话会把「取消在途源请求 + 收尾」的时间
+            # 再加到响应上（实测 8.5s → 9.5/11.1s）。共享扇出在聚合层是
+            # shield 出来的，这里取消只断开本次等待，不影响它的结果进缓存。
+            _task.cancel()
+            _task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            online = partial.get("cards") or []
+            if online:
+                _log.info("online search partial: %d cards (8.5s cap)", len(online))
+            if online:
+                _log.info("online search partial: %d cards (8.5s cap)", len(online))
         except Exception as exc:
             # 在线聚合搜索整体失败即只剩本地结果；记异常类型，不记搜索关键词。
             _log.warning("online search failed: %s", type(exc).__name__)
-            online = []
+            online = partial.get("cards") or []
     # 红果短剧搜索并入（仅查本地已缓存标题，不再打 upstream）
     hgdj_online = []
     if q and hgdj_enabled():
@@ -11184,6 +11358,112 @@ async def ext_junk_keywords(request: Request):
     return {"code": 0, "msg": "saved", "data": {"junk_keywords": kws}}
 
 
+@app.get("/v/api/ext/mirror-pool")
+async def ext_mirror_pool_get():
+    """GitHub 加速镜像池（A2，2026-11-12）：按实测速度排序，含已停用项。"""
+    try:
+        import mirrorpool
+        items = mirrorpool.full_pool()
+        last = int(config.get().get("github_mirror_last_scan") or 0)
+        return {"code": 0, "msg": "", "data": {
+            "pool": items,
+            "last_scan": last,
+            "fail_threshold": mirrorpool.FAIL_THRESHOLD,
+            "seeds": len(mirrorpool.SEEDS),
+        }}
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"code": 500, "msg": f"镜像池不可用：{exc}"}, status_code=500)
+
+
+@app.post("/v/api/ext/mirror-pool/discover")
+async def ext_mirror_pool_discover():
+    """并发探测全部种子，只把通的放进池，按响应时间排序。"""
+    try:
+        import mirrorpool
+        rep = await mirrorpool.discover()
+        return {"code": 0, "msg": f"探测完成：{rep['ok']} 个可用", "data": rep}
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"code": 500, "msg": f"探测失败：{exc}"}, status_code=500)
+
+
+@app.post("/v/api/ext/mirror-pool")
+async def ext_mirror_pool_edit(request: Request):
+    """手动管理镜像池。body: {"host": str, "action": "enable|disable|remove"}"""
+    body = await request.json()
+    host = str(body.get("host") or "").strip().lower()
+    action = str(body.get("action") or "").strip().lower()
+    if not host or action not in ("enable", "disable", "remove"):
+        return JSONResponse({"code": 400, "msg": "参数错误"}, status_code=400)
+    try:
+        import mirrorpool
+        if action == "remove":
+            ok = mirrorpool.remove(host)
+        else:
+            ok = mirrorpool.set_enabled(host, action == "enable")
+        if not ok:
+            return JSONResponse({"code": 404, "msg": "池中没有该镜像"}, status_code=404)
+        return {"code": 0, "msg": "已更新", "data": {"pool": mirrorpool.full_pool()}}
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"code": 500, "msg": f"操作失败：{exc}"}, status_code=500)
+
+
+@app.get("/v/api/ext/proxy")
+async def ext_proxy_get():
+    """统一网络代理配置（A1，2026-11-12）：一处地址 + 四处用途开关 + 手动例外。"""
+    import netutil as _net
+    cfg = config.get()
+    return {"code": 0, "msg": "", "data": {
+        "url": config.proxy_url(),
+        "use": dict(cfg.get("proxy_use") or {"subscription": True,
+                                             "source": True,
+                                             "update": False,
+                                             "media": False}),
+        "always": sorted(config.proxy_hosts("always")),
+        "never": sorted(config.proxy_hosts("never")),
+        "mode": config.source_proxy_mode(),
+        # 诊断：本进程内已学习为「需要代理」的主机（30 分钟过期）
+        "learned": sorted(getattr(_net, "_proxy_hosts", {}).keys()),
+    }}
+
+
+@app.post("/v/api/ext/proxy")
+async def ext_proxy_save(request: Request):
+    """保存统一代理配置。body:
+    {"url": str, "use": {subscription,source,update,media}, 
+     "always": [域名…] 或换行文本, "never": 同上, "mode": "off|on|auto"}
+    各字段缺省表示保持原值。"""
+    body = await request.json()
+    _old_url = config.proxy_url()
+    _old_mode = config.source_proxy_mode()
+    ok, msg = config.set_proxy(
+        url=body.get("url"),
+        use=body.get("use") if isinstance(body.get("use"), dict) else None,
+        always=body.get("always"),
+        never=body.get("never"),
+    )
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    if body.get("mode") is not None:
+        mok, mmsg = config.set_source_proxy_mode(str(body.get("mode")))
+        if not mok:
+            return JSONResponse({"code": 400, "msg": mmsg}, status_code=400)
+    # 仅当「地址或模式」实际变化时才清空 auto 学习结果，让新配置立即生效。
+    # 只点保存、配置没变时不清（否则每个 host 都要重新踩一遍坑才学回来）。
+    try:
+        import netutil as _net
+        if config.proxy_url() != _old_url or config.source_proxy_mode() != _old_mode:
+            _net.clear_proxy_hosts()
+    except Exception:  # noqa: BLE001
+        pass
+    return {"code": 0, "msg": "已保存", "data": {
+        "url": config.proxy_url(),
+        "use": dict(config.get().get("proxy_use") or {}),
+        "always": sorted(config.proxy_hosts("always")),
+        "never": sorted(config.proxy_hosts("never")),
+        "mode": config.source_proxy_mode(),
+    }}
+
+
 @app.post("/v/api/ext/source-proxy")
 async def ext_set_source_proxy(request: Request):
     """设置/清空「访问资源站取源」专用代理（搜索/分类/测速/解析；视频流仍直连）。
@@ -11334,6 +11614,116 @@ async def ext_source_restore(request: Request):
     config.restore_builtin()
     _search_cache.clear(); _AGG_CACHE.clear()
     return {"code": 0, "msg": "restored"}
+
+
+# ---------------- 巡检设置 / 状态 / 日志（第 3 批） ----------------
+
+_PATROL_KEYS = ("patrol_enabled", "patrol_interval_h", "patrol_disabled_interval_h",
+                "patrol_retain_days", "patrol_timeout_s", "patrol_concurrency",
+                "patrol_fail_threshold", "patrol_min_span_h", "search_top_n")
+
+
+@app.get("/v/api/ext/patrol/settings")
+async def ext_patrol_settings_get():
+    return {"code": 0, "data": config.patrol_settings()}
+
+
+@app.post("/v/api/ext/patrol/settings")
+async def ext_patrol_settings_set(request: Request):
+    body = await request.json()
+    patch = {}
+    for k in _PATROL_KEYS:
+        if k in body:
+            v = body[k]
+            if k in ("patrol_enabled",):
+                patch[k] = bool(v)
+            else:
+                try:
+                    patch[k] = float(v) if k in (
+                        "patrol_interval_h", "patrol_disabled_interval_h",
+                        "patrol_timeout_s", "patrol_min_span_h") else int(float(v))
+                except (TypeError, ValueError):
+                    return JSONResponse({"code": 400, "msg": f"{k} 需为数字"},
+                                        status_code=400)
+    if patch:
+        config.save(patch)
+    # 参数变了立刻清缓存，让新的 search_top_n 生效
+    _search_cache.clear(); _AGG_CACHE.clear()
+    return {"code": 0, "msg": "已保存（下一轮巡检按新参数执行）",
+            "data": config.patrol_settings()}
+
+
+@app.get("/v/api/ext/patrol/state")
+async def ext_patrol_state(limit: int = 200):
+    import healthcheck
+    settings = config.patrol_settings()
+    sources = {s["id"]: s for s in config.all_sources()}
+    rows = []
+    for sid, st in healthcheck.probe_state().items():
+        if sid.startswith("_"):
+            continue
+        src = sources.get(sid) or {}
+        rows.append({
+            "id": sid,
+            "name": src.get("name") or sid,
+            "enabled": bool(src.get("enabled")),
+            "sys_disabled": bool(src.get("sys_disabled")),
+            "disabled_reason": src.get("disabled_reason") or "",
+            "disabled_at": src.get("disabled_at"),
+            "fails": st.get("fails") or 0,
+            "state": st.get("last_state") or "",
+            "error": st.get("last_error") or "",
+            "lat_ms": st.get("lat_ms") or 0,
+            "hit": st.get("hit") or 0,
+            "last_probe": st.get("last_probe"),
+            "last_ok": st.get("last_ok"),
+            "ok_rate": healthcheck.ok_rate(sid),
+        })
+    rows.sort(key=lambda r: (-(r["fails"] or 0), r["last_probe"] or 0))
+    return {"code": 0, "data": {
+        "settings": settings,
+        "total": len(config.all_sources()),
+        "probed": len(rows),
+        "rows": rows[:max(1, min(2000, int(limit)))],
+        "log": healthcheck.read_log(120),
+    }}
+
+
+@app.post("/v/api/ext/patrol/run")
+async def ext_patrol_run(request: Request):
+    """手动跑一轮巡检（后台执行，立即返回，避免网关超时）。"""
+    import healthcheck
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    force = bool(body.get("force", True))
+
+    async def _run():
+        try:
+            r = await healthcheck.scan_once(force=force)
+            _log.info("patrol manual run: %s", r)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("patrol manual run failed: %s", exc)
+
+    asyncio.create_task(_run())
+    return {"code": 0, "msg": "巡检已在后台开始，稍后刷新查看结果"}
+
+
+@app.get("/v/api/ext/source/removed")
+async def ext_source_removed():
+    return {"code": 0, "data": {"removed": config.removed_sources()}}
+
+
+@app.post("/v/api/ext/source/restore-one")
+async def ext_source_restore_one(request: Request):
+    body = await request.json()
+    ok, msg = config.restore_removed(str(body.get("id") or ""))
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    _search_cache.clear(); _AGG_CACHE.clear()
+    _schedule_routes_refresh()
+    return {"code": 0, "msg": "已恢复"}
 
 
 @app.post("/v/api/ext/source/test")

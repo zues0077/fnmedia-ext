@@ -34,7 +34,6 @@ BOOT_DELAY = 30
 SCAN_PERIOD = 300  # 每 5 分钟扫一次「是否有订阅到期」
 
 # 单次订阅拉取的探测并发上限。
-_PROBE_CONCURRENCY = 8
 
 # 刷新回调（由 app 注入）：新增源后清搜索缓存 / 刷新聚合路由。
 _on_changed: Callable[[], Awaitable[None]] | None = None
@@ -109,41 +108,31 @@ async def refresh_subscription(sub_id: str) -> dict:
     live_items = groups.get("live", [])
 
     # ---------- 苹果 CMS：探测 + 只增不减 ----------
-    import providers
     existing = {s.get("api", "").rstrip("/").lower()
                 for s in cfg.all_sources()}
     added_names: list[str] = []
     dup = 0
-    failed = 0
-    sem = asyncio.Semaphore(_PROBE_CONCURRENCY)
 
-    async def _probe(c):
-        async with sem:
-            try:
-                pr = await asyncio.wait_for(
-                    providers.probe_source(c["api"], timeout=8.0), timeout=10)
-            except Exception:
-                pr = {"ok": False}
-            return c, pr
-
-    checked = await asyncio.gather(*[_probe(c) for c in cms_cands[:80]])
+    # A1（2026-11-12）：订阅导入【不再同步探测】。
+    # 原实现用 8 秒超时逐源探测，会把 10~15 秒才响应的正常源误判为失效直接丢弃
+    # （实测 niubihu1 的 21 个 CMS 只进 8 个，其中「❤百度」实际 5.4~13 秒可用却
+    # 被 TimeoutError 杀掉）。现在全部入库并标 verified=False，由定时巡检
+    # （/source/health-check，25 秒超时 + 多热门词）确认后更新状态；
+    # 真正失效的源由巡检自动禁用，不再拖慢导入、不再误杀。
     standalone = bool(sub.get("standalone"))
-    for c, pr in checked:
+    for c in cms_cands:
         key = c["api"].rstrip("/").lower()
         if key in existing:
             dup += 1
             continue
-        if not pr.get("ok"):
-            failed += 1
-            continue
         ok, _sid = cfg.add_source(c["name"], c["api"], True, standalone,
-                                  sub_id=sub_id)
+                                  sub_id=sub_id, verified=False)
         if ok:
             added_names.append(c["name"])
             existing.add(key)
         else:
             dup += 1
-        if len(added_names) >= 60:
+        if len(added_names) >= 200:      # 上限从 60 放宽到 200
             break
 
     # ---------- m3u8 直播源 ----------
@@ -165,7 +154,9 @@ async def refresh_subscription(sub_id: str) -> dict:
         "cms_added": len(added_names),
         "added_names": added_names,
         "cms_dup": dup,
-        "cms_failed": failed,
+        # A1：导入不再探测，全部入库待巡检（cms_added 即待验证数）
+        "cms_pending": len(added_names),
+        "cms_failed": 0,
         "live": live_report,
     }
 

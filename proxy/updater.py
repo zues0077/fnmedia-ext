@@ -299,17 +299,17 @@ async def start_update() -> dict:
 
 
 def _proxy_candidates() -> list[str | None]:
-    """更新下载的通道候选，按优先级：update_proxy、subscription_proxy、直连。
+    """更新下载的通道候选，按优先级：update 用途代理 → subscription 用途代理 → 直连。
 
-    服务以干净 systemd 环境运行（无 *_proxy），国内直连 GitHub Release 附件
-    CDN 常握手超时，因此允许用户在管理页为“更新”单独配置代理。
+    A1（2026-11-12）：改为按统一配置的「用途开关」取代理；两个用途都没开
+    或都没配地址时只留直连。服务以干净 systemd 环境运行（无 *_proxy），
+    国内直连 GitHub Release 附件 CDN 常握手超时，因此允许用户单独为更新配代理。
     """
     cands: list[str | None] = []
     if _config is not None:
         try:
-            cfg = _config.config.get()
-            for key in ("update_proxy", "subscription_proxy"):
-                v = (cfg.get(key) or "").strip()
+            for purpose in ("update", "subscription"):
+                v = _config.config.proxy_for(purpose)
                 if v and v not in cands:
                     cands.append(v)
         except Exception:  # noqa: BLE001

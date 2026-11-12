@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 from pathlib import Path
 
 import features
@@ -261,21 +262,38 @@ DEFAULTS = {
     "admin_auth_max_failures": 5,
     "admin_auth_lockout_seconds": 900,
     "admin_auth_window_seconds": 900,
+    # —— 统一网络代理（A1，2026-11-12）——
+    # 一处填地址 + 四处用途开关 + 手动例外，替代原来分散的
+    # subscription_proxy / source_proxy / update_proxy 三个输入框。
+    # 老字段保留（只读兼容），启动时按 _legacy_proxy() 自动回退。
+    "proxy_url": "",
+    "proxy_use": {"subscription": True, "source": True,
+                  "update": False, "media": False},
+    # 手动例外（智能模式生效，最高优先级）：
+    #   proxy_always_hosts：总是走代理（直连能通但慢/不稳的站）
+    #   proxy_never_hosts ：永远直连（加代理反而不能播的站）
+    "proxy_always_hosts": [],
+    "proxy_never_hosts": [],
+    # —— GitHub 加速镜像池（A2，2026-11-12）——
+    # 照 lx-hunter P-0915 的做法：14 个种子探测通了才入池，按实测响应时间排序，
+    # 连续失败 3 次自动出池（enabled=False），支持手动移除/启停。
+    # 空列表 = 尚未探测过，此时按内置种子顺序兜底（不阻塞首次使用）。
+    # 元素结构：{"host": str, "kind": "prefix|raw|jsdelivr", "ms": int,
+    #            "fails": int, "enabled": bool}
+    "github_mirror_pool": [],
+    "github_mirror_last_scan": 0,
     # 仅用于「拉取订阅资源」的可选 HTTP(S) 代理（订阅配置 / spider jar / DRPY 脚本）。
-    # 播放、聚合搜索、CMS 探测等一律不走此代理（产品客户端保持 trust_env=False 直连）。
-    # 形如 http://user:pass@host:port ；留空表示直连。
+    # 【已并入 proxy_url + proxy_use.subscription；仅为老配置兼容保留】
     "subscription_proxy": "",
     # 仅用于「访问资源站取源」（聚合搜索 / 分类深翻 / 测速探测 / CMS 详情）的可选
-    # HTTP(S) 代理。部分运营商直连资源站超时/被墙，挂代理可显著改善搜索结果与速度
-    # （issue #30）。播放、m3u8/分片等媒体流默认仍直连，不增加代理带宽压力。
-    # 形如 http://user:pass@host:port ；留空=直连。
+    # HTTP(S) 代理。【已并入 proxy_url + proxy_use.source；仅为老配置兼容保留】
     "source_proxy": "",
     # 资源站代理模式："off"=一律直连（忽略已配置代理）；"on"=所有取源都走代理；
     # "auto"=默认直连，仅当某个资源站直连发生连接级失败（重置/超时/DNS等）时，
     # 自动对该站切换到已配置代理重试，其余站点保持直连（推荐）。
     "source_proxy_mode": "auto",
     # 检查/下载插件更新安装包时可选的 HTTP(S) 代理（仅更新用途）。
-    # 留空则回退 subscription_proxy，再不行直连。仅存于本机 state，不随包分发。
+    # 【已并入 proxy_url + proxy_use.update；仅为老配置兼容保留】
     "update_proxy": "",
     # —— 网盘过期转存清理（P1-8，与上游调用点默认值一致）——
     # 默认开启：转存只是可随时重新生成的缓存副本，过期不清理会无限占用
@@ -309,6 +327,33 @@ DEFAULTS = {
     "metadata_enabled": True,
     # 关联作品：开启后，详情页下方挂 recommendations 关联作品（同系列/同分类优先）。
     "related_enabled": True,
+
+    # ---- 巡检（第 3 批，2026-11-12）----
+    # 是否启用定期巡检。与 source_health_enabled 分开：后者只管「搜索结果降权」，
+    # 本项只管「定时探测 + 停用/删除」，一个开关一种语义。
+    "patrol_enabled": True,
+    # 正常源巡检间隔（小时）。实测 30 源一轮 48~78 秒，6 小时足够。
+    "patrol_interval_h": 6,
+    # 已停用源巡检间隔（小时）。停用源要快速复活，默认 1 小时。
+    "patrol_disabled_interval_h": 1,
+    # 停用满多少天自动删除；0 表示永不删除（只停用）。
+    "patrol_retain_days": 30,
+    # 单次探测超时（秒）。实测 p90=17.5s、max=24.2s，故 25 秒。
+    "patrol_timeout_s": 25,
+    # 巡检并发。实测并发 2/4/8 的存活判定一致，4 兼顾速度与不惊动源站。
+    "patrol_concurrency": 4,
+    # 连续失败阈值（浮点比较用 int）。
+    "patrol_fail_threshold": 3,
+    # 首次失败到判定停用至少要跨越的小时数，防止瞬时抖动判死。
+    "patrol_min_span_h": 12,
+
+    # ---- 巡检结果回流搜索（第 3 批）----
+    # 搜索只取按质量排序后的前 N 个源；0 = 不截断（只排序）。
+    "search_top_n": 40,
+
+    # 已删除源的墓碑：{id, name, api, reason, deleted_at, last_error, quality}
+    # 用于「已移除」列表展示与单条恢复，避免删掉就再也找不回来。
+    "removed_sources": [],
 }
 
 # 已废弃、需从旧配置里清除的键
@@ -413,7 +458,18 @@ class Config:
                     continue
                 cur = saved_by_id.get(s["id"], {})
                 m = dict(s)
-                m.update({k: cur[k] for k in ("enabled", "name", "api") if k in cur})
+                # api 以代码为准（内置源地址随版本修复才能真正生效）；enabled/name
+                # 保留本地。用户改不了内置源的 api（update_source 硬拒），所以这里
+                # 用代码地址不会覆盖任何人的自定义。历史上确实存过旧 api 的，此次
+                # 升级会一次性纠正到新地址。
+                m.update({k: cur[k] for k in ("enabled", "name") if k in cur})
+                # 巡检状态字段必须能从落盘配置恢复（否则重启后 sys_disabled /
+                # disabled_at 丢失，内置源会被当成用户手动停用而永不复活）。
+                for key in ("verified", "fail_count", "last_check", "last_ok",
+                            "disabled_reason", "disabled_at", "sys_disabled",
+                            "quality"):
+                    if cur.get(key) is not None:
+                        m[key] = cur[key]
                 m["builtin"] = True
                 m["standalone"] = bool(cur.get("standalone", False))
                 m["loose_filter"] = bool(cur.get("loose_filter", False))
@@ -465,6 +521,13 @@ class Config:
                 m["builtin"] = bool(s.get("builtin", False))
                 for key in ("kind", "site_key", "ext", "searchable", "filterable", "indexs", "method", "sub_id", "live"):
                     if key in s:
+                        m[key] = s[key]
+                # A1/A2：巡检状态字段必须持久化，否则重启即丢（曾踩坑：verified 写 False
+                # 后重启被合并逻辑抹成 None）。这里显式登记，新增巡检字段请一并加进来。
+                for key in ("verified", "fail_count", "last_check", "last_ok",
+                            "disabled_reason", "disabled_at", "sys_disabled",
+                            "quality"):
+                    if s.get(key) is not None:
                         m[key] = s[key]
                 merged.append(m)
             cfg["sources"] = merged
@@ -614,6 +677,116 @@ class Config:
         with _LOCK:
             return [dict(s) for s in self._cfg["sources"] if s.get("enabled")]
 
+    # ---------------- 巡检质量排序（第 3 批） ----------------
+
+    @staticmethod
+    def _lat_bucket(ms) -> int:
+        """延迟分档：<1s=0, <3s=1, <8s=2, >=8s=3，无数据=2（居中，给机会）。"""
+        try:
+            v = float(ms)
+        except (TypeError, ValueError):
+            return 2
+        if v <= 0:
+            return 2
+        if v < 1000:
+            return 0
+        if v < 3000:
+            return 1
+        if v < 8000:
+            return 2
+        return 3
+
+    @staticmethod
+    def _state_bucket(state: str) -> int:
+        """状态分档：ok=0, 未知=1, 限搜=2, 存疑=3。"""
+        return {"ok": 0, "": 1, None: 1, "limited": 2, "suspect": 3,
+                "unsupported": 2}.get(state, 1)
+
+    @staticmethod
+    def _rate_bucket(rate) -> int:
+        """7 天可用率分档：>=0.9=0, >=0.7=1, >=0.5=2, 更低=3，无数据=1。"""
+        try:
+            v = float(rate)
+        except (TypeError, ValueError):
+            return 1
+        if v >= 0.9:
+            return 0
+        if v >= 0.7:
+            return 1
+        if v >= 0.5:
+            return 2
+        return 3
+
+    def rank_sources(self, sources: list[dict], limit: int | None = None) -> list[dict]:
+        """按巡检质量排序（字典序，不做加权总分），可截断前 N 个。
+
+        排序键从高到低：
+          0 置顶    人工置顶永远最前
+          1 屏蔽    人工屏蔽的沉底（不删除，也不进前 N）
+          2 状态    ok > 未知 > 限搜 > 存疑（不删不弃，只影响先后）
+          3 预算    3 秒内能返回的排前面（全局搜索总预算 5 秒，慢了等于没结果）
+          4 命中    最近 5 轮巡检关键词命中累计（有片优先）
+          5 直链    搜到的结果里有 http 直链（能播概率高）
+          6 延迟    巡检实测延迟分档（<1s / 1~3s / 3~8s / >=8s）
+          7 可用率  近 7 天巡检成功率分档
+          8 人工    source_priority（人工片源质量，值大优先）
+          9 id      稳定排序，避免刷新后顺序乱跳
+
+        每一档都能指着巡检日志说清「它为什么排后面」，不引入权重表。
+        """
+        self.maybe_reload()
+        with _LOCK:
+            cfg = self._cfg
+            pinned = {x for x in (cfg.get("source_pinned") or []) if isinstance(x, str)}
+            blocked = {x for x in (cfg.get("source_blocked") or []) if isinstance(x, str)}
+            prio = cfg.get("source_priority") or {}
+
+        def key(s: dict):
+            sid = str(s.get("id") or "")
+            q = s.get("quality") if isinstance(s.get("quality"), dict) else {}
+            try:
+                hits = int(q.get("hits") or 0)
+            except (TypeError, ValueError):
+                hits = 0
+            try:
+                direct = int(q.get("direct") or 0)
+            except (TypeError, ValueError):
+                direct = 0
+            try:
+                lat = float(q.get("lat_ms") or 0)
+            except (TypeError, ValueError):
+                lat = 0.0
+            # 「赶得上搜索预算」比「快多少」更重要：全局搜索总预算 5 秒，
+            # 3 秒还没回的源基本进不了结果。所以先按这个二值分档，同档内
+            # 再看有没有片、有没有直链、快不快。
+            feasible = 0 if (lat <= 0 or lat < 3000) else 1
+            try:
+                p = int(prio.get(sid) or 0)
+            except (TypeError, ValueError):
+                p = 0
+            return (
+                0 if sid in pinned else 1,
+                1 if sid in blocked else 0,
+                self._state_bucket(q.get("state")),
+                feasible,
+                -hits,
+                0 if direct > 0 else 1,
+                self._lat_bucket(q.get("lat_ms")),
+                self._rate_bucket(q.get("ok_rate")),
+                -p,
+                sid,
+            )
+
+        ordered = sorted(sources, key=key)
+        if limit is not None:
+            try:
+                n = int(limit)
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                ordered = ordered[:n]
+        return ordered
+
     def all_sources(self):
         self.maybe_reload()
         with _LOCK:
@@ -699,7 +872,8 @@ class Config:
         return "custom_" + hashlib.md5(api.strip().encode()).hexdigest()[:10]
 
     def add_source(self, name: str, api: str, enabled: bool = True,
-                   standalone: bool = False, sub_id: str = "") -> tuple[bool, str]:
+                   standalone: bool = False, sub_id: str = "",
+                   verified: bool | None = None) -> tuple[bool, str]:
         with _LOCK:
             cfg = self.get()
             api = (api or "").strip()
@@ -722,6 +896,10 @@ class Config:
             entry = {"id": sid, "name": name, "api": api,
                      "enabled": bool(enabled), "standalone": bool(standalone),
                      "builtin": False}
+            # 待验证标记：订阅导入时不探测（探测交给定时巡检），先入库标 False，
+            # 巡检确认可用后置 True。缺省不写该键，老源行为不变。
+            if verified is not None:
+                entry["verified"] = bool(verified)
             if sub_id:
                 entry["sub_id"] = sub_id
             cfg["sources"].append(entry)
@@ -1066,6 +1244,122 @@ class Config:
             cfg["subscriptions"] = subs
             self._persist(cfg, backup=False)
 
+    # ---------------- 统一网络代理（A1，2026-11-12） ----------------
+
+    _PROXY_PURPOSES = ("subscription", "source", "update", "media")
+
+    @staticmethod
+    def _valid_proxy_url(p: str) -> tuple[bool, str]:
+        from urllib.parse import urlparse
+        if not p:
+            return True, "ok"
+        u = urlparse(p)
+        if u.scheme not in ("http", "https", "socks5", "socks5h") or not u.hostname:
+            return False, "代理地址格式应为 http://user:pass@host:port（支持 socks5）"
+        return True, "ok"
+
+    def _legacy_proxy(self, cfg: dict) -> str:
+        """老配置迁移：按用途优先级取第一个非空旧字段。"""
+        for k in ("source_proxy", "subscription_proxy", "update_proxy"):
+            v = str(cfg.get(k) or "").strip()
+            if v:
+                return v
+        return ""
+
+    def proxy_url(self) -> str:
+        """统一代理地址（空串=直连）。新字段为空时自动回退老字段，老用户升级即生效。"""
+        try:
+            self.maybe_reload()
+            cfg = self.get()
+            u = str(cfg.get("proxy_url") or "").strip()
+            return u or self._legacy_proxy(cfg)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def proxy_for(self, purpose: str) -> str:
+        """按用途返回应使用的代理地址；该用途未开启或没配地址时返回空串（=直连）。
+
+        purpose: subscription / source / update / media
+        """
+        if purpose not in self._PROXY_PURPOSES:
+            return ""
+        try:
+            cfg = self.get()
+            use = cfg.get("proxy_use")
+            if not isinstance(use, dict) or not use:
+                # 老配置没有 proxy_use：只按老字段精确回退，避免把订阅代理误用到搜索
+                key = {"subscription": "subscription_proxy",
+                       "source": "source_proxy",
+                       "update": "update_proxy",
+                       "media": None}[purpose]
+                return str(cfg.get(key) or "").strip() if key else ""
+            if not bool(use.get(purpose)):
+                return ""
+            return self.proxy_url()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def proxy_hosts(self, kind: str) -> set:
+        """手动例外域名集合。kind: always（总走代理）/ never（永不代理）。"""
+        key = "proxy_always_hosts" if kind == "always" else "proxy_never_hosts"
+        try:
+            cfg = self.get()
+            return {str(x).strip().lower() for x in (cfg.get(key) or [])
+                    if str(x).strip()}
+        except Exception:  # noqa: BLE001
+            return set()
+
+    def set_proxy(self, url: str | None = None, use: dict | None = None,
+                  always: list | str | None = None,
+                  never: list | str | None = None) -> tuple[bool, str]:
+        """保存统一代理配置。各参数为 None 时保持原值。
+
+        - url：代理地址（空串=直连）
+        - use：{subscription,source,update,media} 勾选
+        - always/never：手动例外域名（列表或换行分隔字符串）
+        """
+        def _hosts(v):
+            if v is None:
+                return None
+            items = v if isinstance(v, list) else str(v).replace(",", "\n").splitlines()
+            out = []
+            for it in items:
+                h = str(it).strip().lower()
+                if h and h not in out:
+                    out.append(h)
+            return out
+
+        with _LOCK:
+            cfg = self.get()
+            if url is not None:
+                p = str(url).strip()
+                ok, msg = self._valid_proxy_url(p)
+                if not ok:
+                    return False, msg
+                cfg["proxy_url"] = p
+                # 写了统一地址后清空老字段，避免两处不一致
+                for k in ("source_proxy", "subscription_proxy", "update_proxy"):
+                    cfg[k] = ""
+            if isinstance(use, dict):
+                cur = dict(cfg.get("proxy_use") or {})
+                for k in self._PROXY_PURPOSES:
+                    if k in use:
+                        cur[k] = bool(use[k])
+                cfg["proxy_use"] = cur
+            a = _hosts(always)
+            if a is not None:
+                cfg["proxy_always_hosts"] = a
+                # 同一个域名不能同时在两个列表：always 优先
+                nv = [h for h in (cfg.get("proxy_never_hosts") or []) if h not in a]
+                cfg["proxy_never_hosts"] = nv
+            n = _hosts(never)
+            if n is not None:
+                cfg["proxy_never_hosts"] = n
+                av = [h for h in (cfg.get("proxy_always_hosts") or []) if h not in n]
+                cfg["proxy_always_hosts"] = av
+            self._persist(cfg)
+            return True, "ok"
+
     def set_subscription_proxy(self, proxy_url: str) -> tuple[bool, str]:
         """保存「订阅资源抓取」专用代理（空串=直连）。仅用于订阅配置/jar/DRPY脚本，
         不影响播放与搜索。仅接受 http(s)/socks5 URL 形态。"""
@@ -1193,6 +1487,8 @@ class Config:
             target = next((s for s in cfg["sources"] if s["id"] == sid), None)
             if not target:
                 return False, "源不存在"
+            # 手动删除也写墓碑：删错了能在「已移除」里单条恢复。
+            self._add_tombstone(cfg, target, "手动删除")
             if target.get("builtin"):
                 # 内置源不物理删除，标记移除（可在重置时恢复）
                 if sid not in cfg["removed_ids"]:
@@ -1211,9 +1507,12 @@ class Config:
 
     # ---------------- 定期体检（失效三次停用/删除） ----------------
 
-    def sys_disable_source(self, sid: str) -> tuple[bool, str]:
-        """系统体检停用源：置 enabled=False 并打 sys_disabled 标记。
-        与用户手动停用（enabled=False 无标记）区分，恢复时系统可自动启用。"""
+    def sys_disable_source(self, sid: str, reason: str = "") -> tuple[bool, str]:
+        """系统体检停用源：置 enabled=False 并打 sys_disabled 标记 + disabled_at。
+
+        与用户手动停用（enabled=False 无标记）区分，恢复时系统可自动启用。
+        disabled_at 用于「停用满 N 天自动删除」的计算，缺失时按当前时间兜底。
+        """
         with _LOCK:
             cfg = self.get()
             target = next((s for s in cfg["sources"] if s["id"] == sid), None)
@@ -1221,6 +1520,9 @@ class Config:
                 return False, "源不存在"
             target["enabled"] = False
             target["sys_disabled"] = True
+            target["disabled_at"] = time.time()
+            if reason:
+                target["disabled_reason"] = reason
             self._persist(cfg)
             return True, "ok"
 
@@ -1239,16 +1541,131 @@ class Config:
             self._persist(cfg)
             return True, "ok"
 
-    def sys_remove_source(self, sid: str) -> tuple[bool, str]:
-        """系统体检删除源（仅订阅/自定义源，内置源永不删）。"""
+    def apply_quality_batch(self, mapping: dict) -> None:
+        """把一轮巡检结果批量写回源条目（只落盘一次，避免逐源写配置风暴）。
+
+        mapping: {sid: {"quality": {...}, "verified": bool|None,
+                        "fail_count": int, "last_check": ts, "last_ok": ts|None}}
+        """
+        if not isinstance(mapping, dict) or not mapping:
+            return
+        with _LOCK:
+            cfg = self.get()
+            changed = False
+            by_id = {s["id"]: s for s in cfg["sources"]}
+            for sid, patch in mapping.items():
+                target = by_id.get(sid)
+                if not target or not isinstance(patch, dict):
+                    continue
+                for k, v in patch.items():
+                    if v is None:
+                        continue
+                    target[k] = v
+                changed = True
+            if changed:
+                self._persist(cfg)
+
+    def patrol_settings(self) -> dict:
+        """巡检参数（每次读取都取当前配置，改完立即生效）。"""
+        cfg = self.get()
+
+        def num(key, default, lo, hi, cast=int):
+            try:
+                v = cast(cfg.get(key, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        return {
+            "enabled": bool(cfg.get("patrol_enabled", True)),
+            "interval_h": num("patrol_interval_h", 6, 0.1, 168, float),
+            "disabled_interval_h": num("patrol_disabled_interval_h", 1, 0.1, 168, float),
+            "retain_days": num("patrol_retain_days", 30, 0, 3650),
+            "timeout_s": num("patrol_timeout_s", 25, 3, 120, float),
+            "concurrency": num("patrol_concurrency", 4, 1, 16),
+            "fail_threshold": num("patrol_fail_threshold", 3, 1, 20),
+            "min_span_h": num("patrol_min_span_h", 12, 0, 240, float),
+            "top_n": num("search_top_n", 40, 0, 2000),
+        }
+
+    def sys_remove_source(self, sid: str, reason: str = "") -> tuple[bool, str]:
+        """系统/手动删除源（内置源也允许，但先写墓碑，可单条恢复）。
+
+        不同于旧实现（内置源硬拒）：删掉的内置源会进 removed_ids，下次加载不再
+        合并回来；墓碑保留 name/api/原因/最后巡检数据，「已移除」列表里能查、
+        能单条恢复。这样内置源既不会变成改不了也删不掉的僵尸，也不是不可逆。
+        """
         with _LOCK:
             cfg = self.get()
             target = next((s for s in cfg["sources"] if s["id"] == sid), None)
             if not target:
                 return False, "源不存在"
-            if target.get("builtin"):
-                return False, "内置源不可删除"
+            self._add_tombstone(cfg, target, reason)
+            if target.get("builtin") and sid not in cfg["removed_ids"]:
+                cfg["removed_ids"].append(sid)
             cfg["sources"] = [s for s in cfg["sources"] if s["id"] != sid]
+            self._persist(cfg)
+            return True, "ok"
+
+    def _add_tombstone(self, cfg: dict, target: dict, reason: str = "") -> None:
+        """把源记录写进墓碑（按 id 去重，最多保留 500 条，新的在前）。"""
+        tombstones = [t for t in (cfg.get("removed_sources") or [])
+                      if isinstance(t, dict) and t.get("id") != target.get("id")]
+        tombstones.insert(0, {
+            "id": target.get("id"),
+            "name": target.get("name"),
+            "api": target.get("api"),
+            "kind": target.get("kind") or ("live" if target.get("live") else ""),
+            "builtin": bool(target.get("builtin")),
+            "sub_id": target.get("sub_id") or "",
+            "reason": reason or target.get("disabled_reason") or "",
+            "deleted_at": time.time(),
+            "last_ok": target.get("last_ok"),
+            "last_check": target.get("last_check"),
+            "quality": target.get("quality") or {},
+        })
+        cfg["removed_sources"] = tombstones[:500]
+
+    def removed_sources(self) -> list[dict]:
+        """墓碑列表（新的在前）。"""
+        self.maybe_reload()
+        with _LOCK:
+            return [dict(t) for t in (self._cfg.get("removed_sources") or [])
+                    if isinstance(t, dict)]
+
+    def restore_removed(self, sid: str) -> tuple[bool, str]:
+        """从墓碑恢复单个源。内置源摘掉 removed_ids 后由加载逻辑从代码合并回来；
+        订阅/自定义源按墓碑记录原样插回（id 不变，置顶/优先级仍有效）。"""
+        sid = (sid or "").strip()
+        if not sid:
+            return False, "缺少源 id"
+        with _LOCK:
+            cfg = self.get()
+            tomb = next((t for t in (cfg.get("removed_sources") or [])
+                         if isinstance(t, dict) and t.get("id") == sid), None)
+            if not tomb:
+                return False, "墓碑里没有这个源"
+            cfg["removed_sources"] = [t for t in (cfg.get("removed_sources") or [])
+                                      if not (isinstance(t, dict) and t.get("id") == sid)]
+            if tomb.get("builtin"):
+                cfg["removed_ids"] = [x for x in (cfg.get("removed_ids") or [])
+                                      if x != sid]
+                self._persist(cfg)
+                self.load()
+                return True, "ok"
+            if any(s.get("id") == sid for s in cfg["sources"]):
+                self._persist(cfg)
+                return True, "already"
+            cfg["sources"].append({
+                "id": sid,
+                "name": tomb.get("name") or sid,
+                "api": tomb.get("api") or "",
+                "enabled": True,
+                "standalone": False,
+                "builtin": False,
+                "sub_id": tomb.get("sub_id") or "",
+                "verified": None,
+            })
             self._persist(cfg)
             return True, "ok"
 

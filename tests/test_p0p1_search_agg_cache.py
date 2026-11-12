@@ -179,16 +179,20 @@ class AggCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(search.call_count, 2)
 
     async def test_budget_is_single_param(self):
+        # 预算只经 budget 一个参数传：第一轮拿「总预算 - 兜底预留」，
+        # 兜底轮预算由 _search_budgets 的第二个返回值约束（2026-11-12）。
         with patch.object(providers, "search_all",
                           return_value=[]) as search:
             await appmod._aggregate_briefs("预算片", refresh=True)
-        self.assertEqual(search.call_args.kwargs.get("budget"), BUDGET)
+        self.assertEqual(search.call_args.kwargs.get("budget"),
+                         appmod._search_budgets(BUDGET)[0])
         self.assertIsNone(search.call_args.kwargs.get("timeout"))
         with patch.object(providers, "search_all",
                           return_value=[]) as search:
             await appmod._aggregate_briefs("预算片2", timeout=6.0,
                                            refresh=True)
-        self.assertEqual(search.call_args.kwargs.get("budget"), 6.0)
+        self.assertEqual(search.call_args.kwargs.get("budget"),
+                         appmod._search_budgets(6.0)[0])
         self.assertIsNone(search.call_args.kwargs.get("timeout"))
 
     async def test_t4_interleave_unchanged(self):

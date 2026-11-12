@@ -26,10 +26,13 @@ _GH_HOSTS = ("raw.githubusercontent.com", "raw.kkgithub.com", "raw.bgithub.xyz",
 
 
 def subscription_proxy() -> str:
-    """当前订阅资源代理 URL（空串=直连）。惰性读取 config，避免循环导入。"""
+    """当前订阅资源代理（统一配置的 subscription 用途；空串=直连）。
+
+    A1（2026-11-12）：改为读 proxy_url + proxy_use.subscription，
+    老配置仍由 config.proxy_for 内部回退 subscription_proxy 字段。"""
     try:
         import config
-        return str(config.config.get().get("subscription_proxy") or "").strip()
+        return config.config.proxy_for("subscription")
     except Exception:  # noqa: BLE001
         return ""
 
@@ -66,7 +69,17 @@ def async_sub_client() -> httpx.AsyncClient:
 
 
 def github_mirror_candidates(url: str) -> list[str]:
-    """GitHub 原始/加速域名资源 → [原URL, 各国内镜像候选]；非 GitHub 只返回原 URL。"""
+    """GitHub 原始/加速域名资源 → [原URL, 镜像池候选]；非 GitHub 只返回原 URL。
+
+    A2（2026-11-12）：改为走 mirrorpool 镜像池（探测通了才入池、按实测速度排序、
+    连续失败 3 次自动出池）。mirrorpool 不可用时回退到内置硬编码列表，保证功能不丢。
+    """
+    try:
+        import mirrorpool
+        return mirrorpool.candidates(url, _GH_HOSTS)
+    except Exception:  # noqa: BLE001
+        pass
+    # ---- 兜底：硬编码列表（mirrorpool 导入失败时）----
     out = [url]
     try:
         p = urlparse(url)
@@ -94,6 +107,7 @@ def fetch_first(urls, *, want_zip: bool = False, timeout: float | None = None):
     """用订阅代理按顺序尝试一组 URL。返回 (bytes, 命中URL)；全失败返回 (None, 错误)。
 
     want_zip=True 时额外校验 zip(jar/apk) 魔数 PK。
+    A2：成功/失败会回报给镜像池，供「连续失败 3 次出池」统计。
     """
     last = ""
     for u in urls:
@@ -111,12 +125,28 @@ def fetch_first(urls, *, want_zip: bool = False, timeout: float | None = None):
                 blob = r.content
             if not blob:
                 last = f"空响应 @ {u}"
+                _note_mirror(u, ok=False)
                 continue
             if want_zip and blob[:2] != b"PK":
                 last = f"非有效 jar(zip) @ {u}"
+                _note_mirror(u, ok=False)
                 continue
+            _note_mirror(u, ok=True)
             return blob, u
         except Exception as exc:  # noqa: BLE001
             last = f"{type(exc).__name__} @ {u}"
+            _note_mirror(u, ok=False)
             continue
     return None, last
+
+
+def _note_mirror(url: str, *, ok: bool) -> None:
+    """把某个镜像 URL 的成败回报给镜像池（非镜像 host 会被忽略）。"""
+    try:
+        import mirrorpool
+        if ok:
+            mirrorpool.record_success(url)
+        else:
+            mirrorpool.record_failure(url)
+    except Exception:  # noqa: BLE001
+        pass

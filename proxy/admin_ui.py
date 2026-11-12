@@ -93,6 +93,8 @@ label.field>span{display:block;color:var(--muted);font-size:12px;margin-bottom:4
   border-radius:5px;padding:0 5px;margin-left:6px}
 .tag.amber{color:#b45309;background:#fef3e2}
 .tag.warn{color:#b45309;background:#fef3e2}
+/* 订阅导入待验证（A1）：灰底，提示尚未巡检但已参与搜索 */
+.tag.wait{color:#6b7280;background:#f1f3f5;border:1px dashed #d4d8dd}
 /* 统一订阅导入结果 */
 .subgrp{border:1px solid var(--line);border-radius:9px;padding:8px 10px;margin:10px 0;background:#fbfcfe}
 .subgrp-t{font-size:13px;font-weight:600;margin-bottom:6px}
@@ -468,26 +470,101 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div id="cmsHealthResult" class="muted sm" style="margin-top:8px"></div>
       </div>
 
-      <!-- 资源站取源代理（移植上游 v0.2.46/55；后端 /v/api/ext/source-proxy 已在） -->
-      <details class="card">
-        <summary class="card-title" style="cursor:pointer">🌐 资源站取源代理（可选 · 直连慢时）</summary>
-        <p class="card-sub" style="margin-top:8px">仅用于搜索、分类深翻、测速和播放地址解析；视频分片仍直连，不占代理带宽。留空即直连，不改变现有播放策略。</p>
-        <div class="row">
+      <!-- 巡检设置（第 3 批，2026-11-12） -->
+      <details class="card" id="patrolCard">
+        <summary class="card-title" style="cursor:pointer">🩺 巡检与排序（自动停用 / 自动清理 / 搜索取前 N）</summary>
+        <p class="card-sub" style="margin-top:8px">
+          巡检用最轻的 <code>ac=list</code> 接口探测，<strong>连续失败 3 次且跨 12 小时</strong>才停用；
+          停用的源仍按更短周期复检，探测恢复会自动启用。三条时间都可手改，改完下一轮生效。
+          <br/>搜索按巡检结果排序（状态 → 延迟 → 命中 → 可用率 → 人工优先级），只取前 N 个源。
+        </p>
+        <div class="row" style="flex-wrap:wrap;gap:14px;align-items:flex-end">
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
-            <input type="checkbox" id="srcProxyEnable" style="width:14px;height:14px;accent-color:var(--accent)" onchange="onSrcProxyToggle()"/> 已配置代理</label>
+            <input type="checkbox" id="ptEnabled" style="width:15px;height:15px;accent-color:var(--accent)"/> 启用巡检</label>
+          <label class="muted sm">正常源间隔(小时)<br/><input type="number" id="ptInterval" min="0.1" max="168" step="0.5" style="width:96px"/></label>
+          <label class="muted sm">停用源间隔(小时)<br/><input type="number" id="ptDisabledInterval" min="0.1" max="168" step="0.5" style="width:96px"/></label>
+          <label class="muted sm">停用满N天删除<br/><input type="number" id="ptRetain" min="0" max="3650" step="1" style="width:96px" title="0 = 永不删除，只停用"/></label>
+          <label class="muted sm">搜索取前N个源<br/><input type="number" id="ptTopN" min="0" max="2000" step="10" style="width:96px" title="0 = 不截断，只排序"/></label>
+          <label class="muted sm">单次超时(秒)<br/><input type="number" id="ptTimeout" min="3" max="120" step="1" style="width:88px"/></label>
+          <label class="muted sm">并发<br/><input type="number" id="ptConcurrency" min="1" max="16" step="1" style="width:76px"/></label>
         </div>
+        <div class="btn-row" style="margin-top:10px">
+          <button class="small primary" onclick="savePatrol()">保存设置</button>
+          <button class="small" onclick="runPatrol()">立即巡检一轮</button>
+          <button class="small" onclick="loadPatrol()">刷新状态</button>
+          <span id="ptMsg" class="muted sm"></span>
+        </div>
+        <div id="ptSummary" class="muted sm" style="margin-top:8px"></div>
+        <details style="margin-top:8px">
+          <summary class="muted sm" style="cursor:pointer">巡检明细（最近 120 条，可查每个源为什么被停用）</summary>
+          <div style="max-height:320px;overflow:auto;margin-top:6px">
+            <table><thead><tr><th>时间</th><th>源</th><th>结果</th><th>延迟</th><th>失败</th><th>动作 / 原因</th></tr></thead>
+              <tbody id="ptLogRows"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody></table>
+          </div>
+        </details>
+      </details>
+
+      <!-- 已移除（墓碑）：删掉的源可单条恢复，不靠猜 -->
+      <details class="card" id="removedCard">
+        <summary class="card-title" style="cursor:pointer">🗑 已移除的源（可单条恢复）</summary>
+        <p class="card-sub" style="margin-top:8px">自动删除（停用满 N 天）和手动删除都会留档：名称、地址、删除原因、删除时间。恢复后 id 不变，置顶/优先级仍有效。</p>
+        <div class="btn-row"><button class="small" onclick="loadRemoved()">刷新</button></div>
+        <div id="removedRows" class="muted sm" style="margin-top:8px">未加载</div>
+      </details>
+
+      <!-- 统一网络代理（A1，2026-11-12）：替代原来分散在资源站页/导入订阅页/关于页的三个代理输入框 -->
+      <details class="card" id="proxyCard" open>
+        <summary class="card-title" style="cursor:pointer">🌐 网络代理（统一配置）</summary>
+        <p class="card-sub" style="margin-top:8px">
+          一处填地址，下面勾选用到的地方。留空 = 全部直连。支持 <code>http://</code> / <code>https://</code> / <code>socks5://</code>。
+          <br/>说明：<strong>加速镜像</strong>（GitHub 走国内 CDN）与<strong>翻墙代理</strong>是两件事——国内资源站用代理反而更慢，所以默认「智能」：直连失败才走代理。
+        </p>
         <div class="row">
-          <input type="text" id="srcProxyUrl" placeholder="http://Clash:密码@192.168.x.x:7890" style="flex:2" disabled/>
-          <button class="small primary" id="srcProxySaveBtn" onclick="saveSrcProxy(true)" disabled>保存并测速</button>
-          <button class="small ghost danger" id="srcProxyClearBtn" onclick="clearSrcProxy()" disabled>清空</button>
+          <input type="text" id="pxUrl" placeholder="http://127.0.0.1:7890" style="flex:1"/>
         </div>
-        <div class="seg" id="srcProxyMode" style="margin-top:10px" role="tablist">
-          <button type="button" data-mode="auto" onclick="setSrcProxyMode('auto')">🪄 智能（推荐）</button>
-          <button type="button" data-mode="on" onclick="setSrcProxyMode('on')">始终走代理</button>
-          <button type="button" data-mode="off" onclick="setSrcProxyMode('off')">全部直连</button>
+        <div class="stack sm" style="margin-top:10px">
+          <div class="muted sm" style="font-weight:600">应用范围</div>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="pxUseSub" style="width:14px;height:14px;accent-color:var(--accent)"/> 订阅抓取 <span class="muted sm">（拉订阅配置 / spider jar / DRPY 脚本）</span></label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="pxUseSrc" style="width:14px;height:14px;accent-color:var(--accent)"/> 资源站访问 <span class="muted sm">（搜索 / 详情 / 播放地址解析）</span></label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="pxUseUpd" style="width:14px;height:14px;accent-color:var(--accent)"/> 应用更新 <span class="muted sm">（下载 fpk）</span></label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="pxUseMedia" style="width:14px;height:14px;accent-color:var(--accent)"/> 视频分片 <span class="muted sm">（m3u8 / ts，占带宽，默认关）</span></label>
         </div>
-        <div class="hint" id="srcProxyModeHint" style="margin-top:6px"></div>
-        <div id="srcProxyMsg" class="muted sm" style="margin-top:6px"></div>
+        <div class="stack sm" style="margin-top:10px">
+          <div class="muted sm" style="font-weight:600">资源站访问模式</div>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="radio" name="pxMode" value="auto"/> 智能（推荐）：直连失败才走代理，按域名记忆，正常站点不受影响</label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="radio" name="pxMode" value="on"/> 始终走代理</label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="radio" name="pxMode" value="off"/> 只直连（忽略上面的代理）</label>
+        </div>
+        <div class="stack sm" style="margin-top:10px">
+          <div class="muted sm" style="font-weight:600">手动例外（每行一个域名，智能模式下生效，优先级最高）</div>
+          <div class="row" style="align-items:flex-start;gap:10px">
+            <label class="field" style="flex:1">总是走代理
+              <textarea id="pxAlways" rows="3" placeholder="api.example.com&#10;（直连能通但慢/不稳的站）"></textarea></label>
+            <label class="field" style="flex:1">永远直连
+              <textarea id="pxNever" rows="3" placeholder="cdn.example.com&#10;（加代理反而不能播的站）"></textarea></label>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button class="primary small" onclick="saveProxy()">保存</button>
+          <span id="pxInfo" class="muted sm"></span>
+        </div>
+
+        <!-- GitHub 加速镜像池（A2，2026-11-12）：照 lx-hunter P-0915，通了才入池 -->
+        <div class="stack sm" style="margin-top:14px;border-top:1px dashed var(--line);padding-top:12px">
+          <div class="muted sm" style="font-weight:600">
+            ⚡ GitHub 加速镜像池
+            <span style="font-weight:400">（拉订阅 / spider jar / DRPY 脚本专用，零成本，不需要代理）</span>
+          </div>
+          <div class="btn-row" style="margin-top:6px">
+            <button class="small" id="mpScanBtn" onclick="scanMirrors()">🔄 自动发现并测速</button>
+            <span id="mpInfo" class="muted sm"></span>
+          </div>
+          <div id="mpRows" class="stack sm" style="margin-top:6px"></div>
+          <div class="hint" style="margin-top:6px">
+            只把探测通的放进池 · 按实测速度排序 · 连续失败 3 次自动出池。
+            直连永远排第一，池只作兜底；全部镜像都失败时才回落到上面的代理。
+          </div>
+        </div>
       </details>
 
       <div class="card">
@@ -515,16 +592,15 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
       <h2 class="page-title">导入订阅</h2>
       <p class="page-desc">粘贴一个 TVBox / 影视仓 / OK影视 订阅 URL 或整段配置，自动识别并分类导入，<strong>导入即可在搜索与播放源中使用</strong>。支持 base64 与多订阅聚合。</p>
       <div class="card">
-        <div class="card-title">订阅抓取代理（可选）
-          <label style="float:right;display:flex;align-items:center;gap:6px;font-size:12px;font-weight:400;cursor:pointer">
-            <input type="checkbox" id="subProxyEnable" style="width:14px;height:14px;accent-color:var(--accent)" onchange="onSubProxyToggle()"/> 启用代理</label></div>
-        <p class="card-sub">仅用于<strong>拉取订阅配置、爬虫 jar、DRPY 脚本</strong>（GitHub 等被墙/解析失败时可走 Clash）。<strong>播放、搜索、CMS 探测一律不走此代理</strong>。形如 <code>http://用户:密码@主机:端口</code>，清空=直连。</p>
-        <div class="row">
-          <input type="text" id="subProxyUrl" placeholder="http://Clash:密码@192.168.x.x:7890" style="flex:2" disabled/>
-          <button class="small" id="subProxySaveBtn" onclick="saveSubProxy(true)" disabled>保存并测试</button>
-          <button class="small" id="subProxyClearBtn" onclick="clearSubProxy()" disabled>清空(直连)</button>
+        <div class="card-title">📡 订阅抓取走不走代理？</div>
+        <p class="card-sub" style="margin:6px 0 0">
+          代理已统一到 <strong>「资源站」页 → 🌐 网络代理</strong> 配置，这里不再单独维护一份。
+          在那边勾选「订阅抓取」即可让拉订阅 / 爬虫 jar / DRPY 脚本走代理；没勾则直连。
+          GitHub 被墙时优先靠<strong>加速镜像</strong>（无需代理），镜像也失败才回落到代理。
+        </p>
+        <div class="btn-row" style="margin-top:8px">
+          <button class="small" onclick="switchPage('sources');setTimeout(()=>{const c=document.getElementById('proxyCard');if(c)c.open=true;c&&c.scrollIntoView({block:'center'});},120)">去配置网络代理</button>
         </div>
-        <div id="subProxyMsg" class="muted sm" style="margin-top:6px"></div>
       </div>
       <div class="card">
         <div class="card-title">🛡 播放去广告（m3u8 流层）
@@ -952,13 +1028,13 @@ async function switchPage(page){
   else{stopLivePoll();}
   if(page==="library"){loadLibs().then(renderLibrary);}
   if(page==="quality")renderQuality();
-  if(page==="sources"){try{loadHealth();}catch(e){}try{initSrcProxy();}catch(e){}}
+  if(page==="sources"){try{loadHealth();}catch(e){}try{loadProxy();}catch(e){}try{loadPatrol();}catch(e){}try{loadRemoved();}catch(e){}}
   if(page==="search"){try{loadCacheStatus();}catch(e){}}
   if(page==="tvbox"){try{loadGuardZone();}catch(e){}try{gbInit();}catch(e){}}
   // >>> PRIVATE:GUARD
   if(page==="pan"){const f=$("panFrame");if(f&&!f.src)f.src=f.dataset.src;}
   // <<< PRIVATE:GUARD
-  if(page==="importsub"){try{if(!CFG)await loadStatus();}catch(e){}try{if(typeof initSubProxy==="function")initSubProxy();}catch(e){}try{loadAdfilter();}catch(e){}try{if(typeof loadSpiderMgmt==="function")loadSpiderMgmt();}catch(e){}try{if(typeof loadDrpyMgmt==="function")loadDrpyMgmt();}catch(e){}try{loadSubMgmt();}catch(e){}}
+  if(page==="importsub"){try{if(!CFG)await loadStatus();}catch(e){}try{if(typeof loadProxy==="function")loadProxy();}catch(e){}try{loadAdfilter();}catch(e){}try{if(typeof loadSpiderMgmt==="function")loadSpiderMgmt();}catch(e){}try{if(typeof loadDrpyMgmt==="function")loadDrpyMgmt();}catch(e){}try{loadSubMgmt();}catch(e){}}
   if(page==="about"){loadUpdate(false);try{loadAdminToken();}catch(e){}}
 }
 $$("[data-page]").forEach(b=>b.addEventListener("click",()=>switchPage(b.dataset.page)));
@@ -1579,6 +1655,16 @@ function srcFiltered(){const q=SRC_FILTER.trim().toLowerCase();
 function onSrcFilter(v){SRC_FILTER=v;SRC_PAGE=1;renderSources();}
 function onSrcEnabledFilter(v){SRC_ENABLED=v;SRC_PAGE=1;renderSources();}
 function srcPage(d){SRC_PAGE=Math.max(1,SRC_PAGE+d);renderSources();}
+function srcQ(src){
+  const q=(src&&src.quality)||{},b=[];
+  const m={ok:"正常",limited:"限搜",unsupported:"接口异常",blocked:"需验证",suspect:"存疑",fail:"失败",invalid:"地址非法"};
+  if(q.state&&m[q.state])b.push(m[q.state]);
+  if(q.lat_ms)b.push("延迟 "+(q.lat_ms/1000).toFixed(1)+"s");
+  if(q.ok_rate!=null)b.push("可用率 "+Math.round(q.ok_rate*100)+"%");
+  if(src&&src.fail_count)b.push("失败 "+src.fail_count);
+  if(src&&src.sys_disabled)b.push('<span style="color:var(--danger)">已自动停用'+(src.disabled_reason?("："+esc(src.disabled_reason)):"")+'</span>');
+  return b.length?(" · "+b.join(" · ")):"";
+}
 function renderSources(){
   const srcsAll=srcFiltered();
   const pages=Math.max(1,Math.ceil(srcsAll.length/SRC_PAGE_SIZE));
@@ -1612,8 +1698,8 @@ function renderSources(){
            ${(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc))?"":"disabled"} style="width:15px;height:15px;accent-color:var(--warn);${(src.enabled&&src.standalone&&!(FEAT_DDUO&&src.xsrc))?'':'opacity:.35'}"/>非过滤</label>
         ${extraCell}
       </td>
-      <td><div style="font-weight:500">${esc(src.name)}${src.kind==="t4"?'<span class="tag">T4</span>':''}${extraTag}${src.builtin?'':'<span class="tag amber">自定义</span>'}${src.standalone?'<span class="tag">媒体库</span>':''}</div>
-        <div class="meta">${esc(src.api)}</div></td>
+      <td><div style="font-weight:500">${esc(src.name)}${src.kind==="t4"?'<span class="tag">T4</span>':''}${extraTag}${src.builtin?'':'<span class="tag amber">自定义</span>'}${src.standalone?'<span class="tag">媒体库</span>':''}${(src.verified===false)?'<span class="tag wait" title="订阅导入后尚未巡检验证。已正常参与搜索，无需等待；巡检通过后会自动转为已验证，连续失败才会被自动禁用">待验证</span>':''}</div>
+        <div class="meta">${esc(src.api)}${srcQ(src)}</div></td>
       <td class="st wait" data-st>未测</td>
       <td><button class="small" data-test>测试</button></td>
       <td><button class="del" data-del title="删除">✕</button></td>
@@ -1733,104 +1819,164 @@ async function addSource(){
     await loadStatus();const tr=$("srcRows").querySelector(`tr[data-id="${r.data.id}"]`);if(tr&&!standalone)testOne(r.data.id,tr);}
   else toast(r.msg||"添加失败","fail");
 }
-/* ---------- 资源站取源代理（搜索/分类/测速，视频流仍直连；移植上游 v0.2.46/55） ---------- */
-function initSrcProxy(){
-  const p=(CFG&&CFG.source_proxy)||"";
-  const en=$("srcProxyEnable"),inp=$("srcProxyUrl"),sb=$("srcProxySaveBtn"),cb=$("srcProxyClearBtn"),msg=$("srcProxyMsg");
-  if(!en)return;
-  inp.value=p;en.checked=!!p;inp.disabled=!en.checked;sb.disabled=!en.checked;cb.disabled=!p;
-  msg.textContent=p?"取源请求按下方模式决定是否经代理，视频流仍直连":"当前未设代理（全部直连）";
-  msg.style.color="";renderSrcProxyMode();
-}
-const SRC_MODE_HINT={
-  auto:"🪄 智能：默认直连；只有直连失败的资源站自动切代理，其它站保持直连。",
-  on:"始终走代理：所有资源站搜索/分类/测速/解析都经代理，视频流仍直连。",
-  off:"全部直连：忽略已配置的代理地址。"
-};
-function renderSrcProxyMode(){
-  const mode=(CFG&&CFG.source_proxy_mode)||"auto",seg=$("srcProxyMode"),hint=$("srcProxyModeHint");
-  if(!seg)return;
-  seg.querySelectorAll("button").forEach(b=>b.classList.toggle("active",b.dataset.mode===mode));
-  if(hint)hint.textContent=SRC_MODE_HINT[mode]||SRC_MODE_HINT.auto;
-}
-async function setSrcProxyMode(mode){
-  const proxy=$("srcProxyUrl").value.trim();
-  if(mode!=="off"&&proxy&&proxy!==((CFG&&CFG.source_proxy)||""))await saveSrcProxy(false);
-  const r=await jpost("/v/api/ext/source-proxy",{proxy:(CFG&&CFG.source_proxy)||"",mode});
-  if(r.code===0){CFG.source_proxy_mode=(r.data&&r.data.mode)||mode;renderSrcProxyMode();
-    toast({auto:"已切换为智能模式",on:"已切换为始终走代理",off:"已切换为全部直连"}[mode]);
-  }else toast(r.msg||"切换失败","fail");
-}
-function onSrcProxyToggle(){
-  const en=$("srcProxyEnable"),inp=$("srcProxyUrl"),sb=$("srcProxySaveBtn");
-  inp.disabled=!en.checked;sb.disabled=!en.checked;if(en.checked)inp.focus();
-}
-async function saveSrcProxy(test){
-  const inp=$("srcProxyUrl"),msg=$("srcProxyMsg"),proxy=inp.value.trim();
-  if(!proxy){toast("请填写代理地址，或点清空直连","fail");return;}
-  msg.textContent="保存并测试资源站连通性…";msg.style.color="";
+/* ---------- 巡检设置 / 明细 / 已移除（第 3 批，2026-11-12） ---------- */
+async function loadPatrol(){
   try{
-    const mode=(CFG&&CFG.source_proxy_mode)||"auto";
-    const r=await jpost("/v/api/ext/source-proxy",{proxy,mode});
-    if(r.code!==0){msg.textContent="未保存："+(r.msg||"格式错误");msg.style.color="var(--err)";return;}
-    CFG.source_proxy=proxy;CFG.source_proxy_mode=(r.data&&r.data.mode)||mode;renderSrcProxyMode();
-    const d=r.data||{};
-    if(test){msg.textContent=d.test_ok?("✓ 已保存，经代理测速成功（"+(d.test_msg||"")+"）")
-      :("已保存，但经代理测速失败："+(d.test_msg||"可稍后在资源站页测速"));
-      msg.style.color=d.test_ok?"var(--ok)":"var(--warn)";
-    }else msg.textContent="已保存";
-    $("srcProxyClearBtn").disabled=false;toast("源代理已保存");
-  }catch(e){msg.textContent="请求失败："+String(e);msg.style.color="var(--err)";}
+    const r=await jget("/v/api/ext/patrol/state?limit=200");
+    if(r.code!==0)return;
+    const d=r.data||{}, s=d.settings||{}, log=d.log||[];
+    $("ptEnabled").checked=s.enabled!==false;
+    $("ptInterval").value=s.interval_h;
+    $("ptDisabledInterval").value=s.disabled_interval_h;
+    $("ptRetain").value=s.retain_days;
+    $("ptTopN").value=s.top_n;
+    $("ptTimeout").value=s.timeout_s;
+    $("ptConcurrency").value=s.concurrency;
+    const off=(d.rows||[]).filter(x=>x.sys_disabled||!x.enabled).length;
+    $("ptSummary").textContent=`共 ${d.total||0} 个源 · 已探测 ${d.probed||0} 个 · 未启用/自动停用 ${off} 个 · 判死阈值 ${s.fail_threshold} 次 / 跨 ${s.min_span_h} 小时`;
+    $("ptLogRows").innerHTML=log.length?log.map(x=>{
+      const t=new Date((x.ts||0)*1000).toLocaleString();
+      const act={disable:'<span class="tag amber">停用</span>',enable:'<span class="tag">恢复</span>',delete:'<span class="tag amber">删除</span>',none:''}[x.action]||'';
+      return `<tr><td class="muted sm">${t}</td><td>${esc(x.name||x.id||"")}</td>
+        <td>${esc(x.label||x.state||"")}</td>
+        <td class="muted sm">${x.ms?(x.ms/1000).toFixed(1)+"s":"-"}</td>
+        <td class="muted sm">${x.fails||0}</td>
+        <td class="muted sm">${act} ${esc(x.note||x.error||"")}</td></tr>`;
+    }).join(""):'<tr><td colspan="6" class="muted">还没有巡检记录（点「立即巡检一轮」或等后台首检）</td></tr>';
+  }catch(e){/* 旧后端无此接口时静默 */}
 }
-async function clearSrcProxy(){
-  if(!confirm("清空资源站代理地址并全部直连？"))return;
-  const r=await jpost("/v/api/ext/source-proxy",{proxy:"",mode:"off"});
-  if(r.code===0){CFG.source_proxy="";CFG.source_proxy_mode="off";
-    $("srcProxyUrl").value="";$("srcProxyEnable").checked=false;
-    $("srcProxyUrl").disabled=true;$("srcProxySaveBtn").disabled=true;$("srcProxyClearBtn").disabled=true;
-    renderSrcProxyMode();$("srcProxyMsg").textContent="已清空，当前直连";toast("已清空代理");
-  }else toast(r.msg||"失败","fail");
-}
-// ---------- 订阅抓取代理（仅拉订阅/jar/脚本，不影响播放） ----------
-function initSubProxy(){
-  const p=(CFG&&CFG.subscription_proxy)||"";
-  const en=$("subProxyEnable"),inp=$("subProxyUrl"),sb=$("subProxySaveBtn"),cb=$("subProxyClearBtn"),msg=$("subProxyMsg");
-  if(!en)return;
-  inp.value=p;en.checked=!!p;
-  inp.disabled=!en.checked;sb.disabled=!en.checked;cb.disabled=!p;
-  msg.textContent=p?"当前经代理拉取订阅资源":"当前直连（未设代理）";
-  msg.style.color="";
-}
-function onSubProxyToggle(){
-  const en=$("subProxyEnable"),inp=$("subProxyUrl"),sb=$("subProxySaveBtn");
-  inp.disabled=!en.checked;sb.disabled=!en.checked;
-  if(en.checked)inp.focus();
-}
-async function saveSubProxy(test){
-  const inp=$("subProxyUrl"),msg=$("subProxyMsg");
-  const proxy=inp.value.trim();
-  if(!proxy){toast("请填写代理地址，或点清空直连","fail");return;}
-  msg.textContent="保存并测试连通性…";msg.style.color="";
+async function savePatrol(){
+  const body={patrol_enabled:$("ptEnabled").checked,
+    patrol_interval_h:+$("ptInterval").value,
+    patrol_disabled_interval_h:+$("ptDisabledInterval").value,
+    patrol_retain_days:+$("ptRetain").value,
+    search_top_n:+$("ptTopN").value,
+    patrol_timeout_s:+$("ptTimeout").value,
+    patrol_concurrency:+$("ptConcurrency").value};
   try{
-    const r=await jpost("/v/api/ext/subscription-proxy",{proxy});
-    if(r.code!==0){msg.textContent="未保存："+(r.msg||"格式错误");msg.style.color="var(--danger)";return;}
-    const d=r.data||{};
-    if(test){
-      msg.textContent=d.test_ok?("✓ 已保存，代理连通（"+(d.test_msg||"")+"），仅作用于订阅资源抓取")
-                               :("已保存，但代理测试失败："+(d.test_msg||""));
-      msg.style.color=d.test_ok?"var(--ok,#3a9)":"var(--warn,#d59a2b)";
-    }else{msg.textContent="已保存";}
-    $("subProxyClearBtn").disabled=false;
-    toast("代理已保存");
-  }catch(e){msg.textContent="请求失败："+String(e);msg.style.color="var(--danger)";}
+    const r=await jpost("/v/api/ext/patrol/settings",body);
+    if(r.code===0){$("ptMsg").textContent="已保存，下一轮生效";toast("巡检设置已保存");await loadPatrol();}
+    else toast(r.msg||"保存失败","fail");
+  }catch(e){toast("保存失败："+String(e),"fail");}
 }
-async function clearSubProxy(){
-  if(!confirm("清空订阅代理、改为直连？"))return;
-  const r=await jpost("/v/api/ext/subscription-proxy",{proxy:""});
-  if(r.code===0){$("subProxyUrl").value="";$("subProxyEnable").checked=false;
-    $("subProxyUrl").disabled=true;$("subProxySaveBtn").disabled=true;$("subProxyClearBtn").disabled=true;
-    $("subProxyMsg").textContent="已清空，当前直连";$("subProxyMsg").style.color="";toast("已切回直连");}
-  else toast(r.msg||"失败","fail");
+async function runPatrol(){
+  try{
+    const r=await jpost("/v/api/ext/patrol/run",{force:true});
+    toast(r.msg||"已在后台开始巡检");
+    $("ptMsg").textContent="巡检进行中，约 1~3 分钟后点「刷新状态」查看";
+  }catch(e){toast("启动失败："+String(e),"fail");}
+}
+async function loadRemoved(){
+  try{
+    const r=await jget("/v/api/ext/source/removed");
+    const list=(r.data&&r.data.removed)||[];
+    if(!list.length){$("removedRows").innerHTML="暂无已移除的源";return;}
+    $("removedRows").innerHTML='<table><thead><tr><th>名称</th><th>地址</th><th>原因</th><th>删除时间</th><th></th></tr></thead><tbody>'
+      +list.map(x=>{
+        const t=new Date((x.deleted_at||0)*1000).toLocaleString();
+        return `<tr><td>${esc(x.name||x.id)}${x.builtin?'<span class="tag">内置</span>':''}</td>
+          <td class="muted sm" style="max-width:280px;overflow:hidden;text-overflow:ellipsis">${esc(x.api||"")}</td>
+          <td class="muted sm">${esc(x.reason||"")}</td><td class="muted sm">${t}</td>
+          <td><button class="small" onclick="restoreRemoved('${x.id}')">恢复</button></td></tr>`;
+      }).join("")+'</tbody></table>';
+  }catch(e){$("removedRows").innerHTML="加载失败："+String(e);}
+}
+async function restoreRemoved(id){
+  const r=await jpost("/v/api/ext/source/restore-one",{id});
+  if(r.code===0){toast("已恢复");await loadStatus();renderSources();await loadRemoved();}
+  else toast(r.msg||"恢复失败","fail");
+}
+
+/* ---------- 统一网络代理（A1，2026-11-12）---------- */
+async function loadProxy(){
+  try{
+    const r=await jget("/v/api/ext/proxy");
+    if(r.code!==0)return;
+    const d=r.data||{}, use=d.use||{};
+    $("pxUrl").value=d.url||"";
+    $("pxUseSub").checked=use.subscription!==false;
+    $("pxUseSrc").checked=use.source!==false;
+    $("pxUseUpd").checked=!!use.update;
+    $("pxUseMedia").checked=!!use.media;
+    document.querySelectorAll('input[name="pxMode"]').forEach(x=>{x.checked=(x.value===(d.mode||"auto"));});
+    $("pxAlways").value=(d.always||[]).join("\n");
+    $("pxNever").value=(d.never||[]).join("\n");
+    const learned=d.learned||[];
+    $("pxInfo").textContent=learned.length?("本机已学习需代理的域名："+learned.join("、")):"";
+  }catch(e){/* 旧后端无此接口时静默 */}
+  try{ await loadMirrorPool(); }catch(e){}
+}
+/* ---------- GitHub 加速镜像池（A2，2026-11-12）---------- */
+async function loadMirrorPool(){
+  const rowsEl=$("mpRows"); if(!rowsEl)return;
+  try{
+    const r=await jget("/v/api/ext/mirror-pool");
+    if(r.code!==0){rowsEl.innerHTML='<div class="muted sm">镜像池不可用</div>';return;}
+    renderMirrorPool(r.data||{});
+  }catch(e){ rowsEl.innerHTML='<div class="muted sm">镜像池读取失败</div>'; }
+}
+function renderMirrorPool(d){
+  const pool=d.pool||[], rowsEl=$("mpRows"), infoEl=$("mpInfo");
+  if(!rowsEl)return;
+  const live=pool.filter(m=>m.enabled!==false).length;
+  if(infoEl){
+    const last=d.last_scan?("上次测速 "+new Date(d.last_scan*1000).toLocaleString()):"尚未测速（当前为内置顺序）";
+    infoEl.textContent=`${live}/${pool.length} 个在用 · ${last}`;
+  }
+  rowsEl.innerHTML = pool.length ? pool.map(m=>{
+    const off=m.enabled===false;
+    const ms=m.ms?`${m.ms} ms`:"未测";
+    const fails=m.fails?` · 失败 ${m.fails}`:"";
+    const kindTag=(m.kind&&m.kind!=="prefix")?`<span class="tag">${esc(m.kind)}</span>`:"";
+    return `<div class="subrow" style="${off?'opacity:.5':''}">
+      <span><b>${esc(m.host)}</b>${kindTag}
+        <span class="muted sm">${ms}${fails}</span>
+        ${off?'<span class="tag warn">已出池</span>':''}</span>
+      <span style="white-space:nowrap">
+        <button class="small" data-mp-toggle="${esc(m.host)}" data-mp-on="${off?'1':'0'}">${off?"启用":"停用"}</button>
+        <button class="small ghost danger" data-mp-rm="${esc(m.host)}">移除</button>
+      </span></div>`;
+  }).join("") : '<div class="muted sm">池为空：点「自动发现并测速」把可用镜像收进来。</div>';
+  $$("#mpRows [data-mp-toggle]").forEach(b=>b.addEventListener("click",()=>mpToggle(b.dataset.mpToggle,b.dataset.mpOn==="1")));
+  $$("#mpRows [data-mp-rm]").forEach(b=>b.addEventListener("click",()=>mpRemove(b.dataset.mpRm)));
+}
+async function scanMirrors(){
+  const btn=$("mpScanBtn"); if(!btn)return;
+  const old=btn.textContent; btn.disabled=true; btn.textContent="探测中…（约 20 秒）";
+  try{
+    const r=await jpost("/v/api/ext/mirror-pool/discover",{});
+    if(r.code===0){ toast(r.msg||"探测完成"); await loadMirrorPool(); }
+    else toast(r.msg||"探测失败","fail");
+  }catch(e){ toast("探测失败："+String(e),"fail"); }
+  finally{ btn.disabled=false; btn.textContent=old; }
+}
+async function mpToggle(host,on){
+  try{
+    const r=await jpost("/v/api/ext/mirror-pool",{host,action:on?"enable":"disable"});
+    if(r.code===0){ toast(on?"已启用":"已停用"); await loadMirrorPool(); }
+    else toast(r.msg||"操作失败","fail");
+  }catch(e){ toast("操作失败","fail"); }
+}
+async function mpRemove(host){
+  if(!confirm(`从镜像池移除 ${host}？\n（下次「自动发现」若探测通过会重新入池）`))return;
+  try{
+    const r=await jpost("/v/api/ext/mirror-pool",{host,action:"remove"});
+    if(r.code===0){ toast("已移除"); await loadMirrorPool(); }
+    else toast(r.msg||"操作失败","fail");
+  }catch(e){ toast("操作失败","fail"); }
+}
+async function saveProxy(){
+  const use={subscription:$("pxUseSub").checked,
+             source:$("pxUseSrc").checked,
+             update:$("pxUseUpd").checked,
+             media:$("pxUseMedia").checked};
+  const mode=(document.querySelector('input[name="pxMode"]:checked')||{}).value||"auto";
+  try{
+    const r=await jpost("/v/api/ext/proxy",{url:$("pxUrl").value.trim(),use,mode,
+      always:$("pxAlways").value,never:$("pxNever").value});
+    if(r.code===0){toast("代理配置已保存");await loadProxy();}
+    else toast(r.msg||"保存失败","fail");
+  }catch(e){toast("保存失败："+String(e),"fail");}
 }
 async function loadAdfilter(){
   const box=$("adfStatus"), cb=$("adfEnable");
@@ -2902,7 +3048,7 @@ async function init(){
   $("linePredict").checked=CFG.linepredict_enabled!==false;
   $("linePredictMax").value=CFG.linepredict_max_lines||3;
   $("linePredictTtl").value=CFG.linepredict_ttl_min||30;
-  renderKw();renderSources();initSrcProxy();loadCacheStatus();
+  renderKw();renderSources();loadProxy();loadCacheStatus();
   const gs=$("globalState");gs.textContent="接管运行中 · 已缓存 "+STATUS.cached_titles;gs.className="dot ok";
   const ed=$("aboutEdition");if(ed)ed.textContent=(FEAT_DDUO?"完整版（本地全功能）":"公开版")+" · 在飞牛原生搜索与媒体库中注入在线影视";
   loadOnline();

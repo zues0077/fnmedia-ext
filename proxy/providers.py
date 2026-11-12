@@ -779,9 +779,106 @@ async def probe_source_alive(source: dict, timeout: float = 8.0,
             "elapsed_ms": int((time.monotonic() - t0) * 1000)}
 
 
+# 连接级失败（换代理有意义、也可能是源真挂了）vs 业务级失败（换代理/重试都无意义）。
+# 巡检只对连接级失败计失败次数，避免把「接口改版」「CF 人机验证」「禁搜」误判成死源。
+_CONN_ERROR_NAMES = (
+    "ConnectError", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout",
+    "TimeoutException", "RemoteProtocolError", "ReadError", "WriteError",
+    "ConnectionError", "SSLError", "SSLEOFError", "ProxyError",
+)
+
+
+async def probe_source_quality(source: dict, *, timeout: float = 25.0,
+                               keyword: str | None = None) -> dict:
+    """巡检专用探测：先用最轻的 ac=list，再按需补一次关键词命中。
+
+    为什么不用「5 个关键词串行搜索」：搜索走源站数据库全文检索，最慢；实测
+    30 源里 5 词搜索 78 秒/19 个可用，ac=list 48 秒/22 个可用。且「禁止关键词
+    搜索」的源（如 code=1002）在搜索路径下会被判死，实际还活着。
+
+    返回 {state, ok, status, lat_ms, list_count, hit, keyword, error}
+      ok           正常（code=1，列表为空也算活着——对应 LunaTV 的 no_results）
+      limited      接口正常但被业务码拒绝（如 1002 禁搜）→ 活着，只降排序
+      unsupported  返回非 JSON / 解析失败（接口改版、CF 挑战页）→ 不计失败
+      blocked      HTTP 403（人机验证/鉴权）→ 不计失败
+      fail         连接级失败、超时、404、5xx → 计失败
+      invalid      地址非法 → 直接停用
+    """
+    api = str(source.get("api") or "").strip()
+    out = {"state": "fail", "ok": False, "status": 0, "lat_ms": 0,
+           "list_count": 0, "hit": 0, "direct": 0, "keyword": keyword or "",
+           "error": ""}
+    if not api.startswith(("http://", "https://")):
+        out.update(state="invalid", error="地址非法")
+        return out
+
+    t0 = time.monotonic()
+    try:
+        async with netutil.async_client(timeout=timeout) as client:
+            r = await client.get(
+                api, params={"ac": "list", "pg": 1},
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+            out["status"] = r.status_code
+            out["lat_ms"] = int((time.monotonic() - t0) * 1000)
+            if r.status_code == 403:
+                out.update(state="blocked", error="HTTP 403（人机验证/鉴权）")
+                return out
+            if r.status_code != 200:
+                out.update(state="fail", error=f"HTTP {r.status_code}")
+                return out
+            body = r.text or ""
+            try:
+                j = parse_cms_xml(body) if _is_xml_api(api) else r.json()
+            except Exception:  # noqa: BLE001
+                low = body[:400].lower()
+                if "just a moment" in low or "cloudflare" in low:
+                    out.update(state="blocked", error="Cloudflare 挑战页")
+                else:
+                    out.update(state="unsupported", error="返回非 JSON（接口变更）")
+                return out
+    except asyncio.TimeoutError:
+        out["lat_ms"] = int((time.monotonic() - t0) * 1000)
+        out.update(state="fail", error="超时")
+        return out
+    except Exception as exc:  # noqa: BLE001
+        out["lat_ms"] = int((time.monotonic() - t0) * 1000)
+        name = type(exc).__name__
+        out.update(state="fail" if name in _CONN_ERROR_NAMES else "unsupported",
+                   error=name)
+        return out
+
+    if not isinstance(j, dict):
+        out.update(state="unsupported", error="非 dict 响应")
+        return out
+    code = j.get("code")
+    lst = j.get("list") or []
+    if isinstance(lst, dict):
+        lst = lst.get("list") or []
+    out["list_count"] = len(lst) if isinstance(lst, list) else 0
+    if code in (1, "1"):
+        out.update(state="ok", ok=True, error="")
+    else:
+        # 业务码拒绝：1002 = 禁止关键词搜索，其它多为「需要 VIP/来源受限」。
+        # 这类源接口是活的，只是能力受限，不该计入失败。
+        out.update(state="limited", error=f"code={code}")
+
+    # 命中检测：只在活着且给了关键词时做一次，用于「片源质量」排序的第一档。
+    if keyword and out["state"] in ("ok", "limited"):
+        try:
+            res = await probe_source(api, keyword=keyword, timeout=timeout,
+                                     source=source)
+            out["hit"] = 1 if (res.get("ok") and (res.get("count") or 0) > 0) else 0
+            out["direct"] = int(res.get("direct") or 0)
+            if res.get("ok") and res.get("count"):
+                out["state"] = "ok"
+                out["ok"] = True
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
 # >>> PRIVATE:DDUO
 # ---------------- 多多影视（非标准源，仅完整构建） ----------------
-
 def _dduo_root(source: dict) -> str:
     import dduo
     return dduo.base_of(source)
@@ -1164,6 +1261,27 @@ async def spider_search_source(client, source: dict, keyword: str) -> list[Onlin
 # <<< PRIVATE:SPIDER
 
 
+async def _cancel_pending(tasks, timeout: float = 0.8) -> None:
+    """取消仍在途的源请求，并等它们真正结束（最多等 timeout 秒）。
+
+    只 cancel 不 await 会让任务在后台继续跑到源自身的 12~25s 超时：既占着
+    8 路并发槽，又在外层客户端 aclose 之后抛 RuntimeError /
+    ClosedResourceError。已结束的任务不受影响，重复调用是空操作。
+
+    上限取 0.8s 而不是 2s：这段等待是**算在搜索预算里**的，等太久会把
+    「取消 + 合并」的时间整个顶出调用方的 8.5s 上限，反而让阶段结果来不
+    及发布（2026-11-12 实机复现：9502ms 返回 0 条）。
+    """
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True),
+                               timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+
+
 async def search_all(keyword: str, sources=None,
                      timeout: float | None = None,
                      soft_timeout: float | None = None,
@@ -1204,7 +1322,10 @@ async def search_all(keyword: str, sources=None,
             return []
         tasks = [asyncio.create_task(_one(s)) for s in scheduled]
         if budget is None:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                await _cancel_pending(tasks)
         else:
             # 够快即返回（上游 v0.2.70）：快源先完成、累计结果达到阈值且过了最小
             # 等待后，立即取消仍在途的慢源，不必干等满预算；预算仍作兜底，保证
@@ -1220,32 +1341,37 @@ async def search_all(keyword: str, sources=None,
             # 早返回阈值按可见数计：visible 传入时只累计判定为可见的标题，
             # 增量计数（到达即判，不重算）；不传时沿用原始总数。
             visible_total = 0
-            while pending and loop.time() < deadline:
-                done, pending = await asyncio.wait(
-                    pending, timeout=min(0.25, deadline - loop.time()),
-                    return_when=asyncio.FIRST_COMPLETED)
-                for t in done:
-                    if not t.cancelled() and t.exception() is None:
-                        r = t.result()
-                        if isinstance(r, list):
-                            results.append(r)
-                            seen_ids.add(id(t))
-                            if visible is not None:
-                                for title in r:
-                                    try:
-                                        if visible(title):
-                                            visible_total += 1
-                                    except Exception:
-                                        pass
-                if visible is not None:
-                    total = visible_total
-                else:
-                    total = sum(len(x) for x in results if isinstance(x, list))
-                if loop.time() >= early_gate and total >= early_min_results:
-                    break
-            for t in pending:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                while pending and loop.time() < deadline:
+                    done, pending = await asyncio.wait(
+                        pending, timeout=min(0.25, deadline - loop.time()),
+                        return_when=asyncio.FIRST_COMPLETED)
+                    for t in done:
+                        if not t.cancelled() and t.exception() is None:
+                            r = t.result()
+                            if isinstance(r, list):
+                                results.append(r)
+                                seen_ids.add(id(t))
+                                if visible is not None:
+                                    for title in r:
+                                        try:
+                                            if visible(title):
+                                                visible_total += 1
+                                        except Exception:
+                                            pass
+                    if visible is not None:
+                        total = visible_total
+                    else:
+                        total = sum(len(x) for x in results if isinstance(x, list))
+                    if loop.time() >= early_gate and total >= early_min_results:
+                        break
+            finally:
+                # 到点/早返回/本协程被外层取消，三条路径都要把仍在途的源请求
+                # 取消**并等它们真正结束**。此前取消路径直接跳过这段：泄漏的
+                # 任务会跑到源自身 12~25s 超时才结束，期间占着 8 路并发槽，
+                # 客户端已 aclose 还会抛 RuntimeError / ClosedResourceError
+                # （2026-11-12 压测：3 次请求跑到 12.3/12.9/19.4s，伴生 7+2 次异常）。
+                await _cancel_pending(tasks)
             # 被取消/超时的任务若已产出也尽量回收。按任务身份去重，不再用
             # 列表相等比较（OnlineTitle 是 dataclass，逐字段比较是 O(n²)）。
             for t in tasks:

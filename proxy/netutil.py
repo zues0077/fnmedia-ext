@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -66,12 +67,24 @@ _RECHECK_SECONDS = 1800.0  # 已判定走代理的主机，30 分钟后允许再
 
 
 def source_proxy() -> str:
-    """当前资源站代理 URL（空串=直连）。惰性读 config，避免循环导入。"""
+    """资源站取源代理（按统一配置 proxy_url + proxy_use.source；空串=直连）。"""
     try:
         from config import config as _cfg
-        return str(_cfg.get().get("source_proxy") or "").strip()
+        return _cfg.proxy_for("source")
     except Exception:  # noqa: BLE001
         return ""
+
+
+# 内网 / 本机地址：永不代理（照搬 lx-hunter fetchAuto 的 isLanHost 思路）
+_LAN_RE = re.compile(
+    r"^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|127\.|169\.254\.|"
+    r"localhost$|\[?::1\]?$|.+\.local$)")
+
+
+def is_lan_host(host: str) -> bool:
+    """是否为内网/本机地址。"""
+    h = (host or "").strip().lower()
+    return bool(h) and bool(_LAN_RE.match(h))
 
 
 def proxy_mode() -> str:
@@ -96,16 +109,34 @@ def host_of(url: str | httpx.URL) -> str:
 
 
 def host_needs_proxy(host: str) -> bool:
-    """auto 模式学习结果：该主机是否已被判定为需要代理。"""
+    """智能模式判定：该主机是否应走代理。
+
+    优先级（高→低）：
+      1. proxy_never_hosts（手动例外：永远直连，最高优先，解决"加代理反而不能播"）
+      2. proxy_always_hosts（手动例外：总是代理）
+      3. 内网/本机地址 → 直连
+      4. 学习记忆（直连失败后标记过），30 分钟复检一次给直连机会
+    """
     if not host:
         return False
+    h = host.strip().lower()
+    try:
+        from config import config as _cfg
+        if h in _cfg.proxy_hosts("never"):
+            return False
+        if h in _cfg.proxy_hosts("always"):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    if is_lan_host(h):
+        return False
     with _LOCK:
-        ts = _proxy_hosts.get(host)
+        ts = _proxy_hosts.get(h)
         if ts is None:
             return False
         if time.time() - ts >= _RECHECK_SECONDS:
             # 到期复检：先摘除，给直连一次机会；仍失败会再次学习。
-            _proxy_hosts.pop(host, None)
+            _proxy_hosts.pop(h, None)
             return False
         return True
 
@@ -113,7 +144,7 @@ def host_needs_proxy(host: str) -> bool:
 def mark_host_proxy(host: str) -> None:
     if host:
         with _LOCK:
-            _proxy_hosts[host] = time.time()
+            _proxy_hosts[host.strip().lower()] = time.time()
 
 
 def clear_proxy_hosts() -> None:
@@ -228,11 +259,16 @@ class _AdaptiveAsyncClient(_AdaptiveBase):
         except Exception as exc:
             if use_proxy or stream or not self._is_conn_error(exc):
                 raise
-            # 直连连接级失败：学习该主机并改用代理重发同一次请求（重建请求对象，
-            # 因为它绑定在原直连 transport 上）。
-            mark_host_proxy(host)
+            # 直连连接级失败：先试代理，**只有代理成功才学习该主机**。
+            # 若代理也失败，说明是源本身不可用而非"需要代理"，不写标记，
+            # 否则会给后续请求误加代理（设计约定，2026-11-12 A1）。
             retry = self._rebuild(request)
-            return await self._proxied.send(retry, stream=stream, **kwargs)
+            try:
+                resp = await self._proxied.send(retry, stream=stream, **kwargs)
+            except Exception:  # noqa: BLE001
+                raise exc
+            mark_host_proxy(host)
+            return resp
 
     @staticmethod
     def _rebuild(request: httpx.Request) -> httpx.Request:
@@ -287,14 +323,19 @@ class _AdaptiveSyncClient(_AdaptiveBase):
         except Exception as exc:
             if use_proxy or stream or not self._is_conn_error(exc):
                 raise
-            mark_host_proxy(host)
+            # 同异步版：代理成功才学习该主机（代理也失败=源不可用，不标记）
             retry = httpx.Request(
                 request.method, str(request.url),
                 params=list(request.url.params.multi_items()),
                 headers=request.headers.raw,
                 content=request.content,
             )
-            return self._proxied.send(retry, stream=stream, **kwargs)
+            try:
+                resp = self._proxied.send(retry, stream=stream, **kwargs)
+            except Exception:  # noqa: BLE001
+                raise exc
+            mark_host_proxy(host)
+            return resp
 
     def close(self) -> None:
         if self._closed:

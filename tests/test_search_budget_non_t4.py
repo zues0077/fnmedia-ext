@@ -7,6 +7,11 @@
 修复后：无显式 timeout 时一律给 5.0s 兜底（与 T4 路径同值），
 显式 timeout（如媒体库搜索的 6.0s）仍优先。
 
+2026-11-12 起 timeout 是**整个聚合**的预算：第一轮拿 ``total - 预留``，
+剩下的留给覆盖兜底轮，保证「第一轮 + 兜底轮 + 取消/合并」不超过总预算
+（搜索页 8.5s 上限到点前必须已经发布过一版结果）。拆分见
+``app._search_budgets``。
+
 只测进程内逻辑与假源，不碰真实网络与飞牛。
 """
 from __future__ import annotations
@@ -41,6 +46,8 @@ SLOW = {"id": "slow-src", "name": "Slow",
 T4SRC = {"id": "t4-1", "name": "T4",
          "api": "https://t4.test/api", "kind": "t4", "enabled": True}
 BUDGET = 5.0  # 与 app._AGGREGATE_SEARCH_BUDGET / T4 路径同值
+# 第一轮实际拿到的预算 = 总预算 - 兜底轮预留（见 app._search_budgets）
+STAGE1 = appmod._search_budgets(BUDGET)[0]
 
 
 def _title(vod_id, name, src, play_url, year="2024"):
@@ -93,22 +100,22 @@ class NonT4SearchBudgetTests(unittest.IsolatedAsyncioTestCase):
             await appmod._aggregate_briefs("预算片A", refresh=True)
         search.assert_awaited_once()
         self.assertIsNone(search.call_args.kwargs.get("timeout"))
-        self.assertEqual(search.call_args.kwargs.get("budget"), BUDGET)
+        self.assertEqual(search.call_args.kwargs.get("budget"), STAGE1)
 
     async def test_fast_only_non_t4_also_gets_budget(self):
         with patch.object(providers, "search_all",
                           return_value=[]) as search:
             await appmod._aggregate_briefs("预算片B", fast_only=True,
                                            refresh=True)
-        self.assertEqual(search.call_args.kwargs.get("budget"), BUDGET)
+        self.assertEqual(search.call_args.kwargs.get("budget"), STAGE1)
 
     async def test_t4_aggregate_budget_unchanged(self):
         self._set_sources(FAST + [T4SRC])
         with patch.object(providers, "search_all",
                           return_value=[]) as search:
             await appmod._aggregate_briefs("预算片C", refresh=True)
-        # T4 路径此前已是 5.0s：改动前后行为一致
-        self.assertEqual(search.call_args.kwargs.get("budget"), BUDGET)
+        # T4 路径与非 T4 同预算口径
+        self.assertEqual(search.call_args.kwargs.get("budget"), STAGE1)
 
     async def test_explicit_timeout_still_drives_budget(self):
         # 媒体库搜索传 timeout=6.0：不被默认预算覆盖，预算即 6.0s。
@@ -118,8 +125,13 @@ class NonT4SearchBudgetTests(unittest.IsolatedAsyncioTestCase):
                           return_value=[]) as search:
             await appmod._aggregate_briefs("预算片D", timeout=6.0,
                                            refresh=True)
-        self.assertEqual(search.call_args.kwargs.get("budget"), 6.0)
+        self.assertEqual(search.call_args.kwargs.get("budget"),
+                         appmod._search_budgets(6.0)[0])
         self.assertIsNone(search.call_args.kwargs.get("timeout"))
+        # 两轮预算之和等于总预算；尾部余量从兜底轮里再扣，不额外加时间。
+        stage1, reserve = appmod._search_budgets(6.0)
+        self.assertAlmostEqual(stage1 + reserve, 6.0)
+        self.assertGreater(reserve, appmod._SEARCH_TAIL_RESERVE)
 
     # ---------- 端到端：假源 + 慢源 ----------
 
@@ -153,7 +165,7 @@ class NonT4SearchBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cancelled.is_set())
 
     async def test_budget_exhaustion_returns_partial_results(self):
-        # 只有 5 条（<25，不触发早返回）：等满 5.0s 预算即返回，不空等慢源
+        # 只有 5 条（<25，不触发早返回）：等满第一轮预算即返回，不空等慢源
         self._set_sources([FAST[0], SLOW])
         cancelled = asyncio.Event()
         t0 = time.monotonic()
@@ -163,8 +175,9 @@ class NonT4SearchBudgetTests(unittest.IsolatedAsyncioTestCase):
             briefs = await appmod._aggregate_briefs("冷门片", refresh=True)
         elapsed = time.monotonic() - t0
         self.assertEqual(len(briefs), 5)
-        self.assertGreaterEqual(elapsed, 4.5)
-        self.assertLess(elapsed, 9.0)
+        # 第一轮预算 = 总预算 - 兜底预留；返回时刻不早于它、且不超过总预算
+        self.assertGreaterEqual(elapsed, STAGE1 - 0.2)
+        self.assertLess(elapsed, BUDGET + 2.0)
         self.assertTrue(cancelled.is_set())
 
     # ---------- 退化路径：search_all(budget=None) 仍等全部完成 ----------

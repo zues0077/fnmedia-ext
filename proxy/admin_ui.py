@@ -202,6 +202,21 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
   justify-content:center;padding:14px}
 .gb-player{width:min(960px,100%);background:#111;border-radius:12px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.5)}
 .gb-player-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:#1c1f26;color:#eee;font-size:13px}
+/* 爬虫源管理弹层（C 档界面优化，2026-11-13）：长列表与配置面板改遮罩弹层，
+   不再内联插在卡片里把整页往下推、点一次跳一次。 */
+.mo-mask{position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:9000;display:none;
+  align-items:center;justify-content:center;padding:16px}
+.mo-mask.show{display:flex}
+.mo-box{width:min(940px,100%);max-height:88vh;background:var(--card,#fff);border-radius:12px;
+  display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.35)}
+.mo-hd{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);
+  font-weight:600;font-size:15px;flex-wrap:wrap}
+.mo-hd .mo-x{margin-left:auto;border:0;background:transparent;font-size:20px;line-height:1;
+  cursor:pointer;color:var(--muted);padding:2px 8px;border-radius:6px}
+.mo-hd .mo-x:hover{background:rgba(127,127,127,.14)}
+.mo-bd{padding:12px 16px 16px;overflow:auto}
+.mo-ft{padding:10px 16px;border-top:1px solid var(--line);display:flex;gap:8px;
+  align-items:center;flex-wrap:wrap}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js" async></script>
 </head>
@@ -704,20 +719,40 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
 
       <!-- >>> PRIVATE:SPIDER -->
       <div class="card" style="margin-top:14px">
-        <div class="card-title">已导入的爬虫源 <button class="small" style="float:right" onclick="loadSpiderMgmt()">刷新</button></div>
-        <p class="card-sub">普通 csp_ 爬虫按各自订阅的 jar 在本地安卓运行时执行。jar 自动下载失败时可在此手动补传，补传后非风险源自动启用。点「测试」可验证该源能否搜索、取详情，勾选试播还会尝试解析首集播放地址。
-          标「需登录」的源要求站点登录态：点「配置」把浏览器里登录后的 Cookie 填进站点参数 <code>ext</code>，保存即可验证；这类源不会进「删除勾选失效源」。</p>
-        <div class="row" style="margin:4px 0 8px;gap:8px;align-items:center;flex-wrap:wrap">
-          <input type="text" id="spProbeKw" value="庆余年" placeholder="测试关键词" style="max-width:150px"/>
-          <label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer">
-            <input type="checkbox" id="spProbePlay" style="width:14px;height:14px;accent-color:var(--accent)"/>同时试播(首集)</label>
-          <button class="small" id="spScanBtn" onclick="spScanStart()">一键全部体检</button>
-          <button class="small" id="spDelBtn" onclick="spDeleteChecked()" style="display:none;border-color:var(--danger);color:var(--danger)">删除勾选失效源</button>
-          <span class="muted sm">体检较慢（逐源真机调用）；默认仅勾选确认失效/报错的源，可手动调整。</span>
+        <div class="card-title">已导入的爬虫源
+          <span class="muted sm" id="spSummary">加载中…</span>
+          <button class="primary small" style="margin-left:auto" onclick="spOpen()">管理爬虫源</button>
         </div>
-        <div id="spScanBar" class="muted sm" style="display:none;margin:2px 0 8px"></div>
-        <div id="spScanResult" style="margin-bottom:10px"></div>
-        <div id="spiderMgmt"><div class="muted sm">点击「刷新」加载。</div></div>
+        <p class="card-sub">普通 csp_ 爬虫按各自订阅的 jar 在本地安卓运行时执行。清单、测试、jar 补传、登录态配置都收进弹层里操作，
+          不再把长列表铺在页面上。标「需登录」的源要求站点登录态：在弹层里点「配置」把浏览器登录后的 Cookie 填进站点参数 <code>ext</code>。</p>
+        <div id="spJarWarn" class="hint"></div>
+      </div>
+
+      <div class="mo-mask" id="spModal" onclick="if(event.target===this)spClose()">
+        <div class="mo-box" role="dialog" aria-modal="true" aria-label="爬虫源管理">
+          <div class="mo-hd">
+            <span>爬虫源管理</span>
+            <span class="muted sm" id="spSummary2"></span>
+            <button class="mo-x" onclick="spClose()" title="关闭（Esc）">✕</button>
+          </div>
+          <div class="mo-bd">
+            <div class="row" style="margin:4px 0 8px;gap:8px;align-items:center;flex-wrap:wrap">
+              <input type="text" id="spProbeKw" value="庆余年" placeholder="测试关键词" style="max-width:150px"/>
+              <label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer">
+                <input type="checkbox" id="spProbePlay" style="width:14px;height:14px;accent-color:var(--accent)"/>同时试播(首集)</label>
+              <button class="small" id="spScanBtn" onclick="spScanStart()">一键全部体检</button>
+              <button class="small" id="spDelBtn" onclick="spDeleteChecked()" style="display:none;border-color:var(--danger);color:var(--danger)">删除勾选失效源</button>
+              <span class="muted sm">体检较慢（逐源真机调用）；默认仅勾选确认失效/报错的源，可手动调整。</span>
+            </div>
+            <div id="spScanBar" class="muted sm" style="display:none;margin:2px 0 8px"></div>
+            <div id="spScanResult" style="margin-bottom:10px"></div>
+            <div id="spiderMgmt"><div class="muted sm">点击「刷新」加载。</div></div>
+          </div>
+          <div class="mo-ft">
+            <button class="small" onclick="loadSpiderMgmt()">刷新</button>
+            <span class="muted sm">开关/删除即时生效，不用关掉弹层。Esc 或点遮罩关闭。</span>
+          </div>
+        </div>
       </div>
       <!-- <<< PRIVATE:SPIDER -->
 
@@ -1077,6 +1112,8 @@ async function jpost(p,b){const r=await fetch(p,{method:"POST",headers:{"Content
 async function switchPage(page){
   $$(".page").forEach(el=>el.classList.toggle("active",el.id==="page-"+page));
   $$("[data-page]").forEach(el=>el.classList.toggle("active",el.dataset.page===page));
+  // 切页时收起弹层，避免遮罩留住导致新页面点不动
+  if(typeof spClose==="function")try{spClose();}catch(e){}
   window.scrollTo(0,0);
   if(page==="overview"){renderOverview();startLivePoll();}
   else{stopLivePoll();}
@@ -2408,8 +2445,14 @@ function renderSubResult(d){
     +(d.subscriptions?('（含 '+d.subscriptions+' 个子订阅）'):'')+'，新增登记 <b style="color:var(--ok,#3a9)">'+totalOk+'</b> 个。</div>';
   // 苹果CMS
   if(cms.candidates||cms.added||cms.duplicate){
-    const rows=subList(cms.added_names||[],n=>'<div class="subrow ok"><span>＋ '+esc(n)+'</span><span class="tag">已启用</span></div>');
-    h+=subGrp('🍿 苹果CMS影视站　新增 '+cmsOk+' · 已存在 '+(cms.duplicate||0),rows,(cms.added_names||[]).length);
+    const rows=subList(cms.added_names||[],n=>'<div class="subrow ok"><span>＋ '+esc(n)+'</span><span class="tag">已启用</span></div>')
+      +((cms.adult_auto||[]).length
+        ?'<div class="muted sm" style="padding:4px 2px">其中 '+cms.adult_auto.length+' 个按名字判定为成人站，已自动标「18」进福利库（可在资源站页取消）：'
+          +esc(cms.adult_auto.join("、"))+'</div>'
+        :'');
+    h+=subGrp('🍿 苹果CMS影视站　新增 '+cmsOk+' · 已存在 '+(cms.duplicate||0)
+      +((cms.adult_auto||[]).length?(' · 自动标 18 '+cms.adult_auto.length):''),
+      rows,(cms.added_names||[]).length);
   }
   if(t4.candidates||t4.added||t4.duplicate){
     const rows=subList(t4.added_names||[],n=>'<div class="subrow ok"><span>＋ '+esc(n)+'</span><span class="tag">已登记</span></div>');
@@ -2812,6 +2855,23 @@ function spTag(s){
     return '<span class="tag warn"'+tip+'>已失效</span>';
   return '<span class="tag warn">已停用</span>';
 }
+/* 爬虫源管理弹层（C 档界面优化）：长列表/体检/配置都在弹层里，页面不再被撑长 */
+function spOpen(){
+  const m=$("spModal");if(!m)return;
+  m.classList.add("show");
+  document.body.style.overflow="hidden";
+  loadSpiderMgmt();
+}
+function spClose(){
+  const m=$("spModal");if(!m)return;
+  m.classList.remove("show");
+  document.body.style.overflow="";
+}
+document.addEventListener("keydown",e=>{
+  if(e.key!=="Escape")return;
+  const m=$("spModal");
+  if(m&&m.classList.contains("show"))spClose();
+});
 async function loadSpiderMgmt(){
   const box=$("spiderMgmt");if(!box)return;
   try{
@@ -2819,6 +2879,18 @@ async function loadSpiderMgmt(){
     if(r.code!==0){box.innerHTML='<div class="hint">加载失败</div>';return;}
     const d=r.data||{},sites=d.sites||[];
     SP_SITES={};sites.forEach(s=>{SP_SITES[s.key]=s;});
+    const needsLoginN=sites.filter(s=>s.last_verdict==="needs_login").length;
+    const sum='共 '+sites.length+' 个 · 启用 '+(d.enabled||0)+' · 需登录 '+needsLoginN;
+    if($("spSummary"))$("spSummary").textContent=sites.length?sum:"暂无导入的爬虫源";
+    if($("spSummary2"))$("spSummary2").textContent=sites.length?sum:"";
+    // 卡片上只留一行摘要：缺 jar / 运行时未就绪这类「必须看到」的提示
+    const jarMissN=[...new Set(sites.filter(s=>!s.jar_ready).map(s=>s.jar_url).filter(Boolean))].length;
+    if($("spJarWarn")){
+      let w="";
+      if(!d.available)w+='<span class="tag warn">安卓运行时未就绪</span> 爬虫源暂不可播放，去「TVBox加固源」页一键部署。';
+      if(jarMissN)w+=(w?' ':'')+'<span class="tag warn">'+jarMissN+' 个 jar 未就绪</span> 打开「管理爬虫源」重试下载或手动补传。';
+      $("spJarWarn").innerHTML=w;
+    }
     if(!sites.length){box.innerHTML='<div class="muted sm">暂无导入的普通爬虫源。</div>';return;}
     // 按 jar_url 聚合缺 jar 提示
     const jarMissing=[...new Set(sites.filter(s=>!s.jar_ready).map(s=>s.jar_url))];

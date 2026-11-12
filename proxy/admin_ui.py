@@ -624,7 +624,9 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
           <button class="small" style="float:right" onclick="loadSubMgmt()">刷新</button></div>
         <p class="card-sub">贴订阅地址即可，格式<strong>自动识别</strong>：TVBox / base64 / LunaTV（Base58，
           <code>api_site</code> 视频源 + <code>lives</code> 直播源）/ 饭太硬 / T4 / 多订阅聚合，无需区别添加。
-          视频源与直播源自动分流；能直接播放的源自动启用，P2P/磁力/云盘等慢源与 jar/脚本未就绪的导入后默认关闭。</p>
+          视频源与直播源自动分流；能直接播放的源自动启用，P2P/磁力/云盘等慢源与 jar/脚本未就绪的导入后默认关闭。
+          订阅里若含 csp 爬虫，会先列出清单让你勾选（每个都要下载 jar 并占用真机运行时，全导会互相挤占）；
+          勾选结果按订阅记住，以后每次自动更新都按它导入。</p>
         <div class="row" style="margin:4px 0 8px;gap:8px;flex-wrap:wrap;align-items:center">
           <input type="text" id="subMgName" placeholder="订阅名称（可留空）" style="flex:1;min-width:130px"/>
           <input type="text" id="subMgUrl" placeholder="订阅 URL（http/https），或粘贴配置 JSON" style="flex:2.5;min-width:210px"/>
@@ -638,9 +640,9 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
             <input type="checkbox" id="subMgStandalone" style="width:15px;height:15px;accent-color:var(--accent)"/>
             苹果CMS源同时「作为独立媒体库」</label>
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"
-            title="csp 爬虫要下 jar 并占用真机运行时，默认不导入；勾上才随本次导入一起写入">
+            title="只对下方「粘贴配置 JSON 一次性导入」生效；订阅管理请用订阅卡片上的「选择 csp 源」逐个勾选">
             <input type="checkbox" id="subMgCsp" style="width:15px;height:15px;accent-color:var(--warn)"/>
-            同时导入 csp 爬虫（默认不导入）</label>
+            一次性导入时连 csp 爬虫一起导（默认不导）</label>
           <a href="javascript:;" class="muted sm" style="text-decoration:underline" onclick="toggleSubPaste()">粘贴配置 JSON 导入（仅一次）</a>
           <!-- >>> PRIVATE:SPIDER -->
           <button class="small" style="border-color:var(--accent);color:var(--accent)" onclick="importFantaiying()" title="官方维护、在线影视+网盘聚合；自动解密、智能跳过 x86 会崩溃的加固源">⚡ 一键饭太硬</button>
@@ -657,7 +659,8 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
       <!-- >>> PRIVATE:SPIDER -->
       <div class="card" style="margin-top:14px">
         <div class="card-title">已导入的爬虫源 <button class="small" style="float:right" onclick="loadSpiderMgmt()">刷新</button></div>
-        <p class="card-sub">普通 csp_ 爬虫按各自订阅的 jar 在本地安卓运行时执行。jar 自动下载失败时可在此手动补传，补传后非风险源自动启用。点「测试」可验证该源能否搜索、取详情，勾选试播还会尝试解析首集播放地址。</p>
+        <p class="card-sub">普通 csp_ 爬虫按各自订阅的 jar 在本地安卓运行时执行。jar 自动下载失败时可在此手动补传，补传后非风险源自动启用。点「测试」可验证该源能否搜索、取详情，勾选试播还会尝试解析首集播放地址。
+          标「需登录」的源要求站点登录态：点「配置」把浏览器里登录后的 Cookie 填进站点参数 <code>ext</code>，保存即可验证；这类源不会进「删除勾选失效源」。</p>
         <div class="row" style="margin:4px 0 8px;gap:8px;align-items:center;flex-wrap:wrap">
           <input type="text" id="spProbeKw" value="庆余年" placeholder="测试关键词" style="max-width:150px"/>
           <label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer">
@@ -675,7 +678,8 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
       <!-- >>> PRIVATE:DRPY -->
       <div class="card" style="margin-top:14px">
         <div class="card-title">已导入的远程 JS 爬虫（DRPY）</div>
-        <p class="card-sub">规则脚本来自订阅 URL，由本地 Node 运行时执行；脚本下载失败可重试。</p>
+        <p class="card-sub">规则脚本来自订阅 URL，由本地 Node 运行时执行；脚本下载失败可重试。
+          状态标签取自最近一次巡检或「测试」结果：规则解析报错、站点失效会标红，但<strong>只标记不自动停用</strong>（站侧修好后源可自行恢复）。</p>
         <div id="drpyMgmt"><div class="muted sm">导入后自动显示。</div></div>
       </div>
       <!-- <<< PRIVATE:DRPY -->
@@ -2258,11 +2262,15 @@ async function loadSubMgmt(){
         +'<button class="small" onclick="subMgRefresh(\''+s.id+'\',this)">立即更新</button>'
         +'<button class="small" style="border-color:var(--danger);color:var(--danger)" onclick="subMgRemove(\''+s.id+'\')">删除</button>'
         +'</span></div>'
-        +'<div class="muted sm" style="margin-top:6px;display:flex;gap:14px;flex-wrap:wrap">'
+        +'<div class="muted sm" style="margin-top:6px;display:flex;gap:14px;flex-wrap:wrap;align-items:center">'
         +'<span>已导入 <b style="color:var(--text)">'+esc(s.source_count||0)+'</b> 源</span>'
         +'<span>间隔 <b style="color:var(--text)">'+esc(s.update_interval_h||24)+'</b> h</span>'
         +'<span>上次 <b style="color:var(--text)">'+esc(subMgFmt(s.last_update))+'</b></span>'
         +'<span>'+subMgStatus(s)+'</span>'
+        +'<span>'+((s.csp_keys===undefined||s.csp_keys===null)
+            ?'<span class="tag wait" title="csp 爬虫需要下 jar 并占真机运行时，默认不导入">csp 未选</span>'
+            :'<span class="tag" title="这些 csp 源会随每次更新一起导入">csp 已选 '+(s.csp_keys||[]).length+'</span>')+'</span>'
+        +'<button class="small" style="padding:2px 8px" onclick="cspPick(\''+s.id+'\')" title="解析该订阅并列出全部 csp 爬虫源，自行勾选要导入哪些">选择 csp 源</button>'
         +'</div>'
         +'<div class="muted sm" style="margin-top:4px;word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace">'+esc(s.url||'')+'</div>'
         +'</div>';
@@ -2323,18 +2331,21 @@ async function subMgAdd(){
     $("subMgName").value="";$("subMgUrl").value="";$("subMgInterval").value="24";$("subMgStandalone").checked=false;
     loadSubMgmt();
     if(sid){
-      toast("已添加，正在首次拉取…");
+      toast("已添加，正在解析订阅…");
       try{
-        const rr=await jreq("POST","/v/api/ext/subscriptions/"+sid+"/refresh",{});
-        const d=rr.data||{};
-        if(rr.code!==0)toast("首次拉取失败："+(rr.msg||"")+"（可点「立即更新」重试）","fail");
-        else toast("添加成功：CMS 新增 "+(d.cms_added||0)+" 源"
-          +(d.drpy&&d.drpy.added?("、JS "+(d.drpy.added||0)):"")
-          +(d.t4&&d.t4.added?("、T4 "+(d.t4.added||0)):"")
-          +(d.csp_pending?("（另有 "+d.csp_pending+" 个 csp 爬虫未导入，需要时在「导入订阅」里勾选）"):"")
-          +(d.live&&d.live.added?("、直播 "+(d.live.added)):""));
-      }catch(e){toast("首次拉取出错，可稍后点「立即更新」重试","fail");}
-      
+        // 先只读预览：订阅里有 csp 爬虫就弹勾选清单（要下 jar、占真机运行时，
+        // 不能替用户全导）；没有 csp 就直接走正常导入（复用同一次解析结果）。
+        const pr=await jreq("POST","/v/api/ext/subscriptions/"+sid+"/refresh",{preview:true});
+        const pd=(pr&&pr.data)||{};
+        const rows=(pr&&pr.code===0)?(pd.csp||[]):[];
+        if(rows.length && !pd.csp_skipped_build){
+          renderCspPicker(sid,rows,[],pd.counts||{});
+          toast("该订阅含 "+rows.length+" 个 csp 爬虫源，请勾选要导入的（不勾则不导入）");
+        }else{
+          if(pr&&pr.code!==0)toast("解析失败："+(pr.msg||"")+"（可点「立即更新」重试）","fail");
+          else await subMgRefresh(sid,null);
+        }
+      }catch(e){toast("解析出错，可点「立即更新」重试","fail");}
       loadSubMgmt();
     }else toast("已添加订阅");
   }catch(e){toast("添加失败："+e,"fail");}
@@ -2364,14 +2375,161 @@ async function subMgRefresh(sid,btn){
   }catch(e){toast("拉取失败："+e,"fail");}
   finally{if(btn){btn.disabled=false;btn.textContent=t;}}
 }
+
+// ---------- csp 勾选清单（订阅里的 csp 爬虫逐个挑选） ----------
+// 一个订阅常带几十上百个 csp 源，全量导入要下 jar、每个源占真机运行时，
+// 所以先 preview 列出候选让用户勾，勾选结果存进订阅记录，之后每次自动更新
+// 都按这份勾选导入（不会弹窗、也不会把没选的源偷偷导进来）。
+let CSP_PICK=null;
+async function cspPick(sid){
+  const out=$("subResult");
+  out.innerHTML='<div class="muted sm">正在解析订阅并整理 csp 源清单（只读，不改任何配置），请稍候…</div>';
+  try{
+    const r=await jreq("POST","/v/api/ext/subscriptions/"+sid+"/refresh",{preview:true});
+    if(r.code!==0){out.innerHTML='<div class="hint" style="color:var(--danger)">解析失败：'+esc(r.msg||"")+'</div>';return;}
+    const d=r.data||{};
+    if(d.csp_skipped_build){
+      out.innerHTML='<div class="hint">当前为公开构建，不含爬虫运行时，订阅里的 csp 源无法导入。</div>';return;}
+    const rows=d.csp||[];
+    if(!rows.length){
+      out.innerHTML='<div class="hint">该订阅没有 csp 爬虫源。苹果CMS / JS / T4 / 直播源会自动导入，无需挑选。</div>';
+      return;}
+    renderCspPicker(sid,rows,d.csp_keys||[],d.counts||{});
+  }catch(e){out.innerHTML='<div class="hint" style="color:var(--danger)">解析出错：'+esc(String(e))+'</div>';}
+}
+function renderCspPicker(sid,rows,chosen,counts){
+  CSP_PICK={sid:sid,rows:rows};
+  const pick=new Set(chosen||[]);
+  const risky=rows.filter(r=>r.risk).length, nojar=rows.filter(r=>!r.has_jar).length;
+  let h='<div style="margin:10px 0;padding:12px 14px;border:1px solid var(--accent);border-radius:10px;background:#fbfcfe">'
+   +'<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
+   +'<b>选择要导入的 csp 爬虫源</b>'
+   +'<span class="tag wait">候选 '+rows.length+' 个</span>'
+   +(risky?'<span class="tag warn">风险源 '+risky+'</span>':'')
+   +(nojar?'<span class="tag warn">缺 jar '+nojar+'</span>':'')
+   +'<span class="muted sm">订阅共 '+(counts.cms||0)+' 个苹果CMS、'+(counts.drpy||0)+' 个JS、'+(counts.t4||0)+' 个T4（这些自动导入）</span>'
+   +'</div>'
+   +'<div class="muted sm" style="margin:6px 0 8px">每个 csp 源都要下载 jar 并占用真机运行时，勾太多会互相挤占。'
+   +'不勾任何项 = 一个 csp 源都不导入（苹果CMS 等仍照常导入）。</div>'
+   +'<div class="row" style="gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+   +'<button class="small" onclick="cspSel(\'safe\')">只选安全源</button>'
+   +'<button class="small" onclick="cspSel(\'all\')">全选</button>'
+   +'<button class="small" onclick="cspSel(\'inv\')">反选</button>'
+   +'<button class="small" onclick="cspSel(\'none\')">清空</button>'
+   +'<input type="text" placeholder="按名称过滤" style="max-width:160px" oninput="cspFilter(this.value)"/>'
+   +'<span class="muted sm" id="cspCount"></span></div>'
+   +'<div id="cspList" style="max-height:320px;overflow:auto;border:1px solid var(--line);border-radius:8px">';
+  rows.forEach(r=>{
+    const tags=(r.risk?'<span class="tag warn">风险</span>':'')
+      +(r.has_jar?'':'<span class="tag warn">缺jar</span>')
+      +(r.exists?'<span class="tag">已在库'+(r.enabled?'·启用':'')+'</span>':'');
+    h+='<label class="csp-row" data-name="'+esc((r.name||"").toLowerCase())+'" '
+      +'style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid var(--line);cursor:pointer;font-size:13px">'
+      +'<input type="checkbox" data-key="'+esc(r.key)+'" data-risky="'+(r.risk?1:0)+'" '
+      +(pick.has(r.key)?'checked':'')+' style="width:15px;height:15px;accent-color:var(--accent)"/>'
+      +'<span style="flex:1">'+esc(r.name||r.key)+'</span><span style="display:flex;gap:6px">'+tags+'</span></label>';
+  });
+  h+='</div>'
+   +'<div class="btn-row" style="justify-content:flex-end;margin:10px 0 0">'
+   +'<button class="small" onclick="cspCancel()">取消</button>'
+   +'<button class="small" onclick="cspSave(false,this)">只保存勾选</button>'
+   +'<button class="primary small" onclick="cspSave(true,this)">保存并立即导入</button>'
+   +'</div></div>';
+  const out=$("subResult");out.innerHTML=h;
+  out.querySelectorAll("#cspList input[type=checkbox]").forEach(cb=>{
+    cb.addEventListener("change",cspCount);
+  });
+  cspCount();
+}
+function cspSel(mode){
+  const wrap=$("cspList");if(!wrap)return;
+  wrap.querySelectorAll("input[type=checkbox]").forEach(cb=>{
+    const row=cb.closest(".csp-row");
+    if(row&&row.style.display==="none")return;
+    if(mode==="all")cb.checked=true;
+    else if(mode==="none")cb.checked=false;
+    else if(mode==="safe")cb.checked=cb.dataset.risky!=="1";
+    else if(mode==="inv")cb.checked=!cb.checked;
+  });
+  cspCount();
+}
+function cspFilter(kw){
+  const wrap=$("cspList");if(!wrap)return;
+  const q=(kw||"").toLowerCase().trim();
+  wrap.querySelectorAll(".csp-row").forEach(row=>{
+    row.style.display=(!q||(row.dataset.name||"").indexOf(q)>=0)?"flex":"none";
+  });
+}
+function cspCheckedKeys(){
+  const wrap=$("cspList");if(!wrap)return [];
+  return [...wrap.querySelectorAll("input[type=checkbox]")].filter(cb=>cb.checked).map(cb=>cb.dataset.key);
+}
+function cspCount(){
+  const el=$("cspCount");if(!el)return;
+  const n=cspCheckedKeys().length;
+  el.textContent="已勾选 "+n+" 个"+(n?"（将导入并占用真机运行时）":"（不会导入任何 csp 源）");
+}
+function cspCancel(){CSP_PICK=null;const o=$("subResult");if(o)o.innerHTML="";loadSubMgmt();}
+async function cspSave(andImport,btn){
+  if(!CSP_PICK)return;
+  const keys=cspCheckedKeys();
+  const old=btn?btn.textContent:"";if(btn){btn.disabled=true;btn.textContent="保存中…";}
+  try{
+    const r=await jreq("POST","/v/api/ext/subscriptions/"+CSP_PICK.sid,{csp_keys:keys});
+    if(r.code!==0){toast(r.msg||"保存失败","fail");return;}
+    toast("已保存 csp 勾选："+keys.length+" 个");
+    if(!andImport){CSP_PICK=null;const o=$("subResult");if(o)o.innerHTML="";await loadSubMgmt();return;}
+    const sid=CSP_PICK.sid;
+    const out=$("subResult");
+    out.innerHTML='<div class="muted sm">正在按勾选导入（下载 jar + 写入爬虫表），请稍候…</div>';
+    const rr=await jreq("POST","/v/api/ext/subscriptions/"+sid+"/refresh",{});
+    const d=(rr&&rr.data)||{};
+    if(!rr||rr.code!==0){
+      out.innerHTML='<div class="hint" style="color:var(--danger)">导入失败：'+esc((rr&&rr.msg)||"")+'</div>';
+      return;
+    }
+    const c=d.csp||{};
+    let h='<div style="margin:8px 0;font-weight:600">按勾选导入完成：'
+      +'csp 新增 <b style="color:var(--ok,#3a9)">'+(c.added||0)+'</b> / 更新 '+(c.updated||0)
+      +'；苹果CMS 新增 '+(d.cms_added||0)+'；JS '+(d.drpy?d.drpy.added||0:0)
+      +'；T4 '+(d.t4?d.t4.added||0:0)+'</div>';
+    (c.items||[]).forEach(it=>{
+      const st=it.enabled?'<span class="tag">已启用</span>'
+        :(it.risk?'<span class="tag warn">风险源·默认关</span>'
+          :(it.has_jar?'<span class="tag warn">默认关</span>':'<span class="tag warn">缺 jar</span>'));
+      h+='<div class="subrow"><span>'+esc(it.name||it.key)+'</span>'+st+'</div>';
+    });
+    if(c.error)h+='<div class="hint" style="color:var(--danger)">'+esc(c.error)+'</div>';
+    out.innerHTML=h;
+    CSP_PICK=null;
+    try{await loadSpiderMgmt();}catch(e){}
+    await loadSubMgmt();
+  }catch(e){toast("保存失败："+e,"fail");}
+  finally{if(btn){btn.disabled=false;btn.textContent=old;}}
+}
 // ---------- 已导入普通爬虫源管理 ----------
 /* >>> PRIVATE:SPIDER */
+let SP_SITES={};
+// 爬虫源状态标签：把「需登录」和「已失效」分开——前者只缺一份凭据，
+// 后者才是真要删的，混在一起会被「删除勾选失效源」误删。
+function spTag(s){
+  const tip=(s.last_error?(' title="'+esc(s.last_error)+'"'):'');
+  if(s.last_verdict==="needs_login")
+    return '<span class="tag warn"'+tip+'>需登录</span>';
+  if(s.enabled)return '<span class="tag">已启用</span>';
+  if(s.risk)return '<span class="tag warn">风险源</span>';
+  if(!s.jar_ready)return '<span class="tag warn">缺jar</span>';
+  if(s.last_verdict==="dead_empty"||s.last_verdict==="dead_runtime")
+    return '<span class="tag warn"'+tip+'>已失效</span>';
+  return '<span class="tag warn">已停用</span>';
+}
 async function loadSpiderMgmt(){
   const box=$("spiderMgmt");if(!box)return;
   try{
     const r=await jget("/v/api/ext/spider/status");
     if(r.code!==0){box.innerHTML='<div class="hint">加载失败</div>';return;}
     const d=r.data||{},sites=d.sites||[];
+    SP_SITES={};sites.forEach(s=>{SP_SITES[s.key]=s;});
     if(!sites.length){box.innerHTML='<div class="muted sm">暂无导入的普通爬虫源。</div>';return;}
     // 按 jar_url 聚合缺 jar 提示
     const jarMissing=[...new Set(sites.filter(s=>!s.jar_ready).map(s=>s.jar_url))];
@@ -2389,17 +2547,20 @@ async function loadSpiderMgmt(){
        +'<label class="small" style="border:1px solid var(--line,#ccc);border-radius:6px;padding:4px 10px;cursor:pointer">手动补传 jar'
        +'<input type="file" accept=".jar,.zip" style="display:none" onchange="uploadJar(this,\''+esc(ju)+'\')"></label></div></div>';
     });
-    h+='<div class="subgrp"><div class="subgrp-t">共 '+sites.length+' 个 · 启用 '+(d.enabled||0)+'</div>';
+    h+='<div class="subgrp"><div class="subgrp-t">共 '+sites.length+' 个 · 启用 '+(d.enabled||0)
+      +' · 需登录 '+sites.filter(s=>s.last_verdict==="needs_login").length+'</div>';
     sites.forEach(s=>{
-      const tag=s.enabled?'<span class="tag">已启用</span>'
-        : (s.risk?'<span class="tag warn">风险源</span>'
-           : (s.jar_ready?'<span class="tag warn">已停用</span>':'<span class="tag warn">缺jar</span>'));
+      const needsLogin=s.last_verdict==="needs_login";
       const cb='<label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer">'
         +'<input type="checkbox" '+(s.enabled?"checked":"")+' onchange="spToggle(this,\''+esc(s.key)+'\')" '
         +'style="width:14px;height:14px;accent-color:var(--accent)"/>启用</label>';
       const del='<button class="small" style="padding:2px 8px" onclick="spRemove(\''+esc(s.key)+'\',\''+esc((s.name||s.key).replace(/'/g,""))+'\')">删</button>';
       const test='<button class="small" style="padding:2px 8px" onclick="spProbe(this,\''+esc(s.key)+'\')">测试</button>';
-      h+='<div class="subrow"><span>'+esc(s.name||s.key)+'</span><span style="display:flex;align-items:center;gap:8px">'+tag+cb+test+del+'</span></div>';
+      const cfg='<button class="small" style="padding:2px 8px" onclick="spConfigure(\''+esc(s.key)+'\')"'
+        +(needsLogin?' title="该源需要登录，在这里填 Cookie"':' title="编辑站点级参数 ext（cookie/userid/账号）"')
+        +'>配置'+(s.ext?'●':'')+'</button>';
+      h+='<div class="subrow"><span>'+esc(s.name||s.key)+'</span><span style="display:flex;align-items:center;gap:8px">'
+        +'<span id="sptag-'+esc(s.key)+'">'+spTag(s)+'</span>'+cb+test+cfg+del+'</span></div>';
       h+='<div id="probe-'+esc(s.key)+'" class="muted sm" style="display:none;margin:0 0 6px;padding:6px 10px;border-radius:6px;background:rgba(127,127,127,.08)"></div>';
     });
     h+='</div>';
@@ -2431,7 +2592,9 @@ async function spProbe(btn,key){
     const d=r.data||{};
     let badge,color;
     if(d.ok===false){
-      if(d.verdict==="keyword_miss"){badge="○ 源正常，仅该关键词无资源";color="var(--ok,#3a9)";}
+      if(d.verdict==="needs_login"){badge="🔑 需登录/授权（填 Cookie 后重试）";color="var(--warn,#d59a2b)";}
+      else if(d.verdict==="needs_config"){badge="· 网盘/工具类，需配置后使用";color="var(--warn,#d59a2b)";}
+      else if(d.verdict==="keyword_miss"){badge="○ 源正常，仅该关键词无资源";color="var(--ok,#3a9)";}
       else if(d.verdict==="search_broken"){badge="△ 源有资源但搜索接口异常";color="var(--warn,#d59a2b)";}
       else if(d.verdict==="spider_error"){badge="⚠ 爬虫代码报错";color="var(--warn,#d59a2b)";}
       else if(d.verdict==="dead_empty"){badge="✗ 空源/已失效（取不到任何资源）";color="var(--danger)";}
@@ -2452,17 +2615,71 @@ async function spProbe(btn,key){
     if(d.error)h+='<br><span style="color:'+(d.verdict==='keyword_miss'?'var(--ok,#3a9)':'var(--warn,#d59a2b)')+'">'+esc(d.error)+'</span>';
     if(d.evidence)h+='<br><span class="muted">诊断：'+esc(d.evidence)+'</span>';
     if(box)box.innerHTML=h;
+    // 就地刷新该行标签（后端 probe 已把结论记进源记录），不整块重渲染
+    const rec=SP_SITES[key];
+    if(rec){rec.last_verdict=d.verdict||"";rec.last_error=d.error||d.note||"";
+      const tg=document.getElementById("sptag-"+key);if(tg)tg.innerHTML=spTag(rec);}
   }catch(e){
     if(box)box.innerHTML='<span style="color:var(--danger)">'+esc(String(e))+'</span>';
   }finally{if(btn){btn.disabled=false;btn.textContent=old;}}
 }
 
+// ---------- 登录态配置（ext：cookie / userid / 账号） ----------
+// 我们不去替用户登录：csp 的登录态在 jar 自己的 WebView 里，后台没有能力
+// 也 不该自动抓取。可行且贴本质的做法是——用户在浏览器登录该站，把 Cookie
+// 粘到这里，`_call` 会把它原样透传给 runner 里的 jar。
+function spConfigure(key){
+  const s=SP_SITES[key]||{};
+  const box=_probeBox(key);
+  if(!box)return;
+  box.innerHTML='<div style="display:flex;flex-direction:column;gap:6px">'
+    +'<div><b>登录态配置</b> · '+esc(s.name||key)
+    +(s.last_verdict==="needs_login"?' <span class="tag warn">需登录</span>':'')+'</div>'
+    +'<div class="muted">多数 csp 源用站点参数 <code>ext</code> 传 Cookie / userid / 账号。'
+    +'做法：浏览器登录该站 → 开发者工具复制 Cookie（形如 <code>k=v; k2=v2</code>）或站点要求的 userid → 粘到下面 → 保存并测试。</div>'
+    +'<textarea id="spExt-'+esc(key)+'" rows="3" placeholder="例如：uid=xxx; token=yyy  （留空=清空该源 ext）"'
+    +' style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px">'+esc(s.ext||'')+'</textarea>'
+    +'<div class="row" style="gap:8px">'
+    +'<button class="primary small" onclick="spExtSave(\''+esc(key)+'\',true,this)">保存并测试</button>'
+    +'<button class="small" onclick="spExtSave(\''+esc(key)+'\',false,this)">只保存</button>'
+    +'<button class="small" onclick="spConfigureClose(\''+esc(key)+'\')">收起</button>'
+    +'</div></div>';
+}
+function spConfigureClose(key){const b=document.getElementById("probe-"+key);if(b){b.style.display="none";b.innerHTML="";}}
+async function spExtSave(key,verify,btn){
+  const ta=$("spExt-"+key);if(!ta)return;
+  const old=btn.textContent;btn.disabled=true;btn.textContent="保存中…";
+  const box=_probeBox(key);
+  try{
+    const kw=(($("spProbeKw")&&$("spProbeKw").value)||"庆余年").trim()||"庆余年";
+    const r=await jpost("/v/api/ext/spider/ext",{key:key,ext:ta.value,verify:!!verify,keyword:kw});
+    if(r.code!==0){toast(r.msg||"保存失败","fail");return;}
+    const p=(r.data&&r.data.probe)||null;
+    if(!verify){toast("已保存，可点「测试」验证");}
+    else if(p){
+      const ok=p.ok===true;
+      let t=(ok?'<span style="color:var(--ok,#3a9)">✓ 已保存，验证通过</span>'
+               :'<span style="color:var(--warn,#d59a2b)">△ 已保存，但仍未通过</span>');
+      if(p.verdict==="needs_login")t+=' · 仍报需登录：Cookie 可能过期或该源要的是别的参数';
+      if(p.error)t+='<div style="margin-top:3px;word-break:break-all">'+esc(p.error)+'</div>';
+      box.innerHTML=t;
+      const rec=SP_SITES[key];
+      if(rec){rec.last_verdict=p.verdict||"";rec.last_error=p.error||"";rec.ext=ta.value;
+        const tg=document.getElementById("sptag-"+key);if(tg)tg.innerHTML=spTag(rec);}
+      toast(ok?"验证通过":"已保存，但探测未通过");
+    }else toast("已保存");
+  }catch(e){toast("保存失败："+e,"fail");}
+  finally{btn.disabled=false;btn.textContent=old;}
+}
+
 // ---------- 一键批量体检 ----------
 const SP_VLABEL={playable:"可搜索且可取播放",usable:"可搜索（未/不可取流）",keyword_miss:"源正常·仅该词无片",
- search_broken:"有内容但搜索异常",needs_config:"网盘/工具类·需配置",spider_error:"爬虫代码报错",dead_runtime:"源失效/无法访问",
+ search_broken:"有内容但搜索异常",needs_config:"网盘/工具类·需配置",needs_login:"需登录/授权（填 Cookie 可救）",
+ spider_error:"爬虫代码报错",dead_runtime:"源失效/无法访问",
  dead_empty:"空源/已失效",jar:"jar 未就绪",runtime:"运行时未就绪",unknown:"未知"};
 const SP_VCOLOR={playable:"var(--ok,#3a9)",usable:"var(--ok,#3a9)",keyword_miss:"var(--ok,#3a9)",
- search_broken:"var(--warn,#d59a2b)",needs_config:"var(--muted)",spider_error:"var(--danger)",dead_runtime:"var(--danger)",
+ search_broken:"var(--warn,#d59a2b)",needs_config:"var(--muted)",needs_login:"var(--warn,#d59a2b)",
+ spider_error:"var(--danger)",dead_runtime:"var(--danger)",
  dead_empty:"var(--danger)",jar:"var(--warn,#d59a2b)",runtime:"var(--warn,#d59a2b)",unknown:"var(--muted)"};
 let _spPoll=null;
 async function spScanStart(){
@@ -2498,7 +2715,7 @@ function spRenderScan(results){
   if(!results.length){box.innerHTML="";return;}
   const groups={};
   results.forEach(r=>{(groups[r.verdict]=groups[r.verdict]||[]).push(r);});
-  const order=["playable","usable","keyword_miss","search_broken","needs_config","spider_error","dead_runtime","dead_empty","jar","runtime","unknown"];
+  const order=["playable","usable","keyword_miss","search_broken","needs_config","needs_login","spider_error","dead_runtime","dead_empty","jar","runtime","unknown"];
   let h='<div class="subgrp" style="max-height:none">';
   order.forEach(v=>{
     const arr=groups[v];if(!arr||!arr.length)return;
@@ -2572,6 +2789,29 @@ async function retryJar(btn,jarUrl){
 /* <<< PRIVATE:SPIDER */
 /* >>> PRIVATE:DRPY */
 // ---------- 已导入远程 DRPY 管理 ----------
+/* drpy 源探测状态 → 标签（与爬虫源卡片同一套语义：只标不杀） */
+function drStateTag(s){
+  const st=s.state||"unknown";
+  const er=s.error||"";
+  const tip=(er?(' title="'+esc(er)+'"'):'');
+  if(st==="ok")return '<span class="tag"'+tip+'>✓ 正常</span>';
+  if(st==="limited")return '<span class="tag amber"'+tip+'>△ 受限</span>';
+  if(st==="invalid")return '<span class="tag warn"'+tip+' style="color:#b91c1c;background:#fee2e2">✗ 地址失效</span>';
+  if(st==="fail")return '<span class="tag warn"'+tip+' style="color:#b91c1c;background:#fee2e2">✗ 不可用</span>';
+  if(st==="unsupported"){
+    if(er.indexOf("运行时")>=0)return '<span class="tag wait"'+tip+'>· 运行时不可用</span>';
+    // 规则/脚本级失败细分（文案来自本地 runtime 的固定报错，非猜测站侧）
+    if(er.indexOf("export default")>=0||er.indexOf("drpy3")>=0)
+      return '<span class="tag warn"'+tip+' style="color:#b91c1c;background:#fee2e2">✗ 规则不兼容</span>';
+    if(er.indexOf("不是合法 JSON")>=0||er.indexOf("parseRule")>=0)
+      return '<span class="tag warn"'+tip+' style="color:#b91c1c;background:#fee2e2">✗ 规则解析失败</span>';
+    if(er.indexOf("is not defined")>=0||er.indexOf("TypeError")>=0)
+      return '<span class="tag warn"'+tip+' style="color:#b91c1c;background:#fee2e2">✗ 脚本报错</span>';
+    if(er.indexOf("首页无分类")>=0)return '<span class="tag warn"'+tip+'>△ 空源</span>';
+    return '<span class="tag warn"'+tip+'>△ 异常（悬停看原因）</span>';
+  }
+  return '<span class="tag wait">· 未探测</span>';
+}
 async function loadDrpyMgmt(){
   const box=$("drpyMgmt");if(!box)return;
   try{
@@ -2579,20 +2819,70 @@ async function loadDrpyMgmt(){
     if(r.code!==0){box.innerHTML='<div class="hint">加载失败</div>';return;}
     const d=r.data||{},sites=d.sites||[];
     if(!sites.length){box.innerHTML='<div class="muted sm">暂无导入的远程 JS 爬虫。</div>';return;}
-    let h='<div class="subgrp"><div class="subgrp-t">共 '+sites.length+' 个</div>';
+    const bad=sites.filter(s=>s.state==="fail"||s.state==="invalid"
+      ||(s.state==="unsupported"&&String(s.error||"").indexOf("运行时")<0)).length;
+    let h='<div class="row" style="gap:8px;align-items:center;flex-wrap:wrap;margin:2px 0 8px">'
+      +'<input type="text" id="drProbeKw" value="庆余年" placeholder="测试关键词" style="max-width:130px"/>'
+      +'<button class="small" id="drScanBtn" onclick="drProbeAll(this)">逐一测试（'+sites.length+' 个）</button>'
+      +'<span class="muted sm">规则脚本报错的源通常要等站侧恢复或更新脚本，这里只标出来，不自动停用。</span></div>';
+    if(bad){h+='<div style="margin-bottom:8px;padding:8px 10px;border:1px solid var(--warn,#d59a2b);border-radius:8px;background:rgba(213,154,43,.08)" class="sm">'
+      +'有 '+bad+' 个源最近一次探测失败（规则解析/站点访问），可点「测试」看具体报错。</div>';}
+    h+='<div class="subgrp"><div class="subgrp-t">共 '+sites.length+' 个 · 启用 '
+      +sites.filter(s=>s.enabled).length+'</div>';
     sites.forEach(s=>{
-      const tag=s.enabled?'<span class="tag">已启用</span>'
-        :'<span class="tag warn">'+(s.script_ready?'已停用':'脚本未就绪')+'</span>';
+      const tag='<span id="drtag-'+esc(s.key)+'">'+drStateTag(s)+'</span>';
       const cb=s.script_ready?('<label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer">'
         +'<input type="checkbox" '+(s.enabled?"checked":"")+' onchange="drToggle(this,\''+esc(s.key)+'\')" '
-        +'style="width:14px;height:14px;accent-color:var(--accent)"/>启用</label>'):'';
+        +'style="width:14px;height:14px;accent-color:var(--accent)"/>启用</label>'):'<span class="tag warn">脚本未就绪</span>';
       const rt=s.script_ready?'':'<button class="small" style="padding:2px 8px" onclick="drRetry(\''+esc(s.key)+'\')">重试脚本</button>';
+      const test='<button class="small" style="padding:2px 8px" onclick="drProbe(this,\''+esc(s.key)+'\')">测试</button>';
       const del='<button class="small" style="padding:2px 8px" onclick="drRemove(\''+esc(s.key)+'\')">删</button>';
-      h+='<div class="subrow"><span>'+esc(s.name)+'</span><span style="display:flex;align-items:center;gap:8px">'+tag+cb+rt+del+'</span></div>';
+      h+='<div class="subrow"><span>'+esc(s.name)+'</span><span style="display:flex;align-items:center;gap:8px">'
+        +tag+cb+test+rt+del+'</span></div>';
+      h+='<div id="drprobe-'+esc(s.key)+'" class="muted sm" style="display:none;margin:0 0 6px;padding:6px 10px;border-radius:6px;background:rgba(127,127,127,.08)"></div>';
     });
     h+='</div>';
     box.innerHTML=h;
   }catch(e){box.innerHTML='<div class="hint" style="color:var(--danger)">'+esc(String(e))+'</div>';}
+}
+function _drProbeBox(key){const b=document.getElementById("drprobe-"+key);if(b)b.style.display="block";return b;}
+async function drProbe(btn,key,silent){
+  const kw=(($("drProbeKw")&&$("drProbeKw").value)||"庆余年").trim()||"庆余年";
+  const box=_drProbeBox(key);
+  if(box)box.innerHTML='<span class="muted">正在首页+分类+搜索，JS 运行时约需数秒…</span>';
+  if(btn&&!silent){btn.disabled=true;}
+  try{
+    const r=await jpost("/v/api/ext/drpy/probe",{key:key,keyword:kw});
+    if(r.code!==0){if(box)box.innerHTML='<span style="color:var(--danger)">失败：'+esc(r.msg||"")+'</span>';return false;}
+    const d=r.data||{};
+    const ok=d.ok===true;
+    const head=ok?'<span style="color:var(--ok,#3a9)">✓ 可用</span>'
+      :'<span style="color:var(--danger)">✗ '+(d.state==="invalid"?"地址失效":"不可用")+'</span>';
+    const bits=['耗时 '+(d.elapsed_ms||0)+'ms','结果 '+(d.count||0)+' 条'];
+    if(d.keyword)bits.push('关键词 '+esc(d.keyword));
+    let t=head+' · '+bits.join(' · ');
+    if(!ok&&d.error)t+='<div style="margin-top:3px;word-break:break-all">原因：'+esc(d.error)+'</div>';
+    if(box)box.innerHTML=t;
+    // 只就地更新该行的状态标签，不整块重渲染（否则刚显示的测试结果会被清掉）
+    const tg=document.getElementById("drtag-"+key);
+    if(tg)tg.innerHTML=drStateTag({state:d.state,error:d.error});
+    return ok;
+  }catch(e){if(box)box.innerHTML='<span style="color:var(--danger)">'+esc(String(e))+'</span>';return false;}
+  finally{if(btn&&!silent)btn.disabled=false;}
+}
+async function drProbeAll(btn){
+  const r0=await jget("/v/api/ext/drpy/remote");
+  const sites=(r0&&r0.data&&r0.data.sites)||[];
+  if(!sites.length)return;
+  const old=btn.textContent;btn.disabled=true;
+  let okN=0;
+  for(let i=0;i<sites.length;i++){
+    btn.textContent='测试中 '+(i+1)+'/'+sites.length+'…';
+    _drProbeBox(sites[i].key);
+    if(await drProbe(null,sites[i].key,true))okN++;
+  }
+  btn.disabled=false;btn.textContent=old;
+  toast('测试完成：'+okN+'/'+sites.length+' 可用');
 }
 async function drToggle(el,key){
   try{

@@ -12081,6 +12081,13 @@ async def ext_subscriptions_update(sid: str, request: Request):
     for key in ("name", "url", "update_interval_h", "enabled"):
         if key in body:
             kwargs[key] = body[key]
+    # csp 勾选清单：显式传了就覆盖（含传空数组=一个都不要），没传则保持原值
+    if "csp_keys" in body:
+        v = body.get("csp_keys")
+        if v is not None and not isinstance(v, list):
+            return JSONResponse({"code": 400, "msg": "csp_keys 需为数组"},
+                                status_code=400)
+        kwargs["csp_keys"] = v
     if not kwargs and not body.get("purge_sources"):
         return JSONResponse({"code": 400, "msg": "无更新字段"}, status_code=400)
     purged = 0
@@ -12109,10 +12116,26 @@ async def ext_subscriptions_remove(sid: str):
 
 
 @app.post("/v/api/ext/subscriptions/{sid}/refresh")
-async def ext_subscriptions_refresh(sid: str):
-    """立即拉取某个订阅（只增不减）。"""
+async def ext_subscriptions_refresh(sid: str, request: Request):
+    """立即拉取某个订阅（只增不减）。
+
+    body 可选：
+      preview=True  → 只解析并返回候选清单（含 csp 每项 风险/缺jar/已在库），
+                      用于「选择 csp 源」面板，不写任何配置；
+      csp_keys=[..] → 本次要导入的 csp key（不传则用订阅里存下的勾选）。
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    preview = bool(body.get("preview"))
+    keys = body.get("csp_keys")
+    if keys is not None and not isinstance(keys, list):
+        return JSONResponse({"code": 400, "msg": "csp_keys 需为数组"},
+                            status_code=400)
     import subsched
-    result = await subsched.refresh_subscription(sid)
+    result = await subsched.refresh_subscription(sid, preview=preview,
+                                                 csp_keys=keys)
     return {"code": result.get("code", 0), "msg": result.get("msg", ""),
             "data": result}
 
@@ -12687,11 +12710,51 @@ if features.DRPY:
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"code": 500, "msg": str(exc)[:200], "data": None})
 
+    def _drpy_quality_map() -> dict:
+        """巡检已落盘的探测状态（config 源记录里的 quality），按源 id 索引。"""
+        try:
+            return {str(s.get("id") or ""): (s.get("quality") or {})
+                    for s in config.all_sources()}
+        except Exception:  # noqa: BLE001
+            return {}
+
     @app.get("/v/api/ext/drpy/remote")
     async def drpy_remote_list():
+        sites = await asyncio.to_thread(_drpy.remote_status)
+        # 规则坏了的源不能只显示「已启用」——把巡检结论并进来，让「搜不到东西」
+        # 能落到具体原因（规则解析报错/空源/域名失效）。只读，不改任何状态。
+        qmap = _drpy_quality_map()
+        for s in sites:
+            q = qmap.get(str(s.get("id") or "")) or {}
+            s["state"] = q.get("state") or "unknown"
+            s["error"] = str(q.get("error") or "")[:200]
+            s["checked_at"] = q.get("checked_at") or 0
+            s["list_count"] = int(q.get("list_count") or 0)
+            s["lat_ms"] = int(q.get("lat_ms") or 0)
         return JSONResponse({"code": 0, "msg": "",
                              "data": {"available": _drpy.available(),
-                                      "sites": await asyncio.to_thread(_drpy.remote_status)}})
+                                      "sites": sites}})
+
+    @app.post("/v/api/ext/drpy/probe")
+    async def drpy_probe(request: Request):
+        """单源探测（首页+分类+搜索），供卡片上「测试」按钮逐个验证。"""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        key = str(body.get("key", "")).strip()
+        sids = {str(s.get("id") or "") for s in config.all_sources()}
+        if not key or ("drpy-sub-" + key) not in sids:
+            return JSONResponse({"code": 404, "msg": "未知远程 JS 源"}, status_code=404)
+        src = next(s for s in config.all_sources() if s.get("id") == "drpy-sub-" + key)
+        kw = str(body.get("keyword") or "").strip() or None
+        try:
+            q = await providers.probe_any_source(src, keyword=kw)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"code": 500, "msg": str(exc)[:200]}, status_code=500)
+        return JSONResponse({"code": 0, "msg": "", "data": {
+            **_probe_payload(q), "state": q.get("state") or "fail",
+            "keyword": q.get("keyword") or ""}})
 
     @app.post("/v/api/ext/drpy/remote-toggle")
     async def drpy_remote_toggle(request: Request):
@@ -12999,8 +13062,41 @@ if features.GUARD:
         do_play = bool(body.get("do_play", False))
         # 试播可能触发个别源 WebView 嗅探而拖长，整体给宽超时
         data = await asyncio.wait_for(
-            asyncio.to_thread(_spider.probe, key, kw, do_play), timeout=150)
+            asyncio.to_thread(_spider.probe_and_record, key, kw, do_play),
+            timeout=150)
         return JSONResponse({"code": 0, "msg": "", "data": data})
+
+    @app.post("/v/api/ext/spider/ext")
+    async def spider_set_ext(request: Request):
+        """保存某爬虫源的 ext（登录态：cookie / userid / 账号 / token）。
+
+        body: {key, ext, verify?}
+        保存后可选立刻跑一次体检，让「填完 Cookie 到底通没通」有确定结论。
+        """
+        body = await _guard_body(request)
+        key = str(body.get("key", "")).strip()
+        if not key or not _spider.site(key):
+            return JSONResponse({"code": 404, "msg": "未知爬虫源"}, status_code=404)
+        ext = body.get("ext")
+        if ext is None:
+            return JSONResponse({"code": 400, "msg": "缺少 ext"}, status_code=400)
+        ok = await asyncio.to_thread(_spider.set_ext, key, str(ext))
+        if not ok:
+            return JSONResponse({"code": 404, "msg": "未知爬虫源"}, status_code=404)
+        out: dict = {"key": key, "saved": True}
+        if body.get("verify"):
+            kw = str(body.get("keyword") or "庆余年")[:20]
+            try:
+                r = await asyncio.wait_for(
+                    asyncio.to_thread(_spider.probe_and_record, key, kw, False),
+                    timeout=150)
+                out["probe"] = {"ok": bool(r.get("ok")),
+                                "verdict": r.get("verdict") or "",
+                                "error": r.get("error") or r.get("note") or ""}
+            except Exception as exc:  # noqa: BLE001
+                out["probe"] = {"ok": False, "verdict": "",
+                                "error": f"体检超时/失败：{type(exc).__name__}"}
+        return JSONResponse({"code": 0, "msg": "已保存", "data": out})
 
     @app.post("/v/api/ext/spider/scan")
     async def spider_scan_start(request: Request):

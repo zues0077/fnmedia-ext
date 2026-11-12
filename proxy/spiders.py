@@ -39,6 +39,34 @@ _lock = threading.RLock()
 _sites: dict[str, dict] | None = None
 _jars: dict[str, dict] | None = None   # jarid -> {url,file,size,ok}
 
+# 网盘/P2P/需私人账号的源：默认不自动启用。清单预览与正式导入共用这一份规则，
+# 避免「清单里说安全、导入后变风险源」这种自相矛盾。
+_RISK_RE = re.compile(r"(P2P|磁力|磁鏈|云盘|雲盤|网盘|網盤|夸克|阿里|115|百度|"
+                      r"迅雷|我的|私人|收藏)", re.I)
+
+
+def is_risk_name(name: str) -> bool:
+    return bool(_RISK_RE.search(name or ""))
+
+
+# 需要登录/授权的特征：csp 爬虫里有相当一部分（网盘、付费站、部分厂牌站）
+# 必须带上用户自己的 Cookie/账号才能取内容。这类源不该显示成「已失效」，
+# 更不能被「删除勾选失效源」一键删掉——只是缺一份凭据。
+_LOGIN_RE = re.compile(
+    r"(登录|登錄|未登入|login|log in|signin|sign in|请先登录|请登录|"
+    r"授权|authoriz|cookie|userid|user_id|uid=|token|passport|"
+    r"会员|vip|充值|购买后|人机验证|captcha|401|403)", re.I)
+
+
+def login_hint(text: str) -> bool:
+    """错误文本是否指向「未登录/需授权」而不是「源死了」。"""
+    return bool(_LOGIN_RE.search(str(text or "")))
+
+
+def _login_verdict(exc: BaseException) -> dict:
+    """探测抛错时的附加结论：登录类错误打 needs_login（前端标「需登录」）。"""
+    return {"verdict": "needs_login"} if login_hint(exc) else {}
+
 
 def feature_on() -> bool:
     return bool(getattr(features, "GUARD", False))  # 共用安卓运行时开关
@@ -236,8 +264,6 @@ def import_sites(items: list[dict], enable: str = "smart") -> dict:
     """
     sites = dict(load_sites())
     added = updated = enabled_n = 0
-    risk_re = re.compile(r"(P2P|磁力|磁鏈|云盘|雲盤|网盘|網盤|夸克|阿里|115|百度|"
-                         r"迅雷|我的|私人|收藏)", re.I)
     out_items = []
     for it in items:
         key = str(it.get("key") or "").strip()
@@ -245,7 +271,7 @@ def import_sites(items: list[dict], enable: str = "smart") -> dict:
             continue
         jar_url = (it.get("jar") or "").strip()
         name = str(it.get("name") or key).strip() or key
-        risky = bool(risk_re.search(name))
+        risky = is_risk_name(name)
         rec = {
             "key": key,
             "spider": it.get("spider") or f"csp_{key.rstrip('0123456789')}",
@@ -283,6 +309,32 @@ def import_sites(items: list[dict], enable: str = "smart") -> dict:
             "items": out_items}
 
 
+def candidates(items: list[dict]) -> list[dict]:
+    """把分类器产出的 csp 项转成「可勾选清单」行（**只读，不写任何东西**）。
+
+    供订阅导入前让用户挑源：一个订阅常带几十上百个 csp 源，全量导入要下 jar、
+    每个源占真机运行时，直接全导会把运行时打死。风险判定与 import_sites 同源。
+    """
+    sites = load_sites()
+    out = []
+    for it in items:
+        key = str(it.get("key") or "").strip()
+        if not key:
+            continue
+        jar_url = (it.get("jar") or "").strip()
+        name = str(it.get("name") or key).strip() or key
+        old = sites.get(key) or {}
+        out.append({
+            "key": key, "name": name,
+            "risk": is_risk_name(name),
+            "jar_url": jar_url,
+            "has_jar": bool(jar_url) and jar_local_path(jar_url) is not None,
+            "exists": key in sites,
+            "enabled": bool(old.get("enabled")),
+        })
+    return out
+
+
 def set_enabled(key: str, on: bool) -> bool:
     sites = load_sites()
     if key not in sites:
@@ -290,6 +342,47 @@ def set_enabled(key: str, on: bool) -> bool:
     sites[key]["enabled"] = bool(on)
     _persist_sites(sites)
     return True
+
+
+def set_ext(key: str, ext: str) -> bool:
+    """改写某源的 ext（TVBox 里 ext 就是站点级参数：cookie / userid / 账号 / token）。
+
+    需要登录的 csp 源不靠我们替用户登录——用户在浏览器里登录站点，把 Cookie
+    粘到这里，`_call` 会原样透传给 runner 里的 jar。写盘后 reload 让长驻进程
+    立刻用上新值。
+    """
+    reload_sites()
+    sites = load_sites()
+    if key not in sites:
+        return False
+    sites[key]["ext"] = str(ext or "")
+    _persist_sites(sites)
+    reload_sites()
+    return True
+
+
+def probe_and_record(key: str, keyword: str = "庆余年",
+                     do_play: bool = False) -> dict:
+    """跑一次 probe 并把结论记进源记录（last_verdict/last_error/last_probe）。
+
+    记下来卡片才能在没点「测试」时也显示「需登录 / 已失效」，而不是只显示
+    「已启用」让人以为一切正常。只写爬虫表，不动 config 源记录。
+    """
+    res = probe(key, keyword=keyword, do_play=do_play)
+    try:
+        reload_sites()
+        sites = load_sites()
+        rec = sites.get(key)
+        if rec is not None:
+            rec["last_probe"] = int(time.time())
+            rec["last_verdict"] = str(res.get("verdict") or "")
+            rec["last_ok"] = bool(res.get("ok"))
+            rec["last_error"] = str(res.get("error") or res.get("note") or "")[:200]
+            _persist_sites(sites)
+            reload_sites()
+    except Exception:  # noqa: BLE001
+        _log.info("spider probe 结果写盘失败 %s", key, exc_info=True)
+    return res
 
 
 def remove(key: str) -> bool:
@@ -513,6 +606,16 @@ def diagnose_empty(key: str, keyword: str) -> dict:
                     "evidence": f"热门词「{w}」命中 {len(hits)} 条，如《{(hits[0].get('vod_name') or '')[:20]}》"}
 
     # 4) 首页与热门词都失败：按错误性质定性
+    # 先判「需登录」：登录/授权类报错自带 401/403/cookie 等字样，容易被误判成
+    # 站点失联而把源拉进「建议删除」；它其实只要用户填一份凭据就能用。
+    if home_err and login_hint(home_err):
+        return {"verdict": "needs_login",
+                "reason": "站点要求登录/授权后才能取内容（在该源「配置」里填 Cookie 后重试）",
+                "evidence": _short(home_err)}
+    if hot_err and login_hint(hot_err):
+        return {"verdict": "needs_login",
+                "reason": "搜索接口要求登录/授权（在该源「配置」里填 Cookie 后重试）",
+                "evidence": _short(hot_err)}
     if home_err and net_fail(home_err):
         if _is_util_source(key):
             return {"verdict": "needs_config",
@@ -575,10 +678,13 @@ def probe(key: str, keyword: str = "庆余年", do_play: bool = False) -> dict:
                 rows = search(conf, keyword or "庆余年")
                 out["search_ms"] = int((_t.time() - t) * 1000)
             except Exception as exc2:  # noqa: BLE001
-                return {**out, "ok": False, "stage": "search", "error": str(exc2)[:200]}
+                return {**out, "ok": False, "stage": "search",
+                        "error": str(exc2)[:200],
+                        **_login_verdict(exc2)}
         else:
             return {**out, "ok": False, "stage": "search",
-                    "search_ms": int((_t.time() - t) * 1000), "error": str(exc)[:200]}
+                    "search_ms": int((_t.time() - t) * 1000),
+                    "error": str(exc)[:200], **_login_verdict(exc)}
     if not rows:
         diag = diagnose_empty(key, keyword or "庆余年")
         return {**out, "ok": False, "stage": "search",
@@ -632,9 +738,13 @@ def probe(key: str, keyword: str = "庆余年", do_play: bool = False) -> dict:
         if url and url.startswith(("http://", "https://")):
             return {**out, "ok": True, "playable": True, "play_url": url[:160],
                     "first_ep": ep.get("title", "")}
+        need_login = login_hint(pr)
         return {**out, "ok": True, "playable": False,
-                "note": "未取得直链（该源可能需 WebView 嗅探/解析接口，headless 不支持）",
-                "raw": str(pr)[:160]}
+                "note": ("取播放要求登录/会员（在该源「配置」里填 Cookie 后重试）"
+                         if need_login else
+                         "未取得直链（该源可能需 WebView 嗅探/解析接口，headless 不支持）"),
+                "raw": str(pr)[:160],
+                **({"verdict": "needs_login"} if need_login else {})}
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)[:200]
         out["play_ms"] = int((_t.time() - t) * 1000)
@@ -644,8 +754,10 @@ def probe(key: str, keyword: str = "庆余年", do_play: bool = False) -> dict:
             _ensure_runtime(timeout_s=30.0)
         return {**out, "ok": True, "playable": False,
                 "note": ("取播放触发 WebView 嗅探，无界面环境不支持（已自动恢复运行时）"
-                         if crashed else "取播放失败"),
-                "error": msg}
+                         if crashed else
+                         ("取播放要求登录/会员（填 Cookie 后重试）"
+                          if login_hint(msg) else "取播放失败")),
+                "error": msg, **_login_verdict(exc)}
 
 
 def status() -> dict:
@@ -659,7 +771,14 @@ def status() -> dict:
         "sites": [{"key": k, "name": s.get("name"), "enabled": bool(s.get("enabled")),
                    "risk": bool(s.get("risk")),
                    "jar_ready": k not in missing,
-                   "jar_url": s.get("jar_url", "")}
+                   "jar_url": s.get("jar_url", ""),
+                   # 登录态：ext 是用户可编辑的站点参数（cookie/账号），
+                   # last_* 是最近一次「测试」的结论，供卡片直接显示。
+                   "ext": s.get("ext", ""),
+                   "last_verdict": s.get("last_verdict", ""),
+                   "last_ok": s.get("last_ok"),
+                   "last_error": s.get("last_error", ""),
+                   "last_probe": s.get("last_probe", 0)}
                   for k, s in sites.items()],
     }
 
@@ -678,6 +797,7 @@ VERDICT_LABEL = {
     "keyword_miss": "源正常·仅该词无片",
     "search_broken": "有内容但搜索异常",
     "needs_config": "网盘/工具类·需配置",
+    "needs_login": "需登录/授权·填 Cookie 后可用",
     "spider_error": "爬虫代码报错",
     "dead_runtime": "源失效/无法访问",
     "dead_empty": "空源/已失效",
@@ -708,7 +828,8 @@ def scan_status() -> dict:
 
 def _scan_one(key: str, name: str, keyword: str, do_play: bool) -> dict:
     try:
-        r = probe(key, keyword=keyword, do_play=do_play)
+        # 体检结论同时写进源记录，卡片上不再只显示「已启用」
+        r = probe_and_record(key, keyword=keyword, do_play=do_play)
     except Exception as exc:  # noqa: BLE001
         r = {"key": key, "name": name, "ok": False, "stage": "unknown",
              "verdict": "unknown", "error": str(exc)[:160]}

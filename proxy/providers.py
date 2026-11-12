@@ -893,6 +893,18 @@ def _quality(state: str, *, lat_ms=0, count=0, error: str = "", hit: int = 0,
             "direct": int(direct), "keyword": keyword or "", "error": error}
 
 
+def _err_text(exc: BaseException) -> str:
+    """异常 → 管理页可读的一句话（类名 + 原文截断）。
+
+    只给类名等于什么都没说：JS/JAR 源的失败原因全在原文里（例如
+    `[drpy3:parse/parseRule] 响应体不是合法 JSON`），用户要看到这句才知道
+    是「站侧规则坏了」还是「网络不通」。
+    """
+    nm = type(exc).__name__
+    detail = str(exc).strip().replace("\n", " ")[:120]
+    return nm + (": " + detail if detail else "")
+
+
 async def probe_any_source(source: dict, *, keyword: str = "",
                            timeout: float = 25.0) -> dict:
     """按源**真实类型**探测（管理页「测试」与定时巡检共用）。
@@ -1268,7 +1280,7 @@ async def _probe_drpy_source(source: dict, keyword: str, timeout: float) -> dict
                                "nxdomain", "enotfound", "getaddrinfo"))
         return _quality("fail" if conn else "unsupported",
                         lat_ms=int((time.monotonic() - t0) * 1000),
-                        error=nm, keyword=keyword)
+                        error=_err_text(exc), keyword=keyword)
 
 
 # ---- 独立库适配（catalog 通过 getattr 取用；公开构建无此块 → 自然降级） ----
@@ -1495,7 +1507,7 @@ async def _probe_spider_source(source: dict, keyword: str, timeout: float) -> di
                                "nxdomain", "enotfound", "getaddrinfo"))
         return _quality("fail" if conn else "unsupported",
                         lat_ms=int((time.monotonic() - t0) * 1000),
-                        error=nm, keyword=keyword)
+                        error=_err_text(exc), keyword=keyword)
 
 
 # ---- 独立库适配（catalog 通过 getattr 取用；公开构建无此块 → 自然降级） ----

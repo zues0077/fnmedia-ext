@@ -25,6 +25,9 @@ _log = get_logger("config")
 _STATE = Path(__file__).resolve().parent.parent / "state" / "config.json"
 _LOCK = threading.RLock()
 
+# 「参数未提供」哨兵：区分「没传这个字段」（保持原值）与「显式传了空值」（清空）。
+_UNSET = object()
+
 # 配置版本号：升级时按版本做迁移（见 Config.load）。
 # v2：多用户可见性默认改 fail-closed（acl_default_visible/acl_default_online
 # 由 True 改 False；旧配置首次加载时一次性翻成 False，见 load() 的 v1→v2 迁移）。
@@ -1191,7 +1194,9 @@ class Config:
         """新增一个订阅源。url 为空（纯内置）或 http(s)。重名/重 URL 拒绝。
 
         standalone=True：该订阅导入的苹果CMS源同时作为独立媒体库（后续每次
-        定时拉取也遵守此设置）。"""
+        定时拉取也遵守此设置）。
+        csp_keys：该订阅下用户勾选的 csp 爬虫 key 列表。None 表示「还没选过」
+        （定时拉取因此不导入任何 csp）；[] 表示「明确一个都不要」。"""
         name = (name or "").strip()
         url = (url or "").strip()
         if url and not url.startswith(("http://", "https://", "builtin:")):
@@ -1218,6 +1223,8 @@ class Config:
                 "update_interval_h": interval, "enabled": True,
                 "last_update": 0, "last_status": "", "fail_count": 0,
                 "last_error": "",
+                # None=未选过（定时拉取不导入 csp）；[]=明确全不选
+                "csp_keys": None,
             })
             cfg["subscriptions"] = subs
             self._persist(cfg)
@@ -1226,8 +1233,12 @@ class Config:
     def update_subscription(self, sid: str, *, name: str | None = None,
                             url: str | None = None,
                             update_interval_h: int | None = None,
-                            enabled: bool | None = None) -> tuple[bool, str]:
-        """编辑订阅源：改名/改址/改间隔/启停。"""
+                            enabled: bool | None = None,
+                            csp_keys=_UNSET) -> tuple[bool, str]:
+        """编辑订阅源：改名/改址/改间隔/启停/勾选的 csp 源。
+
+        csp_keys 用哨兵默认值区分「没传」（保持原值）与「显式传 []」（一个都不要）。
+        """
         with _LOCK:
             cfg = self.get()
             subs = cfg.get("subscriptions") or []
@@ -1254,6 +1265,10 @@ class Config:
                 target["update_interval_h"] = max(1, min(interval, 24 * 7))
             if enabled is not None:
                 target["enabled"] = bool(enabled)
+            if csp_keys is not _UNSET:
+                target["csp_keys"] = (None if csp_keys is None else
+                                      [str(k) for k in csp_keys
+                                       if str(k).strip()])
             cfg["subscriptions"] = subs
             self._persist(cfg)
             return True, "ok"

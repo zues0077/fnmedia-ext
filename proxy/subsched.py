@@ -118,7 +118,12 @@ async def _load_sites(sub: dict):
         raise RuntimeError("订阅无有效地址")
     sites, _subs, spider, base, _rules = await tvboxmod.load_subscription_full(url=url)
     if not sites:
-        raise RuntimeError("订阅解析结果为空")
+        # 2026-11-13：同一订阅会偶发「解析结果为空」（镜像/网络抖动，实测
+        # hafrey1 第一次 0 条、隔几秒第二次 69 条）。重试一次再判失败。
+        await asyncio.sleep(1.5)
+        sites, _subs, spider, base, _rules = await tvboxmod.load_subscription_full(url=url)
+    if not sites:
+        raise RuntimeError("订阅解析结果为空（已重试 1 次）")
     return sites, spider, base, url
 
 
@@ -215,16 +220,25 @@ async def refresh_subscription(sub_id: str, *, preview: bool = False,
     # （/source/health-check，25 秒超时 + 多热门词）确认后更新状态；
     # 真正失效的源由巡检自动禁用，不再拖慢导入、不再误杀。
     standalone = bool(sub.get("standalone"))
+    adult_auto: list[str] = []
     for c in cms_cands:
         key = c["api"].rstrip("/").lower()
         if key in existing:
             dup += 1
             continue
-        ok, _sid = cfg.add_source(c["name"], c["api"], True, standalone,
-                                  sub_id=sub_id, verified=False)
+        ok, sid = cfg.add_source(c["name"], c["api"], True, standalone,
+                                 sub_id=sub_id, verified=False)
         if ok:
             added_names.append(c["name"])
             existing.add(key)
+            # 成人站自动打 18（2026-11-13）：进「🔞福利」库，不混进普通搜索。
+            # 保守判定，导入后用户可随时取消。
+            try:
+                import catalog as _catalog
+                if _catalog.looks_adult_source(c["name"]) and cfg.set_adult(sid, True)[0]:
+                    adult_auto.append(c["name"])
+            except Exception:  # noqa: BLE001
+                pass
         else:
             dup += 1
         if len(added_names) >= 200:      # 上限从 60 放宽到 200
@@ -305,6 +319,7 @@ async def refresh_subscription(sub_id: str, *, preview: bool = False,
         "scanned": len(raw_sites),
         "cms_added": len(added_names),
         "added_names": added_names,
+        "adult_auto": adult_auto,
         "cms_dup": dup,
         # A1：导入不再探测，全部入库待巡检（cms_added 即待验证数）
         "cms_pending": len(added_names),

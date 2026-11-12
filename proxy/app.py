@@ -12358,7 +12358,8 @@ async def ext_import_subscription(request: Request):
     # ---------- 苹果 CMS：并发探测，通过即加入并启用 ----------
     existing = {s.get("api", "").rstrip("/").lower() for s in config.all_sources()}
     cms_added, cms_dup = [], 0
-    cms_failed: list[str] = []
+    cms_failed: list[tuple[str, str]] = []
+    cms_adult_auto: list[str] = []
     sem = asyncio.Semaphore(8)
 
     async def _probe(c):
@@ -12367,32 +12368,42 @@ async def ext_import_subscription(request: Request):
                 pr = await asyncio.wait_for(
                     providers.probe_source(c["api"], timeout=8.0), timeout=10)
             except Exception:
-                pr = {"ok": False}
+                pr = {"ok": False, "error": "探测超时"}
             return c, pr
 
-    checked = await asyncio.gather(*[_probe(c) for c in cms_cands[:80]])
+    # 单轮最多探测 200 个（原来 80，超出部分静默丢弃 → 用户看到「有源没采到」）
+    probe_list = cms_cands[:200]
+    checked = await asyncio.gather(*[_probe(c) for c in probe_list])
     for c, pr in checked:
         key = c["api"].rstrip("/").lower()
         if key in existing:
             cms_dup += 1
             continue
         if not pr.get("ok"):
-            cms_failed.append(c["name"][:20])
+            cms_failed.append((c["name"], str(pr.get("error") or "探测不可达")))
             continue
-        ok, _info = config.add_source(c["name"], c["api"], True, standalone,
-                                      sub_id=sub_id)
+        ok, sid = config.add_source(c["name"], c["api"], True, standalone,
+                                    sub_id=sub_id)
         if ok:
             cms_added.append(c["name"])
             existing.add(key)
+            # 成人站自动打 18：进「🔞福利」库而不是混进普通搜索/海量库。
+            # 判定很保守（名字带 🔞 或命中成人强特征词且不含体育/综艺等反向词），
+            # 导入后在资源站页随时可以取消。
+            try:
+                if catalogmod.looks_adult_source(c["name"]):
+                    if config.set_adult(sid, True)[0]:
+                        cms_adult_auto.append(c["name"])
+            except Exception:  # noqa: BLE001
+                pass
         else:
             cms_dup += 1
-        if len(cms_added) >= 60:
-            break
-    for nm in cms_failed:
-        tag = nm + "|探测不可达"
-        if not any(x.get("name") == nm and x.get("reason") == "探测不可达"
-                   for x in skipped):
-            skipped.append({"name": nm, "reason": "探测不可达"})
+    for nm, why in cms_failed:
+        skipped.append({"name": nm[:24], "reason": f"探测不可达（{why[:24]}）"})
+    if len(cms_cands) > len(probe_list):
+        for c in cms_cands[len(probe_list):]:
+            skipped.append({"name": c["name"][:24],
+                            "reason": "候选过多，本轮未探测（下次再导）"})
 
     # ---------- csp_*Guard 加固源（仅完整私有构建） ----------
     guard_report = None
@@ -12529,6 +12540,7 @@ async def ext_import_subscription(request: Request):
             "added": len(cms_added),
             "added_names": cms_added,
             "duplicate": cms_dup,
+            "adult_auto": cms_adult_auto,
         },
         "guard": guard_report,
         "csp": csp_report,

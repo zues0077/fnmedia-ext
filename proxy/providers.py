@@ -9,6 +9,7 @@ provider 只负责"搜索→条目→播放 URL 列表"，不做转码。
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 import urllib.parse
@@ -385,9 +386,17 @@ def _parse_play(vod_play_from: str, vod_play_note: str, vod_play_url: str,
         eps = []
         for item in raw_group.split("#"):
             item = item.strip()
-            if not item or "$" not in item:
+            if not item:
                 continue
-            name, url = item.split("$", 1)
+            if "$" in item:
+                name, url = item.split("$", 1)
+            elif _DIRECT_RE.match(item):
+                # 2026-11-13：部分站（msnii/xrbsp/gdlsp 一族）vod_play_url 直接给
+                # 裸地址、没有「名称$地址」结构（vod_play_from=ckplayer），
+                # 旧逻辑因缺 $ 把整条丢掉 → 搜得到但永远没有播放地址。
+                name, url = "", item
+            else:
+                continue
             url = url.strip()
             if not _DIRECT_RE.match(url):
                 continue
@@ -489,6 +498,70 @@ def _is_xml_api(api: str) -> bool:
     return "/at/xml" in (api or "").lower()
 
 
+def parse_cms_response(r, api: str = "") -> dict | None:
+    """从 HTTP 响应解析苹果CMS 数据，**保持旧路径优先**。
+
+    旧行为：/at/xml → parse_cms_xml，其余 r.json()。为了对现网源零影响，
+    这里仍然先走完全相同的分支；只有在 r.json() 失败（非标准路径返回
+    XML，如 /api/xml.php、/apple_m3u8.php、/feifei）时才回退到
+    parse_cms_payload 按内容解析。
+    """
+    if _is_xml_api(api):
+        return parse_cms_xml(r.text)
+    try:
+        return r.json()
+    except Exception:  # noqa: BLE001
+        return parse_cms_payload(getattr(r, "text", "") or "", api)
+
+
+def parse_cms_payload(text: str, api: str = "") -> dict | None:
+    """按内容解析苹果CMS 响应（2026-11-13）。
+
+    旧行为：/at/xml → parse_cms_xml，其余一律 json。问题是非标准路径的
+    真苹果CMS 站（/api/json.php、/inc/apijson_vod.php、/api/xml.php、
+    /apple_m3u8.php、/feifei）在运行时会被当 JSON 解析而失败。
+
+    新规则：URL 含 /at/xml 的仍先按 XML（旧路径不变）；其余**先按 JSON**，
+    解析失败才回退 XML。这样既保留所有现有 JSON 源的原有行为（成功即返回，
+    与 r.json() 完全一致），又能覆盖 xml.php 这类非标准路径。
+    """
+    body = text or ""
+    if _is_xml_api(api):
+        return parse_cms_xml(body)
+    try:
+        d = json.loads(body)
+        if isinstance(d, dict):
+            return d
+    except Exception:  # noqa: BLE001
+        pass
+    # 只有「看起来确实是 XML」才回退，避免把 HTML 错误页/挑战页解析成
+    # {"code":1,"list":[]} 这种假成功（旧行为会当解析失败报错）。
+    head = body.lstrip()[:200].lower()
+    if head.startswith("<?xml") or head.startswith("<rss") or "<rss" in head:
+        return parse_cms_xml(body)
+    return None
+
+
+def _cms_ok(j: dict | None) -> bool:
+    """苹果CMS 响应是否「成功」。
+
+    标准站返回 code==1；但也有站（如淘片 json.html）不返回 code，只要
+    list 里是带 vod_name 的条目、或分类接口带 class，就算成功。
+    现网所有 code==1 的源判定结果不变。
+    """
+    if not isinstance(j, dict):
+        return False
+    if j.get("code") in (1, "1"):
+        return True
+    if j.get("code") not in (None, ""):
+        return False
+    lst = j.get("list")
+    if isinstance(lst, list) and lst:
+        first = lst[0]
+        return isinstance(first, dict) and bool(first.get("vod_name") or first.get("vod_id"))
+    return "class" in j and isinstance(j.get("class"), list)
+
+
 def _map_vod(v: dict, source: dict) -> OnlineTitle | None:
     sources = _parse_play(v.get("vod_play_from", ""), v.get("vod_play_note", ""),
                           v.get("vod_play_url", ""), _site_root(source["api"]))
@@ -555,7 +628,7 @@ async def search_source(client: httpx.AsyncClient, source: dict,
                 _health.record(source.get("id", ""), False, time.monotonic() - _t0)
             return []
         # 苹果 CMS at/xml：RSS XML 响应，先转成与 at/json 等价的 dict
-        j = parse_cms_xml(r.text) if _is_xml_api(source["api"]) else r.json()
+        j = parse_cms_response(r, source["api"])
     except Exception as e:
         _log.warning("source search failed: id=%s error=%s elapsed=%.2fs",
                      source.get("id"), type(e).__name__, time.monotonic() - _t0)
@@ -564,7 +637,7 @@ async def search_source(client: httpx.AsyncClient, source: dict,
         return []
     if _health_on and _health is not None:
         _health.record(source.get("id", ""), True, time.monotonic() - _t0)
-    if not isinstance(j, dict) or j.get("code") not in (1, "1"):
+    if not _cms_ok(j):
         return []
     out = []
     dropped = 0
@@ -717,12 +790,12 @@ async def probe_source(api: str, keyword: str = "庆余年",
                         "elapsed_ms": ms, "count": 0, "sample": "",
                         "error": f"HTTP {r.status_code}"}
             # 同时支持 at/json 与 at/xml（XML 先转等价 dict）
-            j = parse_cms_xml(r.text) if _is_xml_api(api) else r.json()
+            j = parse_cms_response(r, api)
     except Exception as exc:
         return {"ok": False, "status": 0,
                 "elapsed_ms": int((time.monotonic() - t0) * 1000),
                 "count": 0, "sample": "", "error": type(exc).__name__}
-    if not isinstance(j, dict) or j.get("code") not in (1, "1"):
+    if not _cms_ok(j):
         return {"ok": False, "status": 200, "elapsed_ms": ms, "count": 0,
                 "sample": "", "error": "非苹果CMS JSON（code≠1）"}
     lst = j.get("list", []) or []
@@ -742,8 +815,8 @@ async def probe_source(api: str, keyword: str = "庆余年",
                 r2 = await client.get(
                     api, params={"ac": "list", "pg": 1},
                     headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
-                j2 = parse_cms_xml(r2.text) if _is_xml_api(api) else r2.json()
-            if isinstance(j2, dict) and j2.get("code") in (1, "1"):
+                j2 = parse_cms_response(r2, api)
+            if _cms_ok(j2):
                 return {"ok": True, "status": 200, "elapsed_ms": ms,
                         "count": 0, "sample": "",
                         "error": "接口正常（该词无结果）"}
@@ -836,7 +909,7 @@ async def probe_source_quality(source: dict, *, timeout: float = 25.0,
                 return out
             body = r.text or ""
             try:
-                j = parse_cms_xml(body) if _is_xml_api(api) else r.json()
+                j = parse_cms_response(r, api)
             except Exception:  # noqa: BLE001
                 low = body[:400].lower()
                 if "just a moment" in low or "cloudflare" in low:
@@ -856,14 +929,20 @@ async def probe_source_quality(source: dict, *, timeout: float = 25.0,
         return out
 
     if not isinstance(j, dict):
-        out.update(state="unsupported", error="非 dict 响应")
+        low = (body or "")[:400].lower()
+        if "just a moment" in low or "cloudflare" in low:
+            out.update(state="blocked", error="Cloudflare 挑战页")
+        else:
+            out.update(state="unsupported", error="非 dict 响应")
         return out
     code = j.get("code")
     lst = j.get("list") or []
     if isinstance(lst, dict):
         lst = lst.get("list") or []
     out["list_count"] = len(lst) if isinstance(lst, list) else 0
-    if code in (1, "1"):
+    # 非标准站（无 code、但有 class/list，如淘片 json.html）也算 ok：
+    # 它们的接口是活的，只是不带业务码。现网 code==1 的源判定不变。
+    if code in (1, "1") or (code in (None, "") and _cms_ok(j)):
         out.update(state="ok", ok=True, error="")
     else:
         # 业务码拒绝：1002 = 禁止关键词搜索，其它多为「需要 VIP/来源受限」。

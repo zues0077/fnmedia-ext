@@ -1645,9 +1645,13 @@ function renderClassRules(){
   const d=CLSR||{},pool=d.unclassified||{},rules=d.rules||{},cats=d.cats||[];
   const items=pool.items||[],total=pool.total||0,nNames=pool.names||0;
   const st=$("clsStat");
-  if(st)st.innerHTML=total
+  const failed=pool.failed||0;
+  const failTip=failed
+    ?' · <span class="tag warn" title="这些源本轮没连上，沿用上一轮结果，不参与本次统计">本轮 '+failed+' 个源未连通</span>'
+    :'';
+  if(st)st.innerHTML=(total
     ? '未归类 <b>'+total+'</b> 条（'+nNames+' 个不同名字）· 已生效 '+(rules.exact||0)+' 精确 + '+(rules.keyword||0)+' 关键词'
-    : '全部分类都认出来了 · 已生效 '+(rules.exact||0)+' 精确 + '+(rules.keyword||0)+' 关键词';
+    : '全部分类都认出来了 · 已生效 '+(rules.exact||0)+' 精确 + '+(rules.keyword||0)+' 关键词')+failTip;
 
   const box=$("clsPool");
   if(box){

@@ -602,6 +602,10 @@ class Catalog:
         # 叶子分类。不参与建库，只在管理页「未归类池」里露出来，让用户一眼看到
         # 漏了什么、点一下归类就写回规则库（见 classify_rules.json）。
         self._unclassified: dict[str, list[str]] = {}
+        # 本轮抓分类表失败的源：这些源保留上一轮结果不覆盖，管理页要如实标出来。
+        # 不标的话，用户看到的「未归类 N 条」其实是「本轮连通的那批源」的快照，
+        # 源一抖动数字就变，会被误判成规则失效（2026-11-12 实测：112 → 260）。
+        self._fetch_failed: set[str] = set()
 
     # 移植上游 v0.2.54（缓存管理）：清空海量库分类路由/分页/聚合缓冲
     # （管理页一键清缓存），下次浏览海量库时重新探测分类并深翻。
@@ -620,6 +624,7 @@ class Catalog:
             self._dense_count.clear()
             self._fallbacks.clear()
             self._unclassified.clear()
+            self._fetch_failed.clear()
             # >>> OPTIONAL:DISK CACHE
             # 「清缓存」要连落盘一起清：否则下次重启又会把旧表读回来，
             # 用户会以为按钮没生效。清完由调用方重新建库并再次落盘。
@@ -930,10 +935,19 @@ class Catalog:
         return self.status()
 
     async def _load_source_classes(self, client: httpx.AsyncClient, source: dict):
+        sid = str(source.get("id") or "")
         try:
             cls = await _fetch_class_list(client, source)
-        except Exception:
-            cls = []
+        except Exception as exc:  # noqa: BLE001
+            # 抓不到 ≠ 该源没有分类。超时/HTTP 错误时保留上一轮结果，不覆盖：
+            # 否则一轮抖动就会把已知分类表和未归类条目全清空，海量库路由忽多
+            # 忽少、池子数字忽大忽小（2026-11-12 实测 112 → 260 的根因）。
+            with self._lock:
+                self._fetch_failed.add(sid)
+            _log.info("class list fetch failed, keep last: %s (%s)", sid, exc)
+            return
+        with self._lock:
+            self._fetch_failed.discard(sid)
         # 只取叶子子类：苹果CMS 的父类（电影片/连续剧…）不聚合子类、只有零星条目，
         # 真正可深翻的是动作片/国产剧这类子分类。
         pids_with_child = {str(x.get("type_pid") or "0") for x in cls
@@ -1031,6 +1045,9 @@ class Catalog:
             return {
                 "updated_at": int(self._updated),
                 "unclassified": sum(len(v) for v in self._unclassified.values()),
+                # 本轮抓分类表失败的源数：这些源沿用上一轮结果，池子数字不含
+                # 它们的最新变化，管理页要据此提示「数字是快照不是全量」。
+                "source_failed": len(self._fetch_failed),
                 "categories": {
                     cat: {
                         "routes": len(self._routes.get(
@@ -1061,7 +1078,9 @@ class Catalog:
         items = [{"name": nm, "sources": len(sids), "sample": sorted(sids)[:3]}
                  for nm, sids in buckets.items()]
         items.sort(key=lambda x: (-x["sources"], x["name"]))
-        return {"total": total, "names": len(items), "items": items}
+        with self._lock:
+            failed = len(self._fetch_failed)
+        return {"total": total, "names": len(items), "items": items, "failed": failed}
 
     def _uhd_fallback_routes(self, scope: str) -> list[dict]:
         """4K 回退路由：源没有“4K”分类名时，借电影分类的路由翻页，

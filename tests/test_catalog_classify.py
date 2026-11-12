@@ -137,3 +137,50 @@ def test_child_class_inherits_parent(monkeypatch):
     assert "短剧大全" not in got and "电影片" not in got
     # 子分类自己认得出时以自己为准：理论片进福利库，不跟父类进电影库。
     assert got["理论片"] == catalog.ADULT_CAT
+
+
+def test_fetch_failure_keeps_last_result(monkeypatch):
+    """抓分类表失败时保留上一轮结果，不覆盖清空。
+
+    2026-11-12 实测：同一批源池子从 112 涨到 260、海量库路由 123→156，
+    根因是抓取异常被 `cls=[]` 当成「该源没有分类」写回，抖动一轮就把已知
+    路由和已暴露的未归类条目全清掉，看起来像规则忽好忽坏。
+    """
+    import asyncio
+
+    cat = catalog.Catalog()
+    cat._classes["s1"] = [{"type_id": 1, "type_name": "电影", "type_pid": "0",
+                           "cat": "movie"}]
+    cat._unclassified["s1"] = ["怪名字"]
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("timeout")
+
+    monkeypatch.setattr(catalog, "_fetch_class_list", boom)
+    asyncio.run(cat._load_source_classes(None, {"id": "s1"}))
+
+    assert [x["type_name"] for x in cat._classes["s1"]] == ["电影"]
+    assert cat._unclassified["s1"] == ["怪名字"]
+    assert cat.unclassified()["failed"] == 1
+    assert cat.status()["source_failed"] == 1
+
+
+def test_fetch_success_overwrites_and_clears_failed(monkeypatch):
+    """抓取成功时正常覆盖，并把该源从「本轮未连通」名单里摘掉。"""
+    import asyncio
+
+    cat = catalog.Catalog()
+    cat._classes["s1"] = [{"type_id": 9, "type_name": "旧分类", "type_pid": "0",
+                           "cat": "movie"}]
+    cat._unclassified["s1"] = ["旧名字"]
+    cat._fetch_failed.add("s1")
+
+    async def ok(*_a, **_k):
+        return [{"type_id": 1, "type_pid": 0, "type_name": "电影片"}]
+
+    monkeypatch.setattr(catalog, "_fetch_class_list", ok)
+    asyncio.run(cat._load_source_classes(None, {"id": "s1"}))
+
+    assert [x["type_name"] for x in cat._classes["s1"]] == ["电影片"]
+    assert cat._unclassified["s1"] == []
+    assert cat.unclassified()["failed"] == 0

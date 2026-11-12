@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -138,16 +139,46 @@ _AI_COMIC_KW = ("AI漫剧", "AI动漫", "AI漫画", "动态漫画", "漫剧")
 # P2 追加：TED学习（大小写不敏感，用小写匹配，见 classify）。
 _TED_KW = ("ted", "ted演讲", "tedx", "ted-ed", "ted演讲")
 _OVERSEAS_KW = ("海外剧", "美剧", "英剧", "韩剧", "日剧", "泰剧",
-                "港台剧", "欧美剧", "海外电视剧")
+                "港台剧", "欧美剧", "海外电视剧",
+                # 源站常把「港台剧」拆成具体地名写，之前一个都认不出来，
+                # 结果「香港剧/韩国剧」这类正常分类被当垃圾丢掉（见 2026-11-12 实测）。
+                "香港剧", "台湾剧", "韩国剧", "日本剧", "泰国剧",
+                "新加坡剧", "马来剧", "印度剧", "土耳其剧")
 # 成人向分类名：显式导向 ADULT 福利分类，绝不落入常规电影/剧集类。
 # 硬红线（_REDLINE_KW）在 is_redline 中先于本表拦截，任何开关都不放行。
-_ADULT_KW = ("福利", "伦理", "情色", "午夜", "写真", "里番", "成人")
+# 词表参照 LunaTV src/lib/yellow.ts，并按国内源站实际分类名补了「理论/三级/
+# 无码/有码/国产传媒/黑料吃瓜」等——这些名字不含「福利/伦理」二字，光靠
+# 原表认不出来，只能靠源级 18 标记兜底（见 classify_source_class）。
+# 英文词用小写写，匹配时对 n.lower() 做（Cosplay / SWAG 都能认）。
+_ADULT_KW = ("福利", "倫理", "伦理", "情色", "午夜", "写真", "里番", "成人",
+             "理论", "三级", "无码", "有码", "门事件", "国产传媒", "传媒",
+             "网红主播", "黑丝", "制服", "色情", "同性片", "热舞",
+             "自拍", "偷拍", "探花", "吃瓜", "黑料", "swag", "cosplay")
+# 明确非成人：即使该源打了「福利分类」标记（adult=true），下面这些分类也
+# 绝不进福利库。否则给一个综合站打上 18，会把体育和港台日韩剧全倒进福利库
+# ——2026-11-12 实测暴风资源 49 个分类里，打 18 后 17 个是这种误伤。
+_NON_ADULT_KW = (
+    # 体育项目：源站直接用品类名，不含「体育」二字，逃得过 _EXCLUDE_KW
+    "足球", "篮球", "网球", "排球", "乒乓", "羽毛球", "台球", "斯诺克",
+    "棒球", "冰球", "高尔夫", "赛车", "拳击", "格斗", "ufc", "nba",
+    "世界杯", "奥运", "亚运", "英超", "西甲", "意甲", "德甲", "中超",
+    "电竞", "游戏解说",
+    # 常规类型：正常应由 classify 收走，落到这里说明是没认出来的写法
+    "综艺", "真人秀", "脱口秀", "动漫", "动画", "番剧", "卡通",
+    "纪录片", "纪实", "短剧", "微短剧", "少儿", "儿童", "亲子",
+    "戏曲", "相声", "小品", "曲艺", "公开课", "教程", "网课",
+)
 # 电影：电影/影片/各类型“XX片”且非剧非动漫；剧：电视/连续剧/美剧/国产剧…
 _MOVIE_KW = ("电影", "影片")
 _TV_KW = ("电视", "连续剧", "剧集", "美剧", "英剧", "韩剧", "日剧", "泰剧",
           "国产剧", "港台剧", "海外剧", "番剧")
 # 明确排除的脏类（伦理/福利/资讯/解说/预告/体育/短剧等）
-_EXCLUDE_KW = ("理论", "福利", "写真", "午夜", "解说", "预告",
+# 注意：这里必须列全「XX片」形态的成人分类——classify 末尾有
+# 「以『片』结尾且 ≤4 字 → movie」的兜底，漏一个就会让成人分类漏进电影库
+# （实测「伦理片/情色片/三级片/成人片」全被判成 movie）。
+_EXCLUDE_KW = ("理论", "福利", "写真", "午夜", "伦理", "倫理", "情色",
+               "成人", "三级", "同性",
+               "解说", "预告",
                "花絮", "资讯", "新闻", "体育", "赛事", "漫剧", "AI",
                "演员", "音乐", "MV")
 
@@ -189,6 +220,322 @@ def _welfare_on() -> bool:
         return False
 
 
+# ==================== 本地分类规则库 ====================
+# 一份规则，所有源共用：分类名 -> 标准库 id（cat=None 表示「确认丢弃」）。
+#
+# 为什么要这一层：源站分类名五花八门。2026-11-12 在 246 实测 50 个连通源、
+# 1926 条分类，其中 509 条（26%）内置关键词表判不出来、被静默丢掉；未归类
+# 的不同名字有 156 个。靠代码里加词永远追不上，而且每加一个都得改代码发版。
+# 这里把「分类名 -> 库」外置成一份文件：
+#   - 所有源共用同一套答案，同一个分类名在哪个源都归同一个库；
+#   - 认不出的名字进「未归类池」，管理页可见，点一下归类就写回本文件，
+#     下次所有源同时生效；
+#   - 内置默认规则不写入文件，升级能带着新规则走，用户改过的条目以文件为准。
+#
+# 与内置关键词表的关系：规则优先级更高（除红线外），因为规则是「明确意志」；
+# 规则没命中才轮到 classify() 的关键词猜。cat=None 与「没认出来」是两回事：
+# 前者不再进未归类池，也不会被源级 18 兜底捞回福利库。
+_RULES_FILE = Path(__file__).resolve().parent.parent / "state" / "classify_rules.json"
+RULES_VERSION = 1
+
+# 默认规则，全部取自 246 实测的未归类名，只收实际观测到的、跨源通用的叫法。
+# 每条 (分类名, 目标库 或 None=丢弃, 是否精确匹配)。
+_DEFAULT_RULES: tuple[tuple[str, str | None, bool], ...] = (
+    # —— 体育：源站直接用品类名，不含「体育」二字，内置表认不出；没有对应媒体库 ——
+    ("足球", None, True), ("篮球", None, True), ("网球", None, True),
+    ("排球", None, True), ("乒乓球", None, True), ("羽毛球", None, True),
+    ("台球", None, True), ("斯诺克", None, True), ("棒球", None, True),
+    ("冰球", None, True), ("高尔夫", None, True), ("赛车", None, True),
+    ("拳击", None, True), ("格斗", None, True), ("ufc", None, True),
+    ("nba", None, True), ("cba", None, True), ("世界杯", None, True),
+    ("奥运", None, True), ("亚运", None, True), ("英超", None, True),
+    ("西甲", None, True), ("意甲", None, True), ("德甲", None, True),
+    ("中超", None, True), ("体育赛事", None, True), ("其他赛事", None, True),
+    ("体育", None, True), ("赛事", None, True), ("电竞", None, True),
+    ("网游", None, True), ("单机", None, True), ("手游", None, True),
+    ("游戏解说", None, True),
+    # —— 噪点：栏目、公告、解说、预告，没有对应媒体库 ——
+    ("预告片", None, True), ("预告", None, True), ("花絮", None, True),
+    ("资讯", None, True), ("新闻资讯", None, True), ("公告", None, True),
+    ("头条", None, True), ("影视解说", None, True), ("电影解说", None, True),
+    ("剧情介绍", None, True), ("未分类", None, True), ("中文字幕", None, True),
+    ("精品推荐", None, True), ("家庭篇", None, True), ("ai制作", None, True),
+    ("演唱会", None, True), ("儿童儿歌", None, True), ("科普学习", None, True),
+    # 涉暴力内容，任何库都不收（红线词表拦不到这一类名字）
+    ("强奸乱伦", None, True),
+    # —— 短剧子类：名字全是题材，光看名字判不出类型 ——
+    ("古装仙侠", "shortdrama", True), ("反转爽剧", "shortdrama", True),
+    ("现代都市", "shortdrama", True), ("脑洞悬疑", "shortdrama", True),
+    ("重生民国", "shortdrama", True), ("穿越年代", "shortdrama", True),
+    ("年代穿越", "shortdrama", True), ("女频恋爱", "shortdrama", True),
+    ("言情总裁", "shortdrama", True), ("成长逆袭", "shortdrama", True),
+    ("现代言情", "shortdrama", True), ("反转爽文", "shortdrama", True),
+    ("女恋总裁", "shortdrama", True), ("闪婚离婚", "shortdrama", True),
+    ("都市脑洞", "shortdrama", True),
+    # 「爽剧」是短剧站最通用的后缀，放宽成关键词（如「战神爽剧」）
+    ("爽剧", "shortdrama", False),
+    # —— 剧集别名（内置表只认「国产剧」这种写法）——
+    ("内地剧", "tv", True), ("大陆剧", "tv", True),
+    ("音乐片", "movie", True),          # 被内置表「音乐」误伤，其实是电影类型
+    # —— 海外剧集 ——
+    ("港剧", "overseas", True), ("台剧", "overseas", True),
+    ("港澳剧", "overseas", True), ("美国剧", "overseas", True),
+    ("东南亚剧", "overseas", True),
+    ("netflix", "overseas", False),     # Netflix 自制剧 / Netflix 电影
+    # —— 成人站分类名：一个字都不沾「福利/伦理」，只能靠规则点名 ——
+    ("视频一区", "adult", True), ("视频二区", "adult", True),
+    ("视频三区", "adult", True), ("国产精品", "adult", True),
+    ("欧美精品", "adult", True), ("日本精品", "adult", True),
+    ("两性课堂", "adult", True), ("成人动漫", "adult", True),
+    ("国产传媒", "adult", True), ("女同性恋", "adult", True),
+    ("男同性恋", "adult", True),
+)
+
+_rules_lock = threading.RLock()
+# (精确名 dict, 关键词按长度降序的元组)；None 表示尚未加载
+_rules_cache: tuple[dict[str, str | None],
+                    tuple[tuple[str, str | None], ...]] | None = None
+
+
+def _read_rule_file() -> list[dict]:
+    """只读用户规则（默认规则不落盘，随版本走）。"""
+    try:
+        data = json.loads(_RULES_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("classify rules read failed: %s", exc)
+        return []
+    rules = data.get("rules") if isinstance(data, dict) else None
+    return [r for r in (rules or []) if isinstance(r, dict)]
+
+
+def _write_rule_file(rules: list[dict]) -> bool:
+    try:
+        _RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _RULES_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(
+            {"v": RULES_VERSION, "updated": int(time.time()), "rules": rules},
+            ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, _RULES_FILE)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("classify rules write failed: %s", exc)
+        return False
+
+
+def _rule_index():
+    """合并默认规则与用户规则，建索引。用户同 key 同 exact 覆盖默认。"""
+    global _rules_cache
+    with _rules_lock:
+        if _rules_cache is not None:
+            return _rules_cache
+        exact: dict[str, str | None] = {}
+        kw: dict[str, str | None] = {}
+        for k, cat, is_exact in _DEFAULT_RULES:
+            (exact if is_exact else kw)[k.lower()] = cat
+        for r in _read_rule_file():
+            k = str(r.get("k") or "").strip().lower()
+            if not k:
+                continue
+            cat = r.get("cat")
+            cat = str(cat) if cat is not None else None
+            (exact if bool(r.get("exact", True)) else kw)[k] = cat
+        _rules_cache = (exact, tuple(sorted(kw.items(), key=lambda kv: -len(kv[0]))))
+        return _rules_cache
+
+
+def rule_hit(name: str) -> tuple[bool, str | None]:
+    """查规则。返回 (是否命中, 目标库)；命中且目标为 None = 确认丢弃。
+
+    精确名优先于关键词；关键词取最长者（「成人动漫」不会被「动漫」抢走，
+    虽然内置表里没有「动漫」这条规则，但用户可能自己加）。
+    """
+    n = (name or "").strip().lower()
+    if not n:
+        return (False, None)
+    exact, kws = _rule_index()
+    if n in exact:
+        return (True, exact[n])
+    for k, cat in kws:
+        if k and k in n:
+            return (True, cat)
+    return (False, None)
+
+
+def reload_rules() -> None:
+    """规则改动后清缓存，下次建库即生效。"""
+    global _rules_cache
+    with _rules_lock:
+        _rules_cache = None
+
+
+def set_rule(name: str, cat: str | None, exact: bool = True) -> tuple[bool, str]:
+    """新增/覆盖一条用户规则。cat=None 表示确认丢弃。"""
+    k = (name or "").strip()
+    if not k:
+        return False, "分类名不能为空"
+    if len(k) > 40:
+        return False, "分类名过长"
+    if cat is not None and cat not in all_cats() and cat != ADULT_CAT:
+        return False, "未知分类：%s" % cat
+    rules = [r for r in _read_rule_file()
+             if not (str(r.get("k") or "").strip().lower() == k.lower()
+                     and bool(r.get("exact", True)) == bool(exact))]
+    rules.append({"k": k, "cat": cat, "exact": bool(exact)})
+    if not _write_rule_file(rules):
+        return False, "写入失败（检查 state 目录权限）"
+    reload_rules()
+    return True, "已保存"
+
+
+def del_rule(name: str, exact: bool = True) -> tuple[bool, str]:
+    """删除一条用户规则，回落到默认规则（若默认里也有同名条目）。"""
+    k = (name or "").strip().lower()
+    if not k:
+        return False, "分类名不能为空"
+    rules = _read_rule_file()
+    kept = [r for r in rules
+            if not (str(r.get("k") or "").strip().lower() == k
+                    and bool(r.get("exact", True)) == bool(exact))]
+    if len(kept) == len(rules):
+        return False, "没有这条自定义规则（默认规则不可删除，可直接覆盖）"
+    if not _write_rule_file(kept):
+        return False, "写入失败（检查 state 目录权限）"
+    reload_rules()
+    return True, "已恢复默认"
+
+
+# ---------- 自定义虚拟库（用户手动新增/改名/删除的分类） ----------
+# 存 state/custom_cats.json：[{"id","title","mdb"}]。id 参与路由键与库 guid
+# （md5("fnmedia-catalog-lib:<id>")），必须 [a-z0-9]；mdb 决定客户端按
+# 电影/剧集/综合哪种翻页视图取片。内置 CATALOG_CATEGORIES 不动，自定义库
+# 永远追加在后面，保证固定库的 guid/顺序/契约一个都不变。
+
+_CUSTOM_MDB = ("Movie", "TV", "Mix")
+_CUSTOM_CATS_FILE = (Path(__file__).resolve().parent.parent / "state"
+                     / "custom_cats.json")
+
+
+def _read_custom_cats() -> list[dict]:
+    try:
+        data = json.loads(_CUSTOM_CATS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("custom cats read failed: %s", exc)
+        return []
+    out = []
+    for c in (data.get("cats") if isinstance(data, dict) else None) or []:
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("id") or "").strip()
+        title = str(c.get("title") or "").strip()
+        mdb = c.get("mdb") if c.get("mdb") in _CUSTOM_MDB else "Mix"
+        if cid and title:
+            out.append({"id": cid, "title": title, "mdb": mdb})
+    return out
+
+
+def _write_custom_cats(cats: list[dict]) -> bool:
+    try:
+        _CUSTOM_CATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CUSTOM_CATS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(
+            {"v": 1, "updated": int(time.time()), "cats": cats},
+            ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, _CUSTOM_CATS_FILE)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("custom cats write failed: %s", exc)
+        return False
+
+
+def custom_cats() -> list[dict]:
+    """自定义库列表（管理页 CRUD 与分类规则下拉都用它）。"""
+    return _read_custom_cats()
+
+
+def all_cats() -> list[str]:
+    """建库/路由用的完整分类池：固定 10 库 + 用户自定义库。"""
+    return CATS + [c["id"] for c in _read_custom_cats()]
+
+
+def iter_categories() -> list[tuple[str, str, str]]:
+    """固定 + 自定义的完整分类表：(cat, 展示名, MediaDB category)。
+
+    客户端建库、计数、预热等原来遍历 CATALOG_CATEGORIES 的地方一律换成
+    本函数，自定义库才能和固定库走同一条链路。
+    """
+    return list(CATALOG_CATEGORIES) + [
+        (c["id"], c["title"], c["mdb"]) for c in _read_custom_cats()]
+
+
+def set_custom_cat(title: str, mdb: str = "Mix",
+                   cat_id: str | None = None) -> tuple[bool, str, str | None]:
+    """新增（cat_id=None）或改名/改归属。返回 (ok, msg, id)。"""
+    title = (title or "").strip()
+    if not title:
+        return False, "库名不能为空", None
+    if len(title) > 20:
+        return False, "库名过长（≤20 字）", None
+    if mdb not in _CUSTOM_MDB:
+        return False, "内容归属必须是 Movie/TV/Mix", None
+    cats = _read_custom_cats()
+    if any(c["title"] == title for c in cats):
+        return False, "已有同名库", None
+    if cat_id:
+        hit = [c for c in cats if c["id"] == cat_id]
+        if not hit:
+            return False, "库不存在", None
+        hit[0]["title"] = title
+        hit[0]["mdb"] = mdb
+    else:
+        base = re.sub(r"[^a-z0-9]", "", title.lower())[:16] or "lib"
+        cid, n = base, 2
+        exist = {c["id"] for c in cats} | set(CATS) | {ADULT_CAT}
+        while cid in exist:
+            cid = "%s%d" % (base, n)
+            n += 1
+        cats.append({"id": cid, "title": title, "mdb": mdb})
+        cat_id = cid
+    if not _write_custom_cats(cats):
+        return False, "写入失败（检查 state 目录权限）", None
+    return True, "已保存", cat_id
+
+
+def del_custom_cat(cat_id: str) -> tuple[bool, str]:
+    cats = _read_custom_cats()
+    kept = [c for c in cats if c["id"] != cat_id]
+    if len(kept) == len(cats):
+        return False, "库不存在"
+    if not _write_custom_cats(kept):
+        return False, "写入失败（检查 state 目录权限）"
+    return True, "已删除"
+
+
+def rules_snapshot() -> dict:
+    """给管理页：有效规则统计 + 用户自定义规则列表。"""
+    exact, kws = _rule_index()
+    defaults = {(k.lower(), e) for k, _c, e in _DEFAULT_RULES}
+    users = []
+    for r in _read_rule_file():
+        k = str(r.get("k") or "").strip()
+        if not k:
+            continue
+        e = bool(r.get("exact", True))
+        users.append({"k": k, "cat": r.get("cat"), "exact": e,
+                      "overrides_default": (k.lower(), e) in defaults})
+    return {
+        "file": str(_RULES_FILE),
+        "file_exists": _RULES_FILE.exists(),
+        "exact": len(exact),
+        "keyword": len(kws),
+        "default_total": len(_DEFAULT_RULES),
+        "user": users,
+    }
+
+
 def is_redline(*texts: str) -> bool:
     for t in texts:
         if not t:
@@ -202,6 +549,9 @@ def is_redline(*texts: str) -> bool:
 def catalog_title(cat: str) -> str:
     if cat == ADULT_CAT:
         return "🔞福利"
+    for c in _read_custom_cats():
+        if c["id"] == cat:
+            return c["title"]
     for c, title, _ in CATALOG_CATEGORIES:
         if c == cat:
             return title
@@ -211,6 +561,9 @@ def catalog_title(cat: str) -> str:
 def catalog_mdb(cat: str) -> str:
     if cat == ADULT_CAT:
         return "Mix"
+    for c in _read_custom_cats():
+        if c["id"] == cat:
+            return c["mdb"]
     for c, _, mdb in CATALOG_CATEGORIES:
         if c == cat:
             return mdb
@@ -258,25 +611,38 @@ def classify_source_class(name: str, adult_allowed: bool) -> str | None:
     """按源的扩展授权决定分类归属。
 
     - 命中硬红线（涉未成年/非自愿）一律返回 None，任何开关都不放行；
-    - 常规四类走 classify（其内部脏类/中性噪音仍排除）；
-    - 仅当该源显式开启福利分类(adult_allowed)、且为完整构建时，未归入常规
-      四类、又不属于中性噪音/红线的分类，纳入内部福利分类（只进该源独立库）。
+    - 本地分类规则库优先于内置关键词表：规则命中的名字直接照规则归属，
+      命中「确认丢弃」(cat=None) 就丢弃，不再往下猜 —— 这是「一份规则管所有源」；
+    - 规则没命中才走 classify 的关键词猜测；
+    - 最后才用源级 18 授权把认不出的分类兜进福利库。
     """
     n = (name or "").strip()
     if not n or is_redline(n):
         return None
+    hit, rcat = rule_hit(n)
+    if hit:
+        if rcat is None:
+            return None
+        if rcat == ADULT_CAT and not _welfare_on():
+            return None
+        return rcat
     cat = classify(n)
     if cat:
         return cat
     if not _welfare_on():
         return None
+    nl = n.lower()
     if any(k in n for k in _NEUTRAL_KW):
         return None
-    # 伦理等成人向类目：独立开关打开即收编进 ADULT 池（无需逐源标记），
+    # 明确非成人的先挡掉：打了 18 也不能把体育/港台日韩剧倒进福利库。
+    if any(k in n or k in nl for k in _NON_ADULT_KW):
+        return None
+    # 成人词表命中：独立开关打开即收编进 ADULT 池（无需逐源标记），
     # 这样扩展库卡"打开开关就有内容"；硬红线已在函数开头拦截。
-    if any(k in n for k in _ADULT_KW):
+    if any(k in n or k in nl for k in _ADULT_KW):
         return ADULT_CAT
-    # 其余未归类福利分类：仍需该源显式勾选福利分类才纳入
+    # 其余「名字完全不沾关键词」的分类（如「视频一区」「国产视频」「黑料吃瓜」），
+    # 只有该源显式打了 18 才纳入——成人站全靠这一条兜底。
     if adult_allowed:
         return ADULT_CAT
     return None
@@ -347,6 +713,14 @@ class Catalog:
         self._dense_count: dict[str, int] = {}
         # (sid, cat) -> [备用叶子 route...]（首选分类探测失败时 rescue 得到）
         self._fallbacks: dict[tuple[str, str], list[dict]] = {}
+        # source_id -> [分类名...]：既没命中规则、也没被内置表/18 兜底认出来的
+        # 叶子分类。不参与建库，只在管理页「未归类池」里露出来，让用户一眼看到
+        # 漏了什么、点一下归类就写回规则库（见 classify_rules.json）。
+        self._unclassified: dict[str, list[str]] = {}
+        # 本轮抓分类表失败的源：这些源保留上一轮结果不覆盖，管理页要如实标出来。
+        # 不标的话，用户看到的「未归类 N 条」其实是「本轮连通的那批源」的快照，
+        # 源一抖动数字就变，会被误判成规则失效（2026-11-12 实测：112 → 260）。
+        self._fetch_failed: set[str] = set()
 
     # 移植上游 v0.2.54（缓存管理）：清空海量库分类路由/分页/聚合缓冲
     # （管理页一键清缓存），下次浏览海量库时重新探测分类并深翻。
@@ -364,6 +738,8 @@ class Catalog:
             self._scanned_page.clear()
             self._dense_count.clear()
             self._fallbacks.clear()
+            self._unclassified.clear()
+            self._fetch_failed.clear()
             # >>> OPTIONAL:DISK CACHE
             # 「清缓存」要连落盘一起清：否则下次重启又会把旧表读回来，
             # 用户会以为按钮没生效。清完由调用方重新建库并再次落盘。
@@ -431,6 +807,13 @@ class Catalog:
             self._classes = cls_ok
             self._routes = rt_ok
             self._updated = float(data.get("updated") or data.get("saved_at") or 0)
+            # 未归类池跟着落盘一起恢复：缓存路径不重建分类，内存里没有池子，
+            # 管理页会显示「没有未归类」——跟实际情况不符。旧文件没这个字段时
+            # 取空字典，向后兼容。
+            unc = data.get("unclassified") or {}
+            self._unclassified = {
+                str(k): [str(n) for n in v] for k, v in unc.items()
+                if isinstance(v, list) and (not cfg_ok or str(k) in live)}
         return True
 
     def save_disk(self) -> bool:
@@ -449,6 +832,7 @@ class Catalog:
                     "updated": int(self._updated),
                     "classes": {k: v for k, v in self._classes.items() if v},
                     "routes": {k: v for k, v in self._routes.items() if v},
+                    "unclassified": {k: v for k, v in self._unclassified.items() if v},
                 }
             _DISK_FILE.parent.mkdir(parents=True, exist_ok=True)
             tmp = _DISK_FILE.with_name(_DISK_FILE.name + ".tmp")
@@ -596,7 +980,7 @@ class Catalog:
                 out: dict[str, list[dict]] = {}
                 # 福利分类由 welfare_library_enabled 独立开关控制：
                 # 开关开 → 聚合与单源独立库都纳入 ADULT 池；开关关 → 一律不建。
-                cats = CATS + ([ADULT_CAT] if _welfare_on() else [])
+                cats = all_cats() + ([ADULT_CAT] if _welfare_on() else [])
                 for cat in cats:
                     if scope == AGG_SCOPE:
                         rs = [probed[(cat, sid)] for (c2, sid) in probed
@@ -651,7 +1035,7 @@ class Catalog:
             # <<< OPTIONAL:DISK CACHE
             warm_scopes = [sid for sid in self.standalone_scopes()
                            if any(self.available(c, sid) for c in
-                                  (CATS + ([ADULT_CAT] if _welfare_on() else [])))]
+                                  (all_cats() + ([ADULT_CAT] if _welfare_on() else [])))]
             for sid in warm_scopes:
                 asyncio.create_task(self.warm_standalone(sid))
             # 4K 派生预热：源没有 4K 分类时，后台先翻电影页把 4K 片抄进
@@ -666,27 +1050,70 @@ class Catalog:
         return self.status()
 
     async def _load_source_classes(self, client: httpx.AsyncClient, source: dict):
+        sid = str(source.get("id") or "")
         try:
             cls = await _fetch_class_list(client, source)
-        except Exception:
-            cls = []
+        except Exception as exc:  # noqa: BLE001
+            # 抓不到 ≠ 该源没有分类。超时/HTTP 错误时保留上一轮结果，不覆盖：
+            # 否则一轮抖动就会把已知分类表和未归类条目全清空，海量库路由忽多
+            # 忽少、池子数字忽大忽小（2026-11-12 实测 112 → 260 的根因）。
+            with self._lock:
+                self._fetch_failed.add(sid)
+            _log.info("class list fetch failed, keep last: %s (%s)", sid, exc)
+            return
+        with self._lock:
+            self._fetch_failed.discard(sid)
         # 只取叶子子类：苹果CMS 的父类（电影片/连续剧…）不聚合子类、只有零星条目，
         # 真正可深翻的是动作片/国产剧这类子分类。
-        parent_ids = {str(x.get("type_id")) for x in cls}
         pids_with_child = {str(x.get("type_pid") or "0") for x in cls
                            if str(x.get("type_pid") or "0") not in ("", "0")}
-        norm = []
         adult_allowed = bool(source.get("adult"))
+        # 父分类归属表：子分类名字认不出来时用它兜底继承。
+        # 短剧站的子类叫「重生民国 / 都市脑洞 / 古装仙侠 / 闪婚离婚」，光看名字
+        # 判不出类型（实测暴风资源 8 个这类分类）：不继承就会被「打 18」的兜底
+        # 吞进福利库；不打 18 时更糟——整个被丢掉，短剧库永远是空的。
+        parent_cat = {}
+        for x in cls:
+            try:
+                # 父类一律按「不带 18 授权」判，免得父类自己靠 adult 兜底成
+                # 福利库后，把子分类一起拖进去。
+                parent_cat[str(x.get("type_id"))] = classify_source_class(
+                    str(x.get("type_name") or ""), False)
+            except Exception:  # noqa: BLE001
+                continue
+        norm = []
+        missed: list[str] = []
         for x in cls:
             try:
                 tid = x.get("type_id")
+                if tid is None:
+                    continue
                 pid = str(x.get("type_pid") or "0")
                 name = str(x.get("type_name") or "")
-                cat = classify_source_class(name, adult_allowed)
-                if tid is None or cat is None:
-                    continue
                 is_leaf = pid != "0" or str(tid) not in pids_with_child
+                # 规则命中「确认丢弃」就直接跳过：既不再继承父类，也不走 18
+                # 兜底。否则给一个源打了 18，规则明明写了「足球丢弃」，还是会
+                # 被兜底捞进福利库。
+                hit, rcat = rule_hit(name)
+                if hit and rcat is None:
+                    continue
+                # 判断顺序很关键：① 只看名字（含本地规则）→ ② 认不出就继承
+                # 父类 → ③ 最后才用 18 授权兜底。反过来的话，18 兜底会把短剧
+                # 子类全吞进福利库。
+                cat = classify_source_class(name, False)
+                if cat is None and not hit and pid != "0" \
+                        and not any(k in name for k in _EXCLUDE_KW) \
+                        and not any(k in name.lower() for k in _NON_ADULT_KW):
+                    cat = parent_cat.get(pid)
+                if cat is None and not hit:
+                    cat = classify_source_class(name, adult_allowed)
                 if not is_leaf:
+                    continue
+                if cat is None:
+                    # 规则已命中但福利库关着，不算「没认出来」，别塞进池子让
+                    # 用户以为规则没生效。
+                    if not hit:
+                        missed.append(name)
                     continue
                 norm.append({"type_id": tid, "type_name": name,
                              "type_pid": pid, "cat": cat})
@@ -694,6 +1121,7 @@ class Catalog:
                 continue
         with self._lock:
             self._classes[source["id"]] = norm
+            self._unclassified[source["id"]] = missed
 
     def _source_by_id(self, sid: str) -> dict | None:
         try:
@@ -731,6 +1159,13 @@ class Catalog:
         with self._lock:
             return {
                 "updated_at": int(self._updated),
+                # 建库进行中：管理页保存规则后据此轮询，重建完成再刷池子，
+                # 不再让用户误以为「点了保存没作用」（池子是上一轮的快照）。
+                "refreshing": bool(self._refreshing),
+                "unclassified": sum(len(v) for v in self._unclassified.values()),
+                # 本轮抓分类表失败的源数：这些源沿用上一轮结果，池子数字不含
+                # 它们的最新变化，管理页要据此提示「数字是快照不是全量」。
+                "source_failed": len(self._fetch_failed),
                 "categories": {
                     cat: {
                         "routes": len(self._routes.get(
@@ -742,8 +1177,28 @@ class Catalog:
                         "pagecount": min(int((self._routes.get(
                             self._scope_key(AGG_SCOPE, cat)) or [{}])[0]
                             .get("pagecount") or 0), MAX_PAGES),
-                    } for cat, _, _ in CATALOG_CATEGORIES},
+                    } for cat, _, _ in iter_categories()},
             }
+
+    def unclassified(self) -> dict[str, Any]:
+        """未归类池：名字 + 涉及几个源 + 示例源 id，按涉及源数倒序。
+
+        给管理页「分类规则」卡片用：一屏列出没认出来的分类名，用户选个库
+        点保存 → 写进 classify_rules.json → 下次建库所有源同时生效。
+        """
+        with self._lock:
+            buckets: dict[str, set[str]] = {}
+            total = 0
+            for sid, names in self._unclassified.items():
+                for nm in names:
+                    buckets.setdefault(nm, set()).add(sid)
+                    total += 1
+        items = [{"name": nm, "sources": len(sids), "sample": sorted(sids)[:3]}
+                 for nm, sids in buckets.items()]
+        items.sort(key=lambda x: (-x["sources"], x["name"]))
+        with self._lock:
+            failed = len(self._fetch_failed)
+        return {"total": total, "names": len(items), "items": items, "failed": failed}
 
     def _uhd_fallback_routes(self, scope: str) -> list[dict]:
         """4K 回退路由：源没有“4K”分类名时，借电影分类的路由翻页，
@@ -1114,7 +1569,7 @@ class Catalog:
         """建库后后台预热独立库各分类首页，缓解慢源首屏空白。"""
         try:
             src = self._source_by_id(scope)
-            pool = CATS + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else CATS
+            pool = all_cats() + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else all_cats()
             await asyncio.gather(
                 *[self.get_page(c, 1, scope) for c in pool
                   if self.available(c, scope)],
@@ -1168,7 +1623,7 @@ class Catalog:
         再按排名轮次合并去重，最后按全局 offset 切片。
         """
         src = self._source_by_id(scope)
-        pool = CATS + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else CATS
+        pool = all_cats() + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else all_cats()
         cats = [c for c in pool if self.available(c, scope)]
         if not cats:
             return [], 0
@@ -1198,7 +1653,7 @@ class Catalog:
 
     def standalone_available(self, scope: str) -> bool:
         src = self._source_by_id(scope)
-        pool = CATS + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else CATS
+        pool = all_cats() + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else all_cats()
         return any(self.available(c, scope) for c in pool)
 
 

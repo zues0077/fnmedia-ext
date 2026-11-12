@@ -227,6 +227,33 @@ CATALOG_LIB_GUIDS: dict[str, str] = {
 }
 CATALOG_GUID_CAT = {g: c for c, g in CATALOG_LIB_GUIDS.items()}
 
+
+_CUSTOM_CAT_IDS: set[str] = set()
+
+
+def _refresh_custom_cat_guids() -> None:
+    """把自定义虚拟库的 guid 并进两张映射表（增/改/删后同步）。
+
+    自定义库 guid 与固定库同一派生规则：md5("fnmedia-catalog-lib:<id>")。
+    并入后，客户端建库卡片、显隐/授权/排序的 guid2key、库计数等既有逻辑
+    无需改动即自动覆盖自定义库；删库时把对应条目摘掉，客户端不再出现。
+    只动 _CUSTOM_CAT_IDS 里登记过的 id，固定库的 guid 永不触碰。
+    """
+    live = {c["id"] for c in catalogmod.custom_cats()}
+    for cid in live - _CUSTOM_CAT_IDS:
+        g = hashlib.md5(("fnmedia-catalog-lib:" + cid).encode()).hexdigest()
+        CATALOG_LIB_GUIDS.setdefault(cid, g)
+        CATALOG_GUID_CAT[g] = cid
+    for cid in _CUSTOM_CAT_IDS - live:
+        g = CATALOG_LIB_GUIDS.pop(cid, None)
+        if g:
+            CATALOG_GUID_CAT.pop(g, None)
+    _CUSTOM_CAT_IDS.clear()
+    _CUSTOM_CAT_IDS.update(live)
+
+
+_refresh_custom_cat_guids()
+
 # —— 单源独立媒体库：每个启用 standalone 的源生成一张库卡片 ——
 _STANDALONE_PREFIX = "fnmedia-standalone:"
 
@@ -2421,7 +2448,7 @@ async def _hot_worker(app: FastAPI):
         # 预热海量四库首屏：首次打开现抓多源页面要 6~19s，超过客户端等待就会
         # 显示“加载失败/空海报墙”。后台先抓一次，页面缓存命中后秒开。
         if catalog_on:
-            for _cat, _t, _x in catalogmod.CATALOG_CATEGORIES:
+            for _cat, _t, _x in catalogmod.iter_categories():
                 try:
                     if catalog.available(_cat):
                         await asyncio.wait_for(catalog.get_window(_cat, 0, 22),
@@ -4131,8 +4158,8 @@ async def mediadb_list(request: Request):
         # 海报只读本页/密集缓存，绝不在此联网抓取——TV/安卓 App 对该接口超时很敏感，
         # 一次资源站首页请求可能耗时十余秒，导致客户端提示“加载失败/媒体库不存在”。
         # 海量四库独立开关 catalog_library_enabled
-        if catalog_enabled() and any(catalog.available(c) for c, _, _ in catalogmod.CATALOG_CATEGORIES):
-            for cat, _t, _c in catalogmod.CATALOG_CATEGORIES:
+        if catalog_enabled() and any(catalog.available(c) for c, _, _ in catalogmod.iter_categories()):
+            for cat, _t, _c in catalogmod.iter_categories():
                 if not catalog.available(cat):
                     continue
                 ps = [inj._poster(p) for p in catalog.cached_page_posters(cat, 8)]
@@ -4171,7 +4198,7 @@ async def mediadb_list(request: Request):
             ps: list[str] = []
             # 同样只用缓存海报，不联网；后台预热会逐步填充海报
             try:
-                for cat in list(catalogmod.CATALOG_CATEGORIES):
+                for cat, _ct, _cm in catalogmod.iter_categories():
                     if catalog.available(cat, scope):
                         for p in catalog.cached_page_posters(cat, 8, scope):
                             if p not in ps:
@@ -4480,7 +4507,7 @@ async def mdb_detail(guid: str, request: Request):
         posters = []
         try:
             ps: list[str] = []
-            for cat in list(catalogmod.CATALOG_CATEGORIES):
+            for cat, _ct, _cm in catalogmod.iter_categories():
                 if catalog.available(cat, sscope):
                     for p in catalog.cached_page_posters(cat, 8, sscope):
                         if p not in ps:
@@ -4606,7 +4633,7 @@ async def mediadb_sum(request: Request):
                 payload["data"][CHART_LIB_GUIDS[cat]] = n
                 total_added += n
     if catalog_enabled():
-        for cat, _t, _c in catalogmod.CATALOG_CATEGORIES:
+        for cat, _t, _c in catalogmod.iter_categories():
             if catalog.available(cat):
                 n = catalog.total(cat)
                 if n:
@@ -4621,7 +4648,7 @@ async def mediadb_sum(request: Request):
     for s in standalone_sources_active():
         scope = s["id"]
         if catalog.standalone_available(scope):
-            pool = list(catalogmod.CATALOG_CATEGORIES)
+            pool = catalogmod.iter_categories()
             if catalogmod._welfare_on() and s.get("adult"):
                 pool = pool + [(catalogmod.ADULT_CAT, "", "")]
             n = sum(catalog.total(c, scope) for c, _, _ in pool)
@@ -5877,7 +5904,7 @@ async def item_detail(guid: str, request: Request):
     if sscope is not None and \
             any(s["id"] == sscope for s in standalone_sources_active()):
         src = next((s for s in config.all_sources() if s["id"] == sscope), {})
-        _pool = list(catalogmod.CATALOG_CATEGORIES)
+        _pool = catalogmod.iter_categories()
         if catalogmod._welfare_on() and src.get("adult"):
             _pool = _pool + [(catalogmod.ADULT_CAT, "", "")]
         n = sum(catalog.total(c, sscope) for c, _, _ in _pool)
@@ -10700,6 +10727,114 @@ async def ext_cache_clear(request: Request):
             "msg": "已清除：" + "、".join(done) + ("，服务重启中" if need_restart else "")}
 
 
+# --------------------------------------------------------------- 分类规则库
+# 「一份规则，所有源共用」：分类名的归属是全局唯一的，跟哪个源无关。
+# 规则落盘 state/classify_rules.json，内置默认规则不写盘（升级能带新规则走）。
+# 认不出来的分类名进「未归类池」，页面点一下归类就写回规则，下次建库全源生效。
+@app.get("/v/api/ext/classify/rules")
+async def ext_classify_rules(request: Request):
+    snap = catalogmod.rules_snapshot()
+    pool = catalog.unclassified()
+    cats = [{"id": c, "title": title}
+            for c, title, _ in catalogmod.iter_categories()]
+    cats.append({"id": catalogmod.ADULT_CAT,
+                 "title": catalogmod.catalog_title(catalogmod.ADULT_CAT)})
+    # 池子里带上示例源名，页面不用再翻一遍配置
+    try:
+        names = {s["id"]: (s.get("name") or s["id"]) for s in config.all_sources()}
+    except Exception:  # noqa: BLE001
+        names = {}
+    for it in pool.get("items") or []:
+        it["sample_names"] = [names.get(x, x) for x in (it.get("sample") or [])]
+    return {"code": 0, "data": {"rules": snap, "unclassified": pool, "cats": cats}}
+
+
+@app.post("/v/api/ext/classify/rule")
+async def ext_classify_rule(request: Request):
+    """增改/删除一条规则。
+
+    body: {name, cat, exact?, delete?}
+      - cat 为库 id → 归入该库；cat 为空/__drop__ → 确认丢弃（不再进未归类池）；
+      - delete=true → 删除这条自定义规则，回落默认规则。
+    """
+    body = await request.json()
+    name = str(body.get("name") or "").strip()
+    exact = bool(body.get("exact", True))
+    if body.get("delete"):
+        ok, msg = catalogmod.del_rule(name, exact)
+    else:
+        cat = body.get("cat")
+        if not isinstance(cat, str):
+            cat = None
+        else:
+            cat = cat.strip()
+            if cat in ("", "__drop__", "drop", "none", "null"):
+                cat = None
+        ok, msg = catalogmod.set_rule(name, cat, exact)
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    _schedule_routes_refresh()
+    return {"code": 0, "msg": msg, "data": catalogmod.rules_snapshot()}
+
+
+@app.post("/v/api/ext/classify/rebuild")
+async def ext_classify_rebuild(request: Request):
+    """按当前规则重建分类路由。后台跑，旧库在整表替换前一直可用。"""
+    _schedule_routes_refresh()
+    return {"code": 0, "msg": "已开始按当前规则重建，几十秒后刷新查看"}
+
+
+# ---------- 自定义虚拟库（手动新增/改名/删除分类） ----------
+
+@app.get("/v/api/ext/custom-cats")
+async def ext_custom_cats():
+    return {"code": 0, "data": {"cats": catalogmod.custom_cats(),
+                                "mdb_options": list(catalogmod._CUSTOM_MDB)}}
+
+
+@app.post("/v/api/ext/custom-cat")
+async def ext_custom_cat_add(request: Request):
+    """新建自定义库。body: {title, mdb?}，mdb ∈ Movie/TV/Mix。"""
+    body = await request.json()
+    ok, msg, _cid = catalogmod.set_custom_cat(
+        str(body.get("title") or ""), str(body.get("mdb") or "Mix"))
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    _refresh_custom_cat_guids()
+    _schedule_routes_refresh()
+    return {"code": 0, "msg": msg + "。建库完成后，分类规则下拉里就能选到它",
+            "data": {"cats": catalogmod.custom_cats()}}
+
+
+@app.post("/v/api/ext/custom-cat/update")
+async def ext_custom_cat_update(request: Request):
+    """改名/改内容归属。body: {id, title, mdb?}。"""
+    body = await request.json()
+    cid = str(body.get("id") or "").strip()
+    if not cid:
+        return JSONResponse({"code": 400, "msg": "缺少 id"}, status_code=400)
+    ok, msg, _ = catalogmod.set_custom_cat(
+        str(body.get("title") or ""), str(body.get("mdb") or "Mix"), cat_id=cid)
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    _refresh_custom_cat_guids()
+    _schedule_routes_refresh()
+    return {"code": 0, "msg": msg, "data": {"cats": catalogmod.custom_cats()}}
+
+
+@app.post("/v/api/ext/custom-cat/delete")
+async def ext_custom_cat_delete(request: Request):
+    """删除自定义库。原归到它的分类下次建库回到未归类池。body: {id}。"""
+    body = await request.json()
+    ok, msg = catalogmod.del_custom_cat(str(body.get("id") or "").strip())
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    _refresh_custom_cat_guids()
+    _schedule_routes_refresh()
+    return {"code": 0, "msg": msg + "。该库下分类将在下次建库回到未归类池",
+            "data": {"cats": catalogmod.custom_cats()}}
+
+
 # --------------------------------------------------------------- 管理令牌：状态 / 登录 / 轮换
 # 注意：admin_token 历史上只生成、从不校验；本模块只提供校验/轮换/限流
 # 检查点，不给既有 /v/api/ext/* 接口加鉴权门。用户决定（2026-11-09，
@@ -11058,7 +11193,7 @@ def _virtual_lib_list() -> list[dict]:
                     "title": title, "kind": "chart",
                     "group": "hot", "enabled": charts_enabled(),
                     "count": len(chart_cache.items(cat))})
-    for cat, title, _c in catalogmod.CATALOG_CATEGORIES:
+    for cat, title, _c in catalogmod.iter_categories():
         out.append({"guid": CATALOG_LIB_GUIDS[cat],
                     "key": vlibsmod.make_key(vlibsmod.K_CATALOG, cat),
                     "title": title, "kind": "catalog",
@@ -11615,8 +11750,9 @@ async def ext_source_adult(request: Request):
     target = next((s for s in config.all_sources() if s["id"] == sid), None)
     if not target:
         return JSONResponse({"code": 404, "msg": "源不存在"}, status_code=404)
-    if on and not target.get("standalone"):
-        return JSONResponse({"code": 400, "msg": "请先把该源设为独立媒体库"}, status_code=400)
+    # 18 是「源级内容授权」，作用在全局 🔞福利 库的分类归集上，与是否建独立库
+    # 无关——以前这里强制要求 standalone，导致「只想要福利内容、不想多一张库卡」
+    # 的用户被堵死。解绑后不勾「库」也能标 18。
     ok, info = config.set_adult(sid, on)
     if not ok:
         return JSONResponse({"code": 404, "msg": info}, status_code=404)
@@ -13823,6 +13959,15 @@ refresh();
         """mode=sites：可浏览加固源及其分类；hot：聚合各源首页推荐；
         category：某源某分类一页。均返回海报卡片（含可直接播放的 m3u8）。"""
         if not _guard.available():
+            # 分清两种「不可用」，别都甩一句「运行时未就绪」——实测 503 的真因
+            # 往往是「一个加固源都没有」（feature_on 要求 sites.json 或 imported.json
+            # 存在），此时容器其实是活的，提示人启动运行时会让人白折腾。
+            if not _guard.feature_on():
+                return JSONResponse(
+                    {"code": 503, "data": None,
+                     "msg": "还没有任何加固源：加固源不随插件内置，请用下方「导入加固源」"
+                            "导入一份含 csp_*Guard 的配置（TVBox type=3 DexGuard 源）后才能浏览"},
+                    status_code=503)
             return JSONResponse({"code": 503, "msg": "加固运行时未就绪，请先在本页启动 Android 运行时",
                                  "data": None}, status_code=503)
         limit = max(1, min(int(limit or 60), 120))

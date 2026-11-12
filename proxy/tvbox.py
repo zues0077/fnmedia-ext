@@ -33,8 +33,18 @@ MAX_SUB = 12
 MAX_DEPTH = 2
 
 _JSON_HINT = re.compile(r"provide/vod", re.I)
-# 苹果CMS XML 接口通常带 ac=list 或 provide/vod 且无 at/json；放宽以路径判定
-_CMS_PATH = re.compile(r"/provide/vod", re.I)
+# 苹果CMS 的接口路径五花八门（2026-11-13 实测订阅里真实存在）：
+#   /provide/vod/at/json、/inc/apijson.php、/api/json.php、/inc/apijson_vod.php、
+#   /api/xml.php、/apple_m3u8.php、/cjapi/mc/vod/json.html、/feifei……
+# 不再用路径白名单当门槛：只要不是网盘/直播/爬虫，http(s) 站点一律作为 CMS
+# 候选交给探测（ac=detail&wd 能返回条目才算通过），路径只用来判断 json/xml 倾向。
+_CMS_PATH = re.compile(
+    r"(/provide/vod|apijson|/api/json|json\.php|xml\.php|apple_m3u8|/cjapi/|/feifei)",
+    re.I
+)
+_CMS_JSON_HINT = re.compile(
+    r"(at/json|apijson|/api/json|json\.php|json\.html|format=json)", re.I
+)
 _SKIP_NAME = re.compile(r"(直播|电台|广播|iptv|卫视|央视|体育直播)", re.I)
 _PAN_HINT = re.compile(r"(quark|uc\.cn|aliyundrive|alipan|115|baidupcs|pan\.baidu|"
                        r"weiyun|xunlei|cloud189|ctfile|c189)", re.I)
@@ -377,19 +387,20 @@ def classify_site(site: dict) -> tuple[str, dict | None]:
         return "skip", None
     if t not in ("0", "1"):
         return "skip", None
+    # TVBox 规范里 type 0/1 就是苹果CMS 站：路径只用来判断 json/xml 倾向，
+    # 不再当准入门槛（2026-11-13：/inc/apijson.php、/api/json.php、/api/xml.php、
+    # /apple_m3u8.php、/feifei、/cjapi/mc/vod/json.html 都是真站，过去被路径白名单丢掉）。
+    # 真实可用性交给导入时的探测：ac=detail&wd 能返回条目才入库。
     if not _CMS_PATH.search(api):
-        # 部分配置 api 只给到域名/采集根，尝试补全 provide/vod
+        # 兼容「只给到域名/采集根」的写法：/api.php 结尾按 CMS 处理
         if re.search(r"/api\.php", low, re.I):
             api = api.split("?")[0].rstrip("/")
-        else:
-            return "skip", None
-    is_json = bool(re.search(r"at/json|/json(\?|$)|format=json", api, re.I))
+    is_json = bool(_CMS_JSON_HINT.search(api))
     if is_json:
         norm_api = api
     else:
         # 统一为苹果CMS JSON 接口：/provide/vod[/] → /provide/vod/at/json，
-        # 保留原有 query（如采集站 token）。仅支持 XML 的站点已由
-        # providers.parse_cms_xml 在运行时解析，不再剔除。
+        # 保留原有 query（如采集站 token）。仅支持 XML 的站点由运行时按内容解析。
         m = re.match(r"^(.*?/provide/vod)/?(\?.*)?$", api, re.I)
         if m:
             norm_api = m.group(1).rstrip("/") + "/at/json" + (m.group(2) or "")
@@ -501,6 +512,20 @@ def _spider_jar_url(spider: str, base: str = "") -> str:
     if not s:
         return ""
     return urljoin(base, s)
+
+
+def _abs_api(api: str, base: str) -> str:
+    """相对 api 补成绝对地址。
+
+    只补以 "." 或 "/" 开头的路径（订阅里 " ./js/ss/x.js"、"/api.php/…" 这种）；
+    "csp_XBPQ"、"py_xxx" 这类是类名/脚本名，原样返回不补。
+    """
+    api = (api or "").strip()
+    if not api or not base:
+        return api
+    if api.startswith((".", "/")):
+        return urljoin(base, api)
+    return api
 
 
 def is_drpy_site(site: dict) -> bool:
@@ -680,6 +705,9 @@ def classify_subscription(sites: list[dict], spider: str = "",
             if api.startswith(("py_", "java_", "sp_")):
                 _skip(name, "Python/Java 内置脚本源（不支持）")
                 continue
+            if low.endswith(".py") or ".py?" in low:
+                _skip(name, "Python 脚本源（需 py 运行时，本插件不支持）")
+                continue
             _skip(name, "其它爬虫源（无法识别运行时）")
             continue
         if _PAN_HINT.search(api) or _PAN_API.search(api) or _PAN_HINT.search(name):
@@ -744,8 +772,12 @@ async def load_subscription_full(url: str | None = None,
         sub_jar = _spider_jar_url(sub_spider, sub_base)
         for st in extract_sites(cfg):
             if isinstance(st, dict):
-                if str(st.get("type")) == "4" and sub_base and st.get("api"):
-                    st["api"] = urljoin(sub_base, str(st.get("api") or ""))
+                # 相对路径补全（2026-11-13）：订阅里常见 "./js/ss/xxx.js"、"/api.php/…"。
+                # 过去只对 type=4 补全，其它相对地址一律被判「非 http」丢掉；
+                # 现在凡是以 . 或 / 开头的 api 都按订阅地址补成绝对地址。
+                _api_raw = str(st.get("api") or "").strip()
+                if _api_raw:
+                    st["api"] = _abs_api(_api_raw, sub_base)
                 if sub_jar and not st.get("_spider_jar"):
                     st["_spider_jar"] = sub_jar
                 # 站点自带 jar（饭太硬部分源用伪装成 PNG 的独立 jar），优先级高于全局。

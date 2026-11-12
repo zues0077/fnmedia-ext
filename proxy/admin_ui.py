@@ -2445,8 +2445,14 @@ function renderSubResult(d){
     +(d.subscriptions?('（含 '+d.subscriptions+' 个子订阅）'):'')+'，新增登记 <b style="color:var(--ok,#3a9)">'+totalOk+'</b> 个。</div>';
   // 苹果CMS
   if(cms.candidates||cms.added||cms.duplicate){
-    const rows=subList(cms.added_names||[],n=>'<div class="subrow ok"><span>＋ '+esc(n)+'</span><span class="tag">已启用</span></div>');
-    h+=subGrp('🍿 苹果CMS影视站　新增 '+cmsOk+' · 已存在 '+(cms.duplicate||0),rows,(cms.added_names||[]).length);
+    const rows=subList(cms.added_names||[],n=>'<div class="subrow ok"><span>＋ '+esc(n)+'</span><span class="tag">已启用</span></div>')
+      +((cms.adult_auto||[]).length
+        ?'<div class="muted sm" style="padding:4px 2px">其中 '+cms.adult_auto.length+' 个按名字判定为成人站，已自动标「18」进福利库（可在资源站页取消）：'
+          +esc(cms.adult_auto.join("、"))+'</div>'
+        :'');
+    h+=subGrp('🍿 苹果CMS影视站　新增 '+cmsOk+' · 已存在 '+(cms.duplicate||0)
+      +((cms.adult_auto||[]).length?(' · 自动标 18 '+cms.adult_auto.length):''),
+      rows,(cms.added_names||[]).length);
   }
   if(t4.candidates||t4.added||t4.duplicate){
     const rows=subList(t4.added_names||[],n=>'<div class="subrow ok"><span>＋ '+esc(n)+'</span><span class="tag">已登记</span></div>');

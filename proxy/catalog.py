@@ -546,6 +546,32 @@ def is_redline(*texts: str) -> bool:
     return False
 
 
+# 源名专用成人特征词（比分类词表更严：打错 18 会让该源从全局搜索里消失，
+# 所以只放「基本不可能出现在正经站名里」的词）。
+_ADULT_SRC_KW = ("🔞", "porn", "jav", "91", "avzy", "麻豆", "糖心", "海角",
+                 "含羞草", "swag", "hanime", "女优", "无码", "福利")
+
+
+def looks_adult_source(name: str) -> bool:
+    """按源名判断是否成人源（订阅导入时自动标 18 用）。
+
+    保守优先：adult=True 的源会被排除出全局搜索（app.search_all 的分层），
+    误判会直接让一个正常源「搜不到」。所以只认强特征：
+      1) 名字带 🔞；
+      2) 命中 _ADULT_SRC_KW（porn/jav/91/麻豆/糖心/海角…）；
+      3) 命中分类词表 _ADULT_KW 且不含 _NON_ADULT_KW（体育/综艺等反向词）。
+    导入后用户可在资源站页随时取消 18。
+    """
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    if "🔞" in n or any(k in n for k in _ADULT_SRC_KW):
+        return True
+    if any(k in n for k in _NON_ADULT_KW):
+        return False
+    return any(k in n for k in _ADULT_KW)
+
+
 def catalog_title(cat: str) -> str:
     if cat == ADULT_CAT:
         return "🔞福利"

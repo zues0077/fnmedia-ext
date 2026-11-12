@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -376,7 +377,7 @@ def set_rule(name: str, cat: str | None, exact: bool = True) -> tuple[bool, str]
         return False, "分类名不能为空"
     if len(k) > 40:
         return False, "分类名过长"
-    if cat is not None and cat not in CATS and cat != ADULT_CAT:
+    if cat is not None and cat not in all_cats() and cat != ADULT_CAT:
         return False, "未知分类：%s" % cat
     rules = [r for r in _read_rule_file()
              if not (str(r.get("k") or "").strip().lower() == k.lower()
@@ -403,6 +404,114 @@ def del_rule(name: str, exact: bool = True) -> tuple[bool, str]:
         return False, "写入失败（检查 state 目录权限）"
     reload_rules()
     return True, "已恢复默认"
+
+
+# ---------- 自定义虚拟库（用户手动新增/改名/删除的分类） ----------
+# 存 state/custom_cats.json：[{"id","title","mdb"}]。id 参与路由键与库 guid
+# （md5("fnmedia-catalog-lib:<id>")），必须 [a-z0-9]；mdb 决定客户端按
+# 电影/剧集/综合哪种翻页视图取片。内置 CATALOG_CATEGORIES 不动，自定义库
+# 永远追加在后面，保证固定库的 guid/顺序/契约一个都不变。
+
+_CUSTOM_MDB = ("Movie", "TV", "Mix")
+_CUSTOM_CATS_FILE = (Path(__file__).resolve().parent.parent / "state"
+                     / "custom_cats.json")
+
+
+def _read_custom_cats() -> list[dict]:
+    try:
+        data = json.loads(_CUSTOM_CATS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("custom cats read failed: %s", exc)
+        return []
+    out = []
+    for c in (data.get("cats") if isinstance(data, dict) else None) or []:
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("id") or "").strip()
+        title = str(c.get("title") or "").strip()
+        mdb = c.get("mdb") if c.get("mdb") in _CUSTOM_MDB else "Mix"
+        if cid and title:
+            out.append({"id": cid, "title": title, "mdb": mdb})
+    return out
+
+
+def _write_custom_cats(cats: list[dict]) -> bool:
+    try:
+        _CUSTOM_CATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CUSTOM_CATS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(
+            {"v": 1, "updated": int(time.time()), "cats": cats},
+            ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, _CUSTOM_CATS_FILE)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("custom cats write failed: %s", exc)
+        return False
+
+
+def custom_cats() -> list[dict]:
+    """自定义库列表（管理页 CRUD 与分类规则下拉都用它）。"""
+    return _read_custom_cats()
+
+
+def all_cats() -> list[str]:
+    """建库/路由用的完整分类池：固定 10 库 + 用户自定义库。"""
+    return CATS + [c["id"] for c in _read_custom_cats()]
+
+
+def iter_categories() -> list[tuple[str, str, str]]:
+    """固定 + 自定义的完整分类表：(cat, 展示名, MediaDB category)。
+
+    客户端建库、计数、预热等原来遍历 CATALOG_CATEGORIES 的地方一律换成
+    本函数，自定义库才能和固定库走同一条链路。
+    """
+    return list(CATALOG_CATEGORIES) + [
+        (c["id"], c["title"], c["mdb"]) for c in _read_custom_cats()]
+
+
+def set_custom_cat(title: str, mdb: str = "Mix",
+                   cat_id: str | None = None) -> tuple[bool, str, str | None]:
+    """新增（cat_id=None）或改名/改归属。返回 (ok, msg, id)。"""
+    title = (title or "").strip()
+    if not title:
+        return False, "库名不能为空", None
+    if len(title) > 20:
+        return False, "库名过长（≤20 字）", None
+    if mdb not in _CUSTOM_MDB:
+        return False, "内容归属必须是 Movie/TV/Mix", None
+    cats = _read_custom_cats()
+    if any(c["title"] == title for c in cats):
+        return False, "已有同名库", None
+    if cat_id:
+        hit = [c for c in cats if c["id"] == cat_id]
+        if not hit:
+            return False, "库不存在", None
+        hit[0]["title"] = title
+        hit[0]["mdb"] = mdb
+    else:
+        base = re.sub(r"[^a-z0-9]", "", title.lower())[:16] or "lib"
+        cid, n = base, 2
+        exist = {c["id"] for c in cats} | set(CATS) | {ADULT_CAT}
+        while cid in exist:
+            cid = "%s%d" % (base, n)
+            n += 1
+        cats.append({"id": cid, "title": title, "mdb": mdb})
+        cat_id = cid
+    if not _write_custom_cats(cats):
+        return False, "写入失败（检查 state 目录权限）", None
+    return True, "已保存", cat_id
+
+
+def del_custom_cat(cat_id: str) -> tuple[bool, str]:
+    cats = _read_custom_cats()
+    kept = [c for c in cats if c["id"] != cat_id]
+    if len(kept) == len(cats):
+        return False, "库不存在"
+    if not _write_custom_cats(kept):
+        return False, "写入失败（检查 state 目录权限）"
+    return True, "已删除"
 
 
 def rules_snapshot() -> dict:
@@ -440,6 +549,9 @@ def is_redline(*texts: str) -> bool:
 def catalog_title(cat: str) -> str:
     if cat == ADULT_CAT:
         return "🔞福利"
+    for c in _read_custom_cats():
+        if c["id"] == cat:
+            return c["title"]
     for c, title, _ in CATALOG_CATEGORIES:
         if c == cat:
             return title
@@ -449,6 +561,9 @@ def catalog_title(cat: str) -> str:
 def catalog_mdb(cat: str) -> str:
     if cat == ADULT_CAT:
         return "Mix"
+    for c in _read_custom_cats():
+        if c["id"] == cat:
+            return c["mdb"]
     for c, _, mdb in CATALOG_CATEGORIES:
         if c == cat:
             return mdb
@@ -865,7 +980,7 @@ class Catalog:
                 out: dict[str, list[dict]] = {}
                 # 福利分类由 welfare_library_enabled 独立开关控制：
                 # 开关开 → 聚合与单源独立库都纳入 ADULT 池；开关关 → 一律不建。
-                cats = CATS + ([ADULT_CAT] if _welfare_on() else [])
+                cats = all_cats() + ([ADULT_CAT] if _welfare_on() else [])
                 for cat in cats:
                     if scope == AGG_SCOPE:
                         rs = [probed[(cat, sid)] for (c2, sid) in probed
@@ -920,7 +1035,7 @@ class Catalog:
             # <<< OPTIONAL:DISK CACHE
             warm_scopes = [sid for sid in self.standalone_scopes()
                            if any(self.available(c, sid) for c in
-                                  (CATS + ([ADULT_CAT] if _welfare_on() else [])))]
+                                  (all_cats() + ([ADULT_CAT] if _welfare_on() else [])))]
             for sid in warm_scopes:
                 asyncio.create_task(self.warm_standalone(sid))
             # 4K 派生预热：源没有 4K 分类时，后台先翻电影页把 4K 片抄进
@@ -1044,6 +1159,9 @@ class Catalog:
         with self._lock:
             return {
                 "updated_at": int(self._updated),
+                # 建库进行中：管理页保存规则后据此轮询，重建完成再刷池子，
+                # 不再让用户误以为「点了保存没作用」（池子是上一轮的快照）。
+                "refreshing": bool(self._refreshing),
                 "unclassified": sum(len(v) for v in self._unclassified.values()),
                 # 本轮抓分类表失败的源数：这些源沿用上一轮结果，池子数字不含
                 # 它们的最新变化，管理页要据此提示「数字是快照不是全量」。
@@ -1059,7 +1177,7 @@ class Catalog:
                         "pagecount": min(int((self._routes.get(
                             self._scope_key(AGG_SCOPE, cat)) or [{}])[0]
                             .get("pagecount") or 0), MAX_PAGES),
-                    } for cat, _, _ in CATALOG_CATEGORIES},
+                    } for cat, _, _ in iter_categories()},
             }
 
     def unclassified(self) -> dict[str, Any]:
@@ -1451,7 +1569,7 @@ class Catalog:
         """建库后后台预热独立库各分类首页，缓解慢源首屏空白。"""
         try:
             src = self._source_by_id(scope)
-            pool = CATS + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else CATS
+            pool = all_cats() + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else all_cats()
             await asyncio.gather(
                 *[self.get_page(c, 1, scope) for c in pool
                   if self.available(c, scope)],
@@ -1505,7 +1623,7 @@ class Catalog:
         再按排名轮次合并去重，最后按全局 offset 切片。
         """
         src = self._source_by_id(scope)
-        pool = CATS + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else CATS
+        pool = all_cats() + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else all_cats()
         cats = [c for c in pool if self.available(c, scope)]
         if not cats:
             return [], 0
@@ -1535,7 +1653,7 @@ class Catalog:
 
     def standalone_available(self, scope: str) -> bool:
         src = self._source_by_id(scope)
-        pool = CATS + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else CATS
+        pool = all_cats() + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else all_cats()
         return any(self.available(c, scope) for c in pool)
 
 

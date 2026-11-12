@@ -139,6 +139,14 @@ label.btn:hover,label.btn-sm:hover{background:var(--accent-soft)}
 .stat .n{font-size:22px;font-weight:700}
 .stat .l{font-size:12px;color:var(--muted)}
 .lib-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+/* 分类规则：一行一个名字，紧凑不铺满整屏 */
+.cls-rows{display:flex;flex-direction:column;gap:6px;margin:8px 0}
+.cls-row{display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--line);
+  border-radius:8px;background:var(--card)}
+.cls-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+.cls-row select{flex:none;max-width:170px}
+.cls-row .tag{flex:none}
+@media (max-width:600px){.cls-row{flex-wrap:wrap}.cls-name{flex-basis:100%}}
 .lib{display:flex;align-items:center;gap:10px;background:#fafbfc;border:1px solid var(--line);
   border-radius:10px;padding:10px 12px}
 .lib .ic{font-size:20px}
@@ -325,6 +333,20 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
       </div>
 
       <div class="card">
+        <div class="card-title">分类规则（一份规则，所有源共用）</div>
+        <p class="card-sub">资源站分类名五花八门（古装仙侠 / 视频一区 / 足球），靠猜必然漏。
+          这里把归属定死：<b>同一个分类名，在哪个源都归同一个库</b>。下面列的是系统认不出来的名字，
+          选个库点「保存」就写进规则，下次建库所有源同时生效。</p>
+        <div class="hint" id="clsStat">加载中…</div>
+        <div id="clsPool"></div>
+        <div id="clsUser"></div>
+        <div class="btn-row">
+          <button class="small" onclick="loadClassRules()">刷新</button>
+          <button class="primary small" onclick="clsRebuild()">按当前规则重建海量库</button>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="card-title">③ 其他注入库</div>
         <p class="card-sub">独立源库 / 加固 / 小雅 / 红果短剧。每张卡可单独置顶或隐藏（隐藏后所有账号都看不到）。</p>
         <div class="lib-grid" id="otherLibs"></div>
@@ -372,11 +394,11 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
 
       <div class="card">
         <div class="card-title">🔞 福利（独立开关）</div>
-        <p class="card-sub">仅在已勾选「福利分类」的资源站里浏览成人向片库。默认关闭：完全不建路由、不抓取、不显示。</p>
+        <p class="card-sub">开启后生成一张「🔞福利」库，收录各源命中的成人分类（伦理 / 福利 / 理论片 / 三级 …）。默认关闭：完全不建路由、不抓取、不显示。</p>
         <label class="switch-row">
           <input type="checkbox" id="welfareEnabled"/>
           <span>启用福利库
-            <span class="sub">需配合「资源站」页的福利分类标记才生效</span></span>
+            <span class="sub">分类名命中的自动收录；名字不沾关键词的成人分类，去「资源站」页给该源打 🔞 标记</span></span>
         </label>
         <div class="btn-row">
           <button class="primary small" onclick="saveWelfareCfg()">保存扩展设置</button>
@@ -462,9 +484,9 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
             <input type="checkbox" id="addStandalone" style="width:15px;height:15px;accent-color:var(--accent)"/>独立库</label>
           <button class="primary small" style="justify-content:center" onclick="addSource()">添加</button>
         </div>
-        <div class="hint">「独立库」= 该站单独生成一张媒体库卡片；「非过滤」= 不按标题/备注过滤解说/预告/花絮；
+        <div class="hint">「库」= 该站单独生成一张媒体库卡片；「非过滤」= 该独立库内不按标题/备注过滤解说/预告/花絮（<strong>依附「库」</strong>，没勾库就没有作用对象）；
           <!-- >>> PRIVATE:ADULT -->
-          「🔞」= 把该独立库标记为限制级（18+）：与主库隔离、不进全局搜索，开启需二次确认；
+          「🔞」= 把该源的内容标记为限制级（18+）：福利分类收进全局「🔞福利」库、不进全局搜索（<strong>源级属性，与「库」无关</strong>，不勾库也能标），开启需二次确认；
           <!-- <<< PRIVATE:ADULT -->
           删除内置源仅隐藏，可恢复。批量导入 TVBox 订阅请用左侧「导入订阅」。</div>
         <div id="cmsHealthResult" class="muted sm" style="margin-top:8px"></div>
@@ -1034,7 +1056,7 @@ async function switchPage(page){
   window.scrollTo(0,0);
   if(page==="overview"){renderOverview();startLivePoll();}
   else{stopLivePoll();}
-  if(page==="library"){loadLibs().then(renderLibrary);}
+  if(page==="library"){loadLibs().then(renderLibrary);try{loadClassRules();}catch(e){}}
   if(page==="quality")renderQuality();
   if(page==="sources"){try{loadHealth();}catch(e){}try{loadProxy();}catch(e){}try{loadPatrol();}catch(e){}try{loadRemoved();}catch(e){}}
   if(page==="search"){try{loadCacheStatus();}catch(e){}}
@@ -1580,6 +1602,113 @@ async function saveWelfareCfg(){
   if(r.code===0){Object.assign(CFG,body);toast(body.welfare_library_enabled?"已启用福利库":"已关闭福利库");}
   else toast(r.msg||"保存失败","fail");
 }
+
+/* ---------- 分类规则：一份规则，所有源共用 ---------- */
+let CLSR=null,clsOpen=false;
+
+async function loadClassRules(){
+  const pool=$("clsPool");
+  if(pool&&!pool.innerHTML)pool.innerHTML='<div class="muted sm">加载中…</div>';
+  try{
+    const r=await jget("/v/api/ext/classify/rules",25000);
+    CLSR=r.data||{};
+    renderClassRules();
+  }catch(e){
+    if(pool)pool.innerHTML='<div class="muted sm">加载失败：'+esc(e.message||e)+'</div>';
+  }
+}
+
+function clsCatTitle(cats,id){
+  if(!id)return "✕ 丢弃";
+  const c=(cats||[]).find(x=>x.id===id);
+  return c?c.title:id;
+}
+
+function clsOpts(cats){
+  return '<option value="">— 选库 —</option>'
+    +(cats||[]).map(c=>'<option value="'+esc(c.id)+'">'+esc(c.title)+'</option>').join("")
+    +'<option value="__drop__">✕ 不收录（丢弃）</option>';
+}
+
+function clsRow(it,cats){
+  const nm=it.name||"";
+  const tip=(it.sample_names||[]).join("、");
+  return '<div class="cls-row" data-name="'+esc(nm)+'">'
+    +'<span class="cls-name" title="'+esc(tip||nm)+'">'+esc(nm)+'</span>'
+    +'<span class="muted sm">'+(it.sources||0)+' 个源</span>'
+    +'<select class="input cls-sel">'+clsOpts(cats)+'</select>'
+    +'<button class="btn sm" onclick="clsSave(this)">保存</button>'
+    +'</div>';
+}
+
+function renderClassRules(){
+  const d=CLSR||{},pool=d.unclassified||{},rules=d.rules||{},cats=d.cats||[];
+  const items=pool.items||[],total=pool.total||0,nNames=pool.names||0;
+  const st=$("clsStat");
+  if(st)st.innerHTML=total
+    ? '未归类 <b>'+total+'</b> 条（'+nNames+' 个不同名字）· 已生效 '+(rules.exact||0)+' 精确 + '+(rules.keyword||0)+' 关键词'
+    : '全部分类都认出来了 · 已生效 '+(rules.exact||0)+' 精确 + '+(rules.keyword||0)+' 关键词';
+
+  const box=$("clsPool");
+  if(box){
+    if(!items.length){
+      box.innerHTML='<div class="muted sm" style="padding:8px 0">没有未归类的分类。</div>';
+    }else{
+      const show=clsOpen?items:items.slice(0,15);
+      box.innerHTML='<div class="hint" style="margin-top:10px">未归类（按涉及源数排序，悬停看示例源）</div>'
+        +'<div class="cls-rows">'+show.map(it=>clsRow(it,cats)).join("")+'</div>'
+        +(items.length>15
+          ?'<div class="btn-row"><button class="small" onclick="clsToggle()">'
+            +(clsOpen?'收起':('展开全部 '+items.length+' 个'))+'</button></div>'
+          :'');
+    }
+  }
+
+  const users=rules.user||[],ubox=$("clsUser");
+  if(ubox){
+    ubox.innerHTML=users.length
+      ? '<div class="hint" style="margin-top:12px">你的自定义规则（'+users.length+' 条，可恢复默认）</div>'
+        +'<div class="cls-rows">'+users.map(u=>
+          '<div class="cls-row"><span class="cls-name" title="'+esc(u.k)+'">'+esc(u.k)+'</span>'
+          +'<span class="tag">'+esc(clsCatTitle(cats,u.cat))+'</span>'
+          +'<span class="muted sm">'+(u.overrides_default?"覆盖默认":"新增")+'</span>'
+          +'<button class="btn sm" data-k="'+esc(u.k)+'" data-e="'+(u.exact?1:0)+'" onclick="clsDel(this)">恢复默认</button></div>'
+        ).join("")+'</div>'
+      : '';
+  }
+}
+
+function clsToggle(){clsOpen=!clsOpen;renderClassRules();}
+
+async function clsSave(btn){
+  const row=btn.closest(".cls-row");if(!row)return;
+  const name=row.getAttribute("data-name")||"";
+  const sel=row.querySelector(".cls-sel");
+  const cat=sel?sel.value:"";
+  if(!cat){toast("先选一个库（或选「不收录」）","fail");return;}
+  const real=cat==="__drop__"?null:cat;
+  btn.disabled=true;btn.textContent="保存中…";
+  try{
+    const r=await jpost("/v/api/ext/classify/rule",{name:name,cat:real,exact:true});
+    if(r.code===0){toast("已保存："+name+" → "+clsCatTitle((CLSR||{}).cats,real));await loadClassRules();}
+    else{toast(r.msg||"保存失败","fail");btn.disabled=false;btn.textContent="保存";}
+  }catch(e){toast("保存失败："+(e.message||e),"fail");btn.disabled=false;btn.textContent="保存";}
+}
+
+async function clsDel(btn){
+  const k=btn.getAttribute("data-k")||"";
+  const e=btn.getAttribute("data-e")==="1";
+  if(!confirm("删除规则「"+k+"」？会回落到同名的默认规则（如果有）。"))return;
+  const r=await jpost("/v/api/ext/classify/rule",{name:k,exact:e,delete:true});
+  if(r.code===0){toast("已恢复默认");await loadClassRules();}
+  else toast(r.msg||"删除失败","fail");
+}
+
+async function clsRebuild(){
+  if(!confirm("按当前规则重建海量库？后台进行，几十秒后生效，期间旧库照常可用。"))return;
+  const r=await jpost("/v/api/ext/classify/rebuild",{});
+  toast(r.msg||"已开始重建");
+}
 async function refreshHot(){
   toast("开始刷新榜单…");
   const r=await jpost("/v/api/ext/hot/refresh",{});
@@ -1705,9 +1834,11 @@ function renderSources(){
        st==="catvod"?"网盘源已有「小雅库」，无需再建":
        st==="guard"?"加固源已有「加固影视」专题库":"需先「启用」");
     // >>> PRIVATE:ADULT
-    const adOk=!!(src.enabled&&src.standalone&&libOk);
+    // 18 是源级内容授权（决定该源的福利分类是否收进全局 🔞福利 库），
+    // 与「建不建独立库」无关：只要源启用且类型可建库就能标，不再强制勾「库」。
+    const adOk=!!(src.enabled&&libOk);
     extraCell=FEAT_ADULT?`
-      <label title="${adOk?'🔞 限制级独立库（18+）：与主库隔离、不进全局搜索；开启即表示你已年满 18 周岁并自行承担责任':'需先「启用」并勾选「库」后才能标记 🔞（'+(libOk?'需先建库':libWhy)+'）'}"
+      <label title="${adOk?'🔞 限制级内容（18+）：把该源的福利分类收进「🔞福利」库，不进全局搜索；开启即表示你已年满 18 周岁并自行承担责任':'需先「启用」'+(libOk?'':'（'+libWhy+'）')}"
         style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:${adOk?'pointer':'not-allowed'};margin-left:4px;${adOk?'':'opacity:.55'}">
         <input type="checkbox" class="ad" ${src.adult?"checked":""}
          ${adOk?"":"disabled"} style="width:15px;height:15px;accent-color:#be123c${adOk?'':';opacity:.35'}"/>18</label>`:"";
@@ -1761,7 +1892,9 @@ async function toggleEnable(id,on){
 }
 async function toggleStandalone(id,on){
   const r=await jpost("/v/api/ext/source/standalone",{id,standalone:on});
-  if(r.code===0){const s=CFG.sources.find(x=>x.id===id);if(s){s.standalone=on;if(!on){s.loose_filter=false;s.adult=false;}}
+  // 取消「库」只清「非过滤」（它本来就只对独立库作用域生效）；
+  // 18 是源级授权，不跟着清——否则取消库等于把福利授权一起删了。
+  if(r.code===0){const s=CFG.sources.find(x=>x.id===id);if(s){s.standalone=on;if(!on)s.loose_filter=false;}
     renderSources();toast(on?"已生成独立媒体库（后台建库中）":"已取消独立媒体库");}
   else{toast(r.msg||"操作失败","fail");renderSources();}
 }
@@ -1772,7 +1905,7 @@ async function toggleLoose(id,on){
 }
 // >>> PRIVATE:ADULT
 async function toggleAdult(id,on,el){
-  if(on){const ok=confirm("将该源标记为 🔞 限制级独立库（18+）？\n该库与主库隔离、不进入全局搜索，开启即表示你已年满 18 周岁并自行承担责任。");
+  if(on){const ok=confirm("把该源的内容标记为 🔞 限制级（18+）？\n该源的福利分类会收进全局「🔞福利」库（与主库隔离、不进全局搜索），不需要给它单独建库。\n开启即表示你已年满 18 周岁并自行承担责任。");
     if(!ok){el.checked=false;return;}}
   const r=await jpost("/v/api/ext/source/adult",{id,adult:on});
   if(r.code===0){const s=CFG.sources.find(x=>x.id===id);if(s)s.adult=on;renderSources();toast(on?"已标记为 🔞 限制级":"已取消 🔞 限制级标记");}

@@ -2402,6 +2402,14 @@ async def _hot_worker(app: FastAPI):
                 _log.warning("chart refresh timed out; keeping previous cache")
             except Exception as exc:
                 _log.warning("chart refresh failed, keeping previous cache: %s", exc)
+        # >>> OPTIONAL:DISK CACHE
+        # 先读上次落盘的分类表与路由：重启后秒开，不用空等一轮建库。
+        # 缓存新鲜（< CLASS_REFRESH）时下面这轮刷新会被跳过，重启连网络风暴都没有；
+        # 缓存过期则先顶上旧表、再后台重建，用户看到的是「上次的库」而不是空海报墙。
+        # 整层可摘除（catalog.DISK_CACHE=False 或删掉本块），摘了就是旧行为。
+        if catalog_on and catalog.load_disk():
+            _log.info("catalog routes restored from disk")
+        # <<< OPTIONAL:DISK CACHE
         if catalog_on and catalog.routes_stale():
             try:
                 await asyncio.wait_for(

@@ -12,8 +12,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import os
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -21,6 +25,8 @@ import httpx
 import netutil
 import providers
 from store import make_guid
+
+_log = logging.getLogger(__name__)
 
 PAGE_SIZE = 20
 # 每个大类最多可浏览的页数（页数×20=条数）。250 页 ≈ 5000 部。
@@ -40,6 +46,28 @@ XSRC_DEFAULT_PAGES = 30
 # csp 爬虫首拉 0.6~12s+）。建库是一次性动作，给宽一点的 25 秒，别让首访抖动
 # 直接把独立库判成「没有分类」。
 XSRC_CLASS_TIMEOUT = 25.0
+# 建库阶段「每个源」的硬预算（秒）。auto 代理模式下直连失败会切代理重试一次，
+# 单请求 HTTP_TIMEOUT=12 实际能跑到 24 秒；而每轮 gather 都在等最慢的那一个，
+# 于是 27 个连不上的源把整轮拖成 90 秒（实测 A 段 24.8s / B1 35.4s / B2 30s，
+# 而 40/82 个源 3 秒内就返回了）。建库是尽力而为的冷启动动作：超预算的源
+# 记为「本次没有分类表」，等下一轮刷新或用户真正翻到它时再补，不让单点拖全局。
+BUILD_BUDGET = 10.0
+# >>> OPTIONAL:DISK CACHE
+# 分类表 + 路由落盘：重启后先按上次结果出库（秒开），后台再按 CLASS_REFRESH 刷。
+# 体积实测约 160 KB（82 源 / 1591 条分类 / 400 余条路由），同目录 titles.json 已 3.8 MB。
+#
+# 【这一层可整块摘除，不影响建库本身】
+#   - 只关不删：DISK_CACHE 改 False，立刻回到「每次启动重新建库」的旧行为；
+#   - 彻底删除：删掉所有 OPTIONAL:DISK CACHE 标记块 + state/catalog_routes.json
+#     + tests/test_catalog_disk.py，删完顺带可删 json / os / Path 三个 import 与
+#     _log（它们只服务这层）。refresh_routes 的探测与选源逻辑一行都没动，
+#     摘掉缓存 = 只是回到「冷启动等一轮」，不会少任何一个库。
+# 之所以做成可摘除的独立层：若以后改用更轻的浏览方案（例如像 LunaTV 那样分类
+# 只用豆瓣榜单、点开再搜源），这层可连同建库整块删掉，不留半截持久化依赖。
+DISK_CACHE = True
+_DISK_FILE = Path(__file__).resolve().parent.parent / "state" / "catalog_routes.json"
+DISK_VERSION = 1
+# <<< OPTIONAL:DISK CACHE
 
 
 def _src_kind(source: dict) -> str:
@@ -336,6 +364,102 @@ class Catalog:
             self._scanned_page.clear()
             self._dense_count.clear()
             self._fallbacks.clear()
+            # >>> OPTIONAL:DISK CACHE
+            # 「清缓存」要连落盘一起清：否则下次重启又会把旧表读回来，
+            # 用户会以为按钮没生效。清完由调用方重新建库并再次落盘。
+            if DISK_CACHE:
+                try:
+                    _DISK_FILE.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("catalog disk remove failed: %s", exc)
+            # <<< OPTIONAL:DISK CACHE
+
+    # >>> OPTIONAL:DISK CACHE
+    def load_disk(self) -> bool:
+        """从磁盘恢复上次的分类表与路由（不联网）。返回是否恢复成功。
+
+        冷启动专用：恢复后 status() / routes_for_scope() 立刻可用，用户不必
+        陪着一轮建库；后台仍按 CLASS_REFRESH 周期刷新并覆盖本文件。
+        配置里已删除的源在这里过滤掉，避免路由指向不存在的源。
+        """
+        if not DISK_CACHE:
+            return False
+        try:
+            data = json.loads(_DISK_FILE.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("catalog disk load failed: %s", exc)
+            return False
+        if not isinstance(data, dict) or data.get("v") != DISK_VERSION:
+            return False
+        classes = data.get("classes") or {}
+        routes = data.get("routes") or {}
+        if not isinstance(classes, dict) or not isinstance(routes, dict):
+            return False
+
+        try:
+            import config as _config
+            live = {str(s.get("id") or "") for s in _config.config.all_sources()}
+            enabled = {str(s.get("id") or "")
+                       for s in _config.config.enabled_sources()}
+        except Exception:  # noqa: BLE001
+            live, enabled = set(), set()
+        cfg_ok = bool(live)
+
+        cls_ok = {k: v for k, v in classes.items()
+                  if isinstance(v, list) and (not cfg_ok or k in live)}
+        # 路由键形如 "scope:cat"，scope 是 AGG_SCOPE 或某个源 id
+        rt_ok: dict[str, list[dict]] = {}
+        for k, v in routes.items():
+            if not isinstance(v, list):
+                continue
+            scope = str(k).split(":", 1)[0]
+            if cfg_ok and scope != AGG_SCOPE and scope not in enabled:
+                continue
+            # 停用的源不能靠旧表复活，按当前启用列表过滤
+            keep = [r for r in v if isinstance(r, dict)
+                    and (not cfg_ok or str(r.get("source_id") or "") in enabled)]
+            if keep:
+                rt_ok[k] = keep
+        if not rt_ok:
+            return False
+
+        with self._lock:
+            self._classes = cls_ok
+            self._routes = rt_ok
+            self._updated = float(data.get("updated") or data.get("saved_at") or 0)
+        return True
+
+    def save_disk(self) -> bool:
+        """把分类表与路由原子写盘（先写 .tmp 再 rename），供下次启动秒开。
+
+        落盘的是**上次的结论**而不是探测过程：重启后不做任何联网就能出库，
+        后台刷新完成后自然覆盖。写失败只记日志，绝不影响当前进程运行。
+        """
+        if not DISK_CACHE:
+            return False
+        try:
+            with self._lock:
+                payload = {
+                    "v": DISK_VERSION,
+                    "saved_at": int(time.time()),
+                    "updated": int(self._updated),
+                    "classes": {k: v for k, v in self._classes.items() if v},
+                    "routes": {k: v for k, v in self._routes.items() if v},
+                }
+            _DISK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _DISK_FILE.with_name(_DISK_FILE.name + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False),
+                           encoding="utf-8")
+            os.replace(tmp, _DISK_FILE)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("catalog disk save failed: %s", exc)
+            return False
+    # <<< OPTIONAL:DISK CACHE
 
     @staticmethod
     def _scope_key(scope: str, cat: str) -> str:
@@ -370,12 +494,26 @@ class Catalog:
             return self.status()
         self._refreshing = True
         try:
+            async def _bounded(coro):
+                """给单个源的建库动作封顶。超时 = 本次没有结果（不抛、不中断整轮）。
+
+                auto 代理模式下直连失败会切代理重试，单请求 12 秒实际能跑到 24 秒；
+                不封顶的话，一个连不上的源就把整轮 gather 拖满（实测 90 秒里有
+                55 秒是这类源在等超时，而 40/82 个源 3 秒内就返回了）。
+                """
+                try:
+                    return await asyncio.wait_for(coro, timeout=BUILD_BUDGET)
+                except asyncio.TimeoutError:
+                    return None
+                except Exception:  # noqa: BLE001
+                    return None
+
             # 上游同位置走 netutil.async_client（按代理模式直连/走代理/自动切代理），
             # 与本文件 _load_page 的两处用法一致。
             async with netutil.async_client(
                     timeout=HTTP_TIMEOUT) as client:
                 await asyncio.gather(
-                    *[self._load_source_classes(client, s) for s in sources],
+                    *[_bounded(self._load_source_classes(client, s)) for s in sources],
                     return_exceptions=True)
 
             # 每个源每类先探测一个代表性叶子；首选超时/空时，回退探测该类下
@@ -400,19 +538,26 @@ class Catalog:
             async with netutil.async_client(
                     timeout=HTTP_TIMEOUT) as client:
                 async def probe_one(sid, cat, cl):
+                    """探一个代表叶子，返回 (状态, 路由)。
+
+                    `ok` 有内容 / `empty` 能连通但该分类为空 / `fail` 连不上或超时。
+                    区分 empty 与 fail 很关键：空页值得换个叶子再试，而连不上的源
+                    换 8 个叶子依然连不上，只会白白再等一轮超时。
+                    """
                     source = self._source_by_id(sid)
                     if not source:
-                        return None
+                        return ("fail", None)
                     try:
-                        _lst, pc = await _fetch_category_page(
-                            client, source, cl["type_id"], 1)
-                    except Exception:
-                        return None
+                        _lst, pc = await asyncio.wait_for(
+                            _fetch_category_page(client, source, cl["type_id"], 1),
+                            timeout=BUILD_BUDGET)
+                    except Exception:  # noqa: BLE001
+                        return ("fail", None)
                     if not _lst:
-                        return None
-                    return {"source_id": sid, "type_id": cl["type_id"],
-                            "type_name": cl["type_name"],
-                            "pagecount": int(pc or 0)}
+                        return ("empty", None)
+                    return ("ok", {"source_id": sid, "type_id": cl["type_id"],
+                                   "type_name": cl["type_name"],
+                                   "pagecount": int(pc or 0)})
 
                 # 第一轮：每个 (源,类) 只探首选
                 first = await asyncio.gather(
@@ -421,12 +566,14 @@ class Catalog:
                     return_exceptions=True)
                 missing: list[tuple[str, str]] = []
                 for (sid, cat), res in zip(order, first):
-                    if isinstance(res, dict):
-                        probed[(cat, sid)] = res
-                    else:
+                    st, payload = res if isinstance(res, tuple) else ("fail", None)
+                    if st == "ok" and isinstance(payload, dict):
+                        probed[(cat, sid)] = payload
+                    elif st == "empty":
+                        # 只对「能连通但空」的换叶子；连接失败的直接放弃本轮
                         missing.append((sid, cat))
 
-                # 第二轮：对首轮失败/空的(源,类)，并发尝试其余叶子，取页数最多者
+                # 第二轮：对首轮空页的(源,类)，并发尝试其余叶子，取页数最多者
                 async def rescue(sid, cat):
                     cls = all_by_cat[(sid, cat)][1:9]  # 最多再试 8 个叶子
                     if not cls:
@@ -434,7 +581,9 @@ class Catalog:
                     res = await asyncio.gather(
                         *[probe_one(sid, cat, cl) for cl in cls],
                         return_exceptions=True)
-                    ok = [r for r in res if isinstance(r, dict)]
+                    ok = [r[1] for r in res
+                          if isinstance(r, tuple) and r[0] == "ok"
+                          and isinstance(r[1], dict)]
                     if ok:
                         ok.sort(key=lambda r: -(r.get("pagecount") or 0))
                         probed[(cat, sid)] = ok[0]
@@ -496,6 +645,10 @@ class Catalog:
                         if k not in valid_keys:
                             d.pop(k, None)
                 self._updated = time.time()
+            # >>> OPTIONAL:DISK CACHE
+            # 这一轮的结论立刻落盘：下次进程重启直接用它出库，不再空等一轮建库。
+            self.save_disk()
+            # <<< OPTIONAL:DISK CACHE
             warm_scopes = [sid for sid in self.standalone_scopes()
                            if any(self.available(c, sid) for c in
                                   (CATS + ([ADULT_CAT] if _welfare_on() else [])))]

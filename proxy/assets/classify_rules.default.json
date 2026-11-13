@@ -1,0 +1,613 @@
+{
+ "v": 1,
+ "kind": "fnmedia-ext-classify-rules-default",
+ "note": "随包内置默认规则：新装即生效；用户规则（state/classify_rules.json）优先级更高，升级不会覆盖用户改动。",
+ "updated": 1794548251,
+ "rules": [
+  {
+   "k": "91制片厂",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "A V 解说",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "AI短剧",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "AV解说",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "SM调教",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "VR视角",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "ai制作",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "东南亚",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "东南亚剧",
+   "cat": "overseas",
+   "exact": true
+  },
+  {
+   "k": "丝袜美腿",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "两性课堂",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "中文剧情",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "中文字幕",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "主播直播",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "主播网红",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "主播视讯",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "主播诱惑",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "乱伦毁三观",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "人兽典藏",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "人兽性交",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "人妖系列",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "人妻熟女",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "公告",
+   "cat": null,
+   "exact": true
+  },
+  {
+   "k": "其他剧",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "内地剧",
+   "cat": "tv",
+   "exact": true
+  },
+  {
+   "k": "剧情介绍",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "剧情故事",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "反转爽剧",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "反转爽文",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "口爆颜射",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "古装仙侠",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "台剧",
+   "cat": "overseas",
+   "exact": true
+  },
+  {
+   "k": "国产专区",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "国产主播",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "国产传媒",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "国产大制作",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "国产精品",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "国产视频",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "多人群交",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "大陆剧",
+   "cat": "tv",
+   "exact": true
+  },
+  {
+   "k": "女优明星",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "女同口交",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "女同性恋",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "女同性爱",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "女同系列",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "女恋总裁",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "女频恋爱",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "媚黑母狗",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "嫖妓全过程",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "家庭伦伦",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "家庭篇",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "少女破处",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "巨乳美乳",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "年代穿越",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "强奸乱伦",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "性感身体",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "成人动漫",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "成人综艺",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "成长逆袭",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "抖阴视频",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "抖音视频",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "教程",
+   "cat": null,
+   "exact": true
+  },
+  {
+   "k": "日本精品",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "日本素人",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "日韩主播",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "暴力侵犯",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "未分类",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "极品媚黑",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "欧美性爱",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "欧美激情",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "欧美精品",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "欧美系列",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "水果派解说",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "淫乱学生妹",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "港剧",
+   "cat": "overseas",
+   "exact": true
+  },
+  {
+   "k": "港澳剧",
+   "cat": "overseas",
+   "exact": true
+  },
+  {
+   "k": "漫画连载",
+   "cat": "anime",
+   "exact": true
+  },
+  {
+   "k": "激情中字",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "熟女人妻",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "燃烧荷尔蒙",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "现代言情",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "现代都市",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "男同性恋",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "男同系列",
+   "cat": null,
+   "exact": true
+  },
+  {
+   "k": "监控摄像头",
+   "cat": null,
+   "exact": true
+  },
+  {
+   "k": "直播大秀",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "直播裸聊",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "短视频",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "科普学习",
+   "cat": "ted",
+   "exact": true
+  },
+  {
+   "k": "穿越年代",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "穿越现代",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "站内新闻",
+   "cat": null,
+   "exact": true
+  },
+  {
+   "k": "精东影业",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "精品推荐",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "精选独家",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "糖心Vlog",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "网红头条",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "美乳巨乳",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "美国剧",
+   "cat": "overseas",
+   "exact": true
+  },
+  {
+   "k": "美女主播",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "翹臀美尻",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "脑洞悬疑",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "葫芦影业",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "视频一区",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "视频三区",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "视频二区",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "角色扮演",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "言情总裁",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "貧乳小奶",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "都市脑洞",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "都市言情",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "采集教程",
+   "cat": null,
+   "exact": true
+  },
+  {
+   "k": "重口味",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "重口激情",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "重生民国",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "闪婚离婚",
+   "cat": "shortdrama",
+   "exact": true
+  },
+  {
+   "k": "韩国主播",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "音乐片",
+   "cat": "movie",
+   "exact": true
+  },
+  {
+   "k": "高清名优",
+   "cat": "adult",
+   "exact": true
+  },
+  {
+   "k": "netflix",
+   "cat": "overseas",
+   "exact": false
+  },
+  {
+   "k": "爽剧",
+   "cat": "shortdrama",
+   "exact": false
+  }
+ ]
+}

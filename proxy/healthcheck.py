@@ -440,7 +440,12 @@ async def verify_batch(ids: list[str], *, max_sources: int = 60) -> dict:
         return {"checked": 0, "skipped": "not found"}
 
     def _heavy(s: dict) -> bool:
-        return bool(s.get("guard")) or str(s.get("stype") or "") in ("spider", "drpy")
+        # 用 config.source_type 判真实类型：源记录里没有 stype 字段，
+        # 直接读 s["stype"] 会把 spider 全当 CMS（2026-11-13 修）。
+        try:
+            return _config.source_type(s) in ("spider", "drpy", "guard", "catvod")
+        except Exception:  # noqa: BLE001
+            return bool(s.get("guard")) or bool(s.get("spider_src"))
 
     cms = [s for s in picked if not _heavy(s)]
     heavy = [s for s in picked if _heavy(s)]

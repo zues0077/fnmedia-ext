@@ -1867,7 +1867,8 @@ function renderRulesList(){
   users.forEach(u=>rows.push({k:u.k,cat:u.cat,exact:u.exact!==false,src:"user",over:!!u.overrides_default}));
   defs.forEach(d=>{
     if(uk.has((d.k||"").toLowerCase()))return;
-    rows.push({k:d.k,cat:d.cat,exact:d.exact!==false,src:"default",over:false});
+    rows.push({k:d.k,cat:d.cat,exact:d.exact!==false,src:"default",
+               dsrc:(d.src||"builtin"),over:false});
   });
   const q=(CLS_RF.q||"").toLowerCase();
   const list=rows.filter(r=>{
@@ -1900,6 +1901,8 @@ function renderRulesList(){
       +"<a class=\"btn sm\" href=\"/v/api/ext/classify/rules-export\" download>⇩ 导出规则</a>"
       +"<button class=\"btn sm\" onclick=\"$('clsImportFile').click()\">⇧ 导入规则</button>"
       +"<input type=\"file\" id=\"clsImportFile\" accept=\".json,application/json\" style=\"display:none\" onchange=\"clsImport(this)\"/>"
+      +"<button class=\"btn sm\" onclick=\"clsBake(this)\" title=\"把当前用户规则写成随包内置默认，新装即认全\">\u2b06 沉淀为内置默认</button>"
+      +"<button class=\"btn sm\" onclick=\"clsDedupe(this)\" title=\"删掉与内置默认完全相同的用户规则，让默认能随包升级\">🧹 清理重复</button>"
     +"</div>"
     +"<div class=\"cls-batch\">"
     +"<input class=\"input\" placeholder=\"搜索名字…\" value=\""+esc(CLS_RF.q||"")+"\" oninput=\"clsRfQ(this.value)\" style=\"max-width:170px\"/>"
@@ -1929,7 +1932,9 @@ function renderRulesList(){
           +"<span class=\"cls-name\" title=\""+esc(r.k)+"\">"+esc(r.k)+"</span>"
           +(r.src==="user"
             ?"<span class=\"tag warn\">用户配置"+(r.over?" · 覆盖默认":"")+"</span>"
-            :"<span class=\"tag\">系统默认</span>")
+            :(r.dsrc==="file"
+                ?"<span class=\"tag\">内置默认</span>"
+                :"<span class=\"tag\">系统默认</span>"))
           +"<select class=\"input cls-sel\">"+clsOpts(cats,r.cat===undefined?null:r.cat)+"</select>"
           +"<button class=\"btn sm\" onclick=\"clsSave(this)\">保存</button>"
           +(r.src==="user"
@@ -1938,6 +1943,36 @@ function renderRulesList(){
           +"</div>";
       }).join("")+"</div>"
     +(list.length===0?"<div class=\"muted sm\" style=\"padding:6px 0\">没有匹配的规则</div>":"");
+}
+async function clsDedupe(btn){
+  if(!confirm("清理与内置默认完全相同的用户规则？\n\n清掉的只是冗余副本（值一样），"
+      +"以后升级默认规则才能生效。\n你真正改过的规则不会被删。"))return;
+  btn.disabled=true;const old=btn.textContent;btn.textContent="清理中…";
+  try{
+    const r=await jpost("/v/api/ext/classify/dedupe-default",{},30000);
+    if(r.code===0){
+      if(r.data&&r.data.rules&&CLSR)CLSR.rules=r.data.rules;
+      toast(r.msg||"已清理");
+      renderRulesList();
+    }else{toast(r.msg||"清理失败","fail");}
+  }catch(e){toast("清理失败："+(e.message||e),"fail");}
+  finally{btn.disabled=false;btn.textContent=old||"🧹 清理重复";}
+}
+async function clsBake(btn){
+  const n=(((CLSR||{}).rules)||{}).user||[];
+  if(!n.length){toast("还没有用户规则可沉淀","fail");return;}
+  if(!confirm("把当前 "+n.length+" 条用户规则写成「随包内置默认」？\n\n"
+      +"· 红线词会自动跳过\n· 你的用户规则不会被删除（仍优先）\n· 以后新装即认全"))return;
+  btn.disabled=true;const old=btn.textContent;btn.textContent="沉淀中…";
+  try{
+    const r=await jpost("/v/api/ext/classify/bake-default",{},30000);
+    if(r.code===0){
+      if(r.data&&r.data.rules&&CLSR)CLSR.rules=r.data.rules;
+      toast(r.msg||"已沉淀");
+      renderRulesList();
+    }else{toast(r.msg||"沉淀失败","fail");}
+  }catch(e){toast("沉淀失败："+(e.message||e),"fail");}
+  finally{btn.disabled=false;btn.textContent=old||"⬆ 沉淀为内置默认";}
 }
 function clsRfConflict(){
   if(CLS_RF.cf){CLS_RF.cf=null;renderRulesList();return;}   // 再点一次取消

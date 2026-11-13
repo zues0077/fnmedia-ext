@@ -669,32 +669,6 @@ def classify(name: str) -> str | None:
     return None
 
 
-def classify_baseline(name: str, adult_allowed: bool) -> str | None:
-    """**不含用户规则**的分类基线（关键词词表 + 源级 18 兜底）。
-
-    规则本地化要用它：规则删掉后，名字要能回到「没有这条规则时」的归属。
-    与 classify_source_class 的唯一区别是跳过 rule_hit。
-    """
-    n = (name or "").strip()
-    nl = n.lower()
-    if not n or is_redline(n):
-        return None
-    cat = classify(n)
-    if cat:
-        return cat
-    if not _welfare_on():
-        return None
-    if any(k in n for k in _NEUTRAL_KW):
-        return None
-    if any(k in n or k in nl for k in _NON_ADULT_KW):
-        return None
-    if any(k in n or k in nl for k in _ADULT_KW):
-        return ADULT_CAT
-    if adult_allowed:
-        return ADULT_CAT
-    return None
-
-
 def classify_source_class(name: str, adult_allowed: bool) -> str | None:
     """按源的扩展授权决定分类归属。
 
@@ -714,7 +688,26 @@ def classify_source_class(name: str, adult_allowed: bool) -> str | None:
         if rcat == ADULT_CAT and not _welfare_on():
             return None
         return rcat
-    return classify_baseline(n, adult_allowed)
+    cat = classify(n)
+    if cat:
+        return cat
+    if not _welfare_on():
+        return None
+    nl = n.lower()
+    if any(k in n for k in _NEUTRAL_KW):
+        return None
+    # 明确非成人的先挡掉：打了 18 也不能把体育/港台日韩剧倒进福利库。
+    if any(k in n or k in nl for k in _NON_ADULT_KW):
+        return None
+    # 成人词表命中：独立开关打开即收编进 ADULT 池（无需逐源标记），
+    # 这样扩展库卡"打开开关就有内容"；硬红线已在函数开头拦截。
+    if any(k in n or k in nl for k in _ADULT_KW):
+        return ADULT_CAT
+    # 其余「名字完全不沾关键词」的分类（如「视频一区」「国产视频」「黑料吃瓜」），
+    # 只有该源显式打了 18 才纳入——成人站全靠这一条兜底。
+    if adult_allowed:
+        return ADULT_CAT
+    return None
 
 
 async def _fetch_class_list(client: httpx.AsyncClient, source: dict) -> list[dict]:
@@ -767,9 +760,6 @@ class Catalog:
         self._lock = threading.RLock()
         # source_id -> [ {type_id, type_name, type_pid, cat} ]
         self._classes: dict[str, list[dict]] = {}
-        # 源 id → {分类名: {tid,pid}}：**所有叶子**（含未归类）都记下来，
-        # 规则本地化时才能把「刚被规则认出来的名字」直接变成路由，无需联网。
-        self._leaf_index: dict[str, dict[str, dict]] = {}
         # "scope:cat" -> [ {source_id, type_id, type_name, pagecount?} ]（首选在最前）
         # scope 为 AGG_SCOPE（跨源聚合）或某个 source_id（单源独立媒体库）。
         self._routes: dict[str, list[dict]] = {}
@@ -1122,7 +1112,6 @@ class Catalog:
         return self.status()
 
     async def _load_source_classes(self, client: httpx.AsyncClient, source: dict):
-        _idx: dict[str, dict] = {}
         sid = str(source.get("id") or "")
         try:
             cls = await _fetch_class_list(client, source)
@@ -1182,8 +1171,6 @@ class Catalog:
                     cat = classify_source_class(name, adult_allowed)
                 if not is_leaf:
                     continue
-                _idx.setdefault(name, {"tid": tid, "pid": pid,
-                                       "base": classify_baseline(name, adult_allowed)})
                 if cat is None:
                     # 规则已命中但福利库关着，不算「没认出来」，别塞进池子让
                     # 用户以为规则没生效。
@@ -1197,8 +1184,6 @@ class Catalog:
         with self._lock:
             self._classes[source["id"]] = norm
             self._unclassified[source["id"]] = missed
-            if _idx:
-                self._leaf_index[source["id"]] = _idx
 
     def _source_by_id(self, sid: str) -> dict | None:
         try:
@@ -1300,301 +1285,6 @@ class Catalog:
                     keep.append(nm)
                 self._unclassified[sid] = keep
         return changed
-
-    def suggest_rules(self) -> list[dict]:
-        """给未归类名字生成「建议归属」（只建议，不写盘、不改状态）。
-
-        三层猜测（越靠前越可信）：
-        1. 去噪后能命中关键词/规则（如「喜剧片2」→「喜剧片」→ movie）；
-        2. 与已归类名字做包含/相似匹配（bigram Dice ≥ 0.5，取最长包含优先）；
-        3. 同源多数票：该名字所在源的其它已归类名字里最常见的库（低置信）。
-        管理页「智能建议」按钮拿它批量预选，用户确认后走批量保存。
-        """
-        import re as _re
-
-        def _norm(t: str) -> str:
-            t = (t or "").strip()
-            # 去尾部编号/括号/标点：「电影2」「电影(1)」「电影 - 高清」
-            t = _re.sub(r"[\s\-_—·•()（）\[\]【】<>《》/\\|,，.。:：;；!！?？]+$", "", t)
-            t = _re.sub(r"\d+$", "", t)
-            return t.strip()
-
-        def _grams(t: str) -> set[str]:
-            t = t.replace(" ", "")
-            return {t[i:i + 2] for i in range(len(t) - 1)} if len(t) > 1 else {t}
-
-        def _dice(a: str, b: str) -> float:
-            ga, gb = _grams(a), _grams(b)
-            if not ga or not gb:
-                return 0.0
-            return 2 * len(ga & gb) / (len(ga) + len(gb))
-
-        with self._lock:
-            classes = {sid: [dict(x) for x in v] for sid, v in self._classes.items()}
-            unc = {sid: list(v) for sid, v in self._unclassified.items()}
-            # 名字 → 涉及源
-            src_of: dict[str, set] = {}
-            for sid, names in unc.items():
-                for nm in names:
-                    src_of.setdefault(nm, set()).add(sid)
-
-        # 同名分类在不同源里可能被归到不同库：按出现次数取多数，
-        # 不能拿「第一条」（曾把「女同性爱」定成 movie，因为某个源历史归属如此）。
-        _votes: dict[str, dict[str, int]] = {}
-        for items in classes.values():
-            for it in items:
-                nm = str(it.get("type_name") or "").strip()
-                cat = it.get("cat")
-                if nm and cat:
-                    _votes.setdefault(nm, {})
-                    _votes[nm][cat] = _votes[nm].get(cat, 0) + 1
-        known: dict[str, str] = {nm: max(v.items(), key=lambda kv: kv[1])[0]
-                                 for nm, v in _votes.items()}
-        for k, cat, _ex in _DEFAULT_RULES:
-            if cat:
-                known.setdefault(str(k).strip(), cat)
-        # 每源最常见库（同源多数票）
-        per_src_top: dict[str, str] = {}
-        for sid, items in classes.items():
-            cnt: dict[str, int] = {}
-            for it in items:
-                c = it.get("cat")
-                if c:
-                    cnt[c] = cnt.get(c, 0) + 1
-            if cnt:
-                per_src_top[sid] = max(cnt.items(), key=lambda kv: kv[1])[0]
-
-        # 建议层前置判定：这些不该往影视库塞，直接建议「不收录」
-        _UTILITY_KW = ("教程", "采集", "接口", "公告", "配置", "软件", "下载",
-                       "直播源", "说明", "帮助", "版本", "专题", "客服", "群",
-                       "app", "APP", "接口", "测试", "demo", "Demo")
-        _SPORT_KW = ("格斗", "拳击", "篮球", "足球", "网球", "排球", "乒乓球",
-                     "羽毛球", "台球", "斯诺克", "棒球", "冰球", "高尔夫",
-                     "赛车", "ufc", "UFC", "综合格斗")
-
-        out: list[dict] = []
-        for nm, sids in sorted(src_of.items(), key=lambda kv: -len(kv[1])):
-            name = str(nm).strip()
-            cat = reason = None
-            conf = 0.0
-            if is_redline(name):
-                out.append({"name": name, "cat": None, "reason": "红线：必须不收录",
-                            "conf": 1.0, "sources": len(sids)})
-                continue
-            if any(k in name or k in name.lower() for k in _UTILITY_KW):
-                out.append({"name": name, "cat": None, "reason": "非内容分类（建议不收录）",
-                            "conf": 0.85, "sources": len(sids)})
-                continue
-            _ADULT_HINT = ("女同", "百合", "蕾丝", "人妻", "熟女", "巨乳", "美乳",
-                           "骚", "嫖", "约炮", "自慰", "喷射", "调教", "露出",
-                           "无套", "中出", "痴女", "痴汉", "淫")
-            if any(k in name for k in _ADULT_HINT):
-                out.append({"name": name, "cat": ADULT_CAT,
-                            "reason": "成人用词", "conf": 0.75, "sources": len(sids)})
-                continue
-            if any(k in name for k in _NEUTRAL_KW):
-                out.append({"name": name, "cat": None,
-                            "reason": "非正片（解说/预告/花絮类）",
-                            "conf": 0.8, "sources": len(sids)})
-                continue
-            if any(k in name or k in name.lower() for k in _SPORT_KW):
-                out.append({"name": name, "cat": None, "reason": "体育（无对应媒体库）",
-                            "conf": 0.8, "sources": len(sids)})
-                continue
-            cands = [name, _norm(name)]
-            for c in cands:
-                if not c:
-                    continue
-                k2, rc = rule_hit(c)
-                if k2:
-                    cat, reason, conf = rc, "规则/关键词", 0.95
-                    break
-                g = classify(c)
-                if g:
-                    cat, reason, conf = g, "关键词", 0.9
-                    break
-            if cat is None and not reason:
-                # 包含匹配（取最长）
-                best = ""
-                for k in known:
-                    if k == name:
-                        continue      # 不和自己比：历史脏归属会自证成正解
-                    if len(k) >= 2 and (k in name or name in k) and len(k) > len(best):
-                        best = k
-                if best:
-                    cat, reason, conf = known[best], "相似：「%s」" % best[:8], 0.8
-            if cat is None and not reason:
-                best_k, best_s = "", 0.0
-                for k in known:
-                    if k == name:
-                        continue
-                    sc = _dice(name, k)
-                    if sc > best_s:
-                        best_k, best_s = k, sc
-                if best_s >= 0.5:
-                    cat, reason = known[best_k], "近似：「%s」" % best_k[:8]
-                    conf = round(best_s, 2)
-            if cat is None and not reason:
-                votes = [per_src_top[s] for s in sids if s in per_src_top]
-                if votes:
-                    cat = max(set(votes), key=votes.count)
-                    reason, conf = "同源多数票", 0.4
-            out.append({"name": name, "cat": cat, "reason": reason or "无建议",
-                        "conf": conf, "sources": len(sids)})
-        return out
-
-    def apply_rules_local(self) -> dict:
-        """规则本地化：只用本地缓存重算「分类 → 路由」，**完全不联网**。
-
-        数据来源：`_leaf_index`（建库时记下的全部叶子：名字/type_id/父 id）+
-        `_classes`（当前归属）+ `_routes`（既有 pagecount，用来保持翻页能力）。
-        规则命中的名字立即改归属或丢弃；没命中的保持原样（不重算、不偏移）。
-        跑完写盘，重启后仍是新结论。典型耗时：全库 2000~3000 个叶子 < 50ms。
-        """
-        from config import config as _cfg
-
-        srcs = {str(s.get("id") or ""): s for s in _cfg.all_sources()}
-        enabled = {sid for sid, s in srcs.items() if s.get("enabled")}
-        welfare_on = _welfare_on()
-
-        with self._lock:
-            leaf = {sid: dict(v) for sid, v in self._leaf_index.items()}
-            old_classes = {sid: [dict(x) for x in v]
-                           for sid, v in self._classes.items()}
-            old_routes = {k: list(v) for k, v in self._routes.items()}
-        cats_all = all_cats() + ([ADULT_CAT] if welfare_on else [])
-
-        if not leaf:
-            # 还没有建过库（或从旧缓存恢复、没有叶子索引）→ 不能本地算
-            return {"ok": False, "reason": "no-leaf-index"}
-
-        # 既有 pagecount：(source_id, type_id) → 页数，本地重算时沿用
-        pc: dict[tuple[str, str], int] = {}
-        for arr in old_routes.values():
-            for r in arr or []:
-                sid = str(r.get("source_id") or "")
-                tid = str(r.get("type_id") or "")
-                if sid and tid:
-                    pc[(sid, tid)] = int(r.get("pagecount") or MAX_PAGES)
-
-        old_cat = {(sid, str(c.get("type_id"))): c.get("cat")
-                   for sid, items in old_classes.items() for c in items}
-        # 规则「新改」出来的 (源, 分类) 组合：只有这些才允许在聚合库里新增路由；
-        # 其它没变过的组合沿用旧代表叶子——建库时只有探测成功的 (源,类) 才会进
-        # 聚合路由，本地重算若照单全收，会凭空多出一大批未探测的路由（36→50）。
-        fresh_pairs: set[tuple[str, str]] = set()
-        # 聚合库旧路由里每个 (source, cat) 的代表叶子 type_id（本地重算时沿用，
-        # 避免换成另一个叶子导致翻页行为漂移）
-        old_agg_rep: dict[tuple[str, str], str] = {}
-        for c in cats_all:
-            for r in old_routes.get(self._scope_key(AGG_SCOPE, c), []) or []:
-                sid = str(r.get("source_id") or "")
-                if sid:
-                    old_agg_rep[(sid, c)] = str(r.get("type_id") or "")
-
-        new_classes: dict[str, list[dict]] = {}
-        new_unc: dict[str, list[str]] = {}
-        changed = 0
-        # 本轮分类表拉取失败的源：只在 _classes/_unclassified 里、没有叶子索引。
-        # 它们必须原样保留，否则本地重算会把它们的路由整片抹掉（实测 36→4）。
-        for sid, items in old_classes.items():
-            if sid not in leaf:
-                new_classes[sid] = items
-        for sid, names_list in self._unclassified.items():
-            if sid not in leaf and names_list:
-                new_unc[sid] = list(names_list)
-        for sid, leaves in leaf.items():
-            if sid not in enabled:
-                continue
-            items, missed = [], []
-            for name, meta in leaves.items():
-                tid = str(meta.get("tid") or "")
-                if not tid:
-                    continue
-                hit, rcat = rule_hit(name)
-                if hit:
-                    cat = rcat
-                    if (old_cat.get((sid, tid)) or None) != cat:
-                        changed += 1
-                        if cat:
-                            fresh_pairs.add((sid, cat))
-                else:
-                    # 回到「不含用户规则」的基线；老数据没有 base 时退回当前归属
-                    cat = meta.get("base", old_cat.get((sid, tid)))
-                if cat is None:
-                    if not hit:
-                        missed.append(name)
-                    continue
-                items.append({"type_id": tid, "type_name": name,
-                              "type_pid": str(meta.get("pid") or "0"),
-                              "cat": cat})
-            if items:
-                new_classes[sid] = items
-            if missed:
-                new_unc[sid] = missed
-
-        cats = all_cats() + ([ADULT_CAT] if welfare_on else [])
-        scopes = [AGG_SCOPE] + list(self.standalone_scopes())
-        new_routes: dict[str, list[dict]] = {}
-        for scope in scopes:
-            for cat in cats:
-                rs: list[dict] = []
-                if scope == AGG_SCOPE:
-                    # 聚合库与建库逻辑保持一致：**每个源每类只取一个代表叶子**
-                    # （建库时是 probed 里挑页数最多的那个）。全塞会把电影库
-                    # 路由从 22 条涨到 479 条，聚合抓取直接被打爆。
-                    for sid, items in new_classes.items():
-                        if not self._agg_ok(sid):
-                            continue
-                        if (sid, cat) not in fresh_pairs and                                 (sid, cat) not in old_agg_rep:
-                            continue      # 建库时这个 (源,类) 没探通，别凭空加路由
-                        best = None
-                        for it in items:
-                            if it["cat"] != cat:
-                                continue
-                            pcn = pc.get((sid, it["type_id"]), MAX_PAGES)
-                            prev = old_agg_rep.get((sid, cat))
-                            if prev and str(it["type_id"]) == prev:
-                                best = (pcn, it)
-                                break
-                            if best is None or pcn > best[0]:
-                                best = (pcn, it)
-                        if best:
-                            it = best[1]
-                            rs.append({"source_id": sid,
-                                       "type_id": it["type_id"],
-                                       "type_name": it["type_name"],
-                                       "pagecount": best[0]})
-                else:
-                    for it in new_classes.get(scope, []):
-                        if it["cat"] == cat:
-                            rs.append({"source_id": scope,
-                                       "type_id": it["type_id"],
-                                       "type_name": it["type_name"],
-                                       "pagecount": pc.get((scope, it["type_id"]),
-                                                           MAX_PAGES)})
-                if scope == AGG_SCOPE:
-                    # 没有叶子索引的源（拉取失败、走缓存）沿用旧路由条目
-                    known = {str(r.get("source_id") or "") for r in rs}
-                    for r in old_routes.get(self._scope_key(scope, cat), []) or []:
-                        sid = str(r.get("source_id") or "")
-                        if sid and sid not in known and sid not in leaf:
-                            rs.append(dict(r))
-                if rs:
-                    rs.sort(key=lambda r: -(r.get("pagecount") or 0))
-                    new_routes[self._scope_key(scope, cat)] = rs
-
-        with self._lock:
-            self._classes = new_classes
-            self._unclassified = new_unc
-            self._routes = new_routes
-            self._updated = time.time()
-        # >>> OPTIONAL:DISK CACHE
-        self.save_disk()
-        # <<< OPTIONAL:DISK CACHE
-        return {"ok": True, "changed": changed,
-                "routes": sum(len(v) for v in new_routes.values()),
-                "unclassified": sum(len(v) for v in new_unc.values())}
 
     def _uhd_fallback_routes(self, scope: str) -> list[dict]:
         """4K 回退路由：源没有“4K”分类名时，借电影分类的路由翻页，

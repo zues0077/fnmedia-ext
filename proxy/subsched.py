@@ -211,6 +211,7 @@ async def refresh_subscription(sub_id: str, *, preview: bool = False,
     existing = {s.get("api", "").rstrip("/").lower()
                 for s in cfg.all_sources()}
     added_names: list[str] = []
+    added_ids: list[str] = []
     dup = 0
 
     # A1（2026-11-12）：订阅导入【不再同步探测】。
@@ -231,6 +232,7 @@ async def refresh_subscription(sub_id: str, *, preview: bool = False,
                                  sub_id=sub_id, verified=False)
         if ok:
             added_names.append(c["name"])
+            added_ids.append(sid)
             existing.add(key)
             # 成人站自动打 18（2026-11-13）：进「🔞福利」库，不混进普通搜索。
             # 名字判不出的（美少女/水机/香奶/湿妹/AV…）在循环后按内容再判。
@@ -336,6 +338,13 @@ async def refresh_subscription(sub_id: str, *, preview: bool = False,
     if changed:
         await _notify_changed()
 
+    if added_ids:
+        # 灌入后立即验证这批新源（不等 6h 周期轮）；通过即 verified=True 进搜索
+        try:
+            import healthcheck as _hc
+            asyncio.create_task(_hc.verify_batch(added_ids))
+        except Exception:  # noqa: BLE001
+            pass
     cfg.mark_subscription_update(sub_id, True)
     return {
         "code": 0, "sub_id": sub_id,

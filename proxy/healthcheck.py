@@ -419,6 +419,62 @@ async def _scan_group(sources: list[dict], settings: dict, *, group: str,
             "deleted": deleted}
 
 
+async def verify_batch(ids: list[str], *, max_sources: int = 60) -> dict:
+    """导入后立即验证一小批新源（不等到 6 小时周期轮）。
+
+    阈值依据实测（2026-11-13，246）：正常源首字节 1~8s、慢源最慢 15s 左右，
+    所以单源 25s（= 巡检 patrol_timeout_s）能兜住绝大多数，又不至于把整批拖死。
+    并发按类型拆：纯 HTTP 的 CMS 8 路；spider / drpy / guard 这类要占 redroid
+    或 Node 单线程的，2 路（多开会互相排队，反而更慢）。
+    只测前 max_sources 个：溢出的留给周期巡检，不在这里硬扛。
+    """
+    if _config is None:
+        return {"checked": 0, "skipped": "no config"}
+    cfg = _config.config
+    want = {str(x) for x in ids if x}
+    if not want:
+        return {"checked": 0, "skipped": "empty"}
+    all_src = {str(s.get("id") or ""): s for s in cfg.all_sources()}
+    picked = [all_src[i] for i in list(want) if i in all_src][:max_sources]
+    if not picked:
+        return {"checked": 0, "skipped": "not found"}
+
+    def _heavy(s: dict) -> bool:
+        return bool(s.get("guard")) or str(s.get("stype") or "") in ("spider", "drpy")
+
+    cms = [s for s in picked if not _heavy(s)]
+    heavy = [s for s in picked if _heavy(s)]
+    settings = _settings()
+    meta = _STATE.get("_meta") if isinstance(_STATE.get("_meta"), dict) else {}
+    _STATE["_meta"] = meta
+    round_no = int(meta.get("round") or 0) + 1
+    meta["round"] = round_no
+
+    out = {"checked": 0, "ok": 0, "fail": 0, "revived": [], "disabled": [],
+           "groups": {}}
+    for group, conc in (("cms", 8), ("heavy", 2)):
+        batch = cms if group == "cms" else heavy
+        if not batch:
+            continue
+        st = dict(settings)
+        st["concurrency"] = conc
+        try:
+            rep = await _scan_group(batch, st, group="active", round_no=round_no)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("verify_batch %s failed: %s", group, type(exc).__name__)
+            continue
+        out["groups"][group] = rep
+        out["checked"] += int(rep.get("checked") or 0)
+        out["revived"].extend(rep.get("revived") or [])
+        out["disabled"].extend(rep.get("disabled") or [])
+    # _scan_group 不回 ok，用落盘后的 verified 反查（同一份配置对象）
+    now_ok = {str(x.get("id") or "") for x in cfg.all_sources()
+              if x.get("verified") is True}
+    out["ok"] = len([s for s in picked if str(s.get("id") or "") in now_ok])
+    out["fail"] = max(0, out["checked"] - out["ok"])
+    return out
+
+
 async def scan_once(*, force: bool = False) -> dict:
     """跑一轮巡检（防止并发：启动首检与手动触发撞上时，只跑一轮）。"""
     global _RUNNING

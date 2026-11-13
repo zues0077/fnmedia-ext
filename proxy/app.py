@@ -10904,9 +10904,20 @@ async def ext_classify_dedupe_default():
 
 @app.post("/v/api/ext/classify/rebuild")
 async def ext_classify_rebuild(request: Request):
-    """按当前规则重建分类路由。后台跑，旧库在整表替换前一直可用。"""
-    _schedule_routes_refresh()
-    return {"code": 0, "msg": "已开始按当前规则重建，几十秒后刷新查看"}
+    """按当前规则重建分类路由。
+
+    body: {full: true} 强制全量；默认走增量（只探测分类表变化/新增/上轮缺失的源，
+    快很多；日常改规则、加源都不需要全量）。
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    full = bool(body.get("full"))
+    _schedule_routes_refresh(full=full)
+    return {"code": 0,
+            "msg": ("已开始**全量**重建，几分钟后刷新查看" if full
+                    else "已开始增量重建（只补变化/缺失的源），约 1~2 分钟")}
 
 
 # ---------- 自定义虚拟库（手动新增/改名/删除分类） ----------
@@ -11831,13 +11842,22 @@ def _apply_rules_local_or_fallback(names: list[str]) -> dict:
 
 
 _ROUTES_REFRESH_PENDING = False
+_ROUTES_REFRESH_FULL = False
 
 
-def _schedule_routes_refresh():
-    global _ROUTES_REFRESH_PENDING
+def _schedule_routes_refresh(full: bool = False):
+    """排一轮重建。full=True 时强制全量（忽略增量缓存）。
+
+    增量建库（2026-11-13）后，日常重建只探测「分类表变化/新增/上轮缺失」的源；
+    修复源站或想彻底重算时用 full。
+    """
+    global _ROUTES_REFRESH_PENDING, _ROUTES_REFRESH_FULL
     if _ROUTES_REFRESH_PENDING:
         # 已经有一轮在等（它会等当前轮结束后按**最新规则**再跑一遍）：
-        # 连续保存 N 条时不要排 N 轮，否则用户要等 N×30 秒。
+        # 连续保存 N 条时不要排 N 轮，否则用户要等 N×30 秒。但 full 请求要升级，
+        # 否则「点全量重建」会被已排队的那轮吞掉、变成增量。
+        if full:
+            _ROUTES_REFRESH_FULL = True
         return
 
     async def _run_after_current():
@@ -11848,6 +11868,7 @@ def _schedule_routes_refresh():
             _ROUTES_REFRESH_PENDING = False
 
     async def _run_refresh_once():
+        global _ROUTES_REFRESH_FULL
         # 刷新进行中时不能丢事件：连续“关→开”切换若把“开”丢掉，
         # 关状态的重建会先落地且再无重建，扩展库卡永远回不来。
         # 等当前这轮结束再按最新配置补跑一次（refresh_routes 自身有重入保护）。
@@ -11856,11 +11877,18 @@ def _schedule_routes_refresh():
             await asyncio.sleep(2)
             waited += 2
         if not catalog._refreshing:
-            await catalog.refresh_routes(config.enabled_sources())
+            _full_now = bool(_ROUTES_REFRESH_FULL)
+            _ROUTES_REFRESH_FULL = False
+            await catalog.refresh_routes(config.enabled_sources(), full=_full_now)
 
     _ROUTES_REFRESH_PENDING = True
+    if full:
+        _ROUTES_REFRESH_FULL = True
     try:
-        asyncio.create_task(_run_after_current())
+        _t = asyncio.create_task(_run_after_current())
+        # 保留强引用，避免排好的重建被执行前被 GC（见 _spawn_bg 注释）
+        _BG_TASKS.add(_t)
+        _t.add_done_callback(_BG_TASKS.discard)
     except Exception:
         _ROUTES_REFRESH_PENDING = False
 

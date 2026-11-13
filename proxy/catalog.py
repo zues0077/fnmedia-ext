@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import hashlib
 import os
 import re
 import threading
@@ -980,6 +981,12 @@ class Catalog:
         # 不标的话，用户看到的「未归类 N 条」其实是「本轮连通的那批源」的快照，
         # 源一抖动数字就变，会被误判成规则失效（2026-11-12 实测：112 → 260）。
         self._fetch_failed: set[str] = set()
+        # 增量建库（2026-11-13）：分类表指纹 → 分类没变的源不再重新探测。
+        # 每轮重建要发上千个分类页请求（98 源 × 多分类），全量约 8 分钟；
+        # 增量后日常只剩装载（每源一个 ac=list），约 1~2 分钟。
+        self._class_hash: dict[str, str] = {}
+        self._changed_sids: set[str] = set()
+        self._unchanged_sids: set[str] = set()
         # 上一轮建库覆盖报告：{sources, loaded, missing:[名字], at}
         self._build_report: dict[str, Any] = {}
 
@@ -1082,6 +1089,10 @@ class Catalog:
                                if isinstance(meta, dict)}
                     for sid, leaves in li.items()
                     if isinstance(leaves, dict) and (not cfg_ok or str(sid) in live)}
+            # 分类表指纹：重启后第一次重建仍能走增量（不必全量重探上千个分类页）
+            ch = data.get("class_hash") or {}
+            if isinstance(ch, dict) and ch:
+                self._class_hash = {str(k): str(v) for k, v in ch.items() if v}
         return True
 
     def save_disk(self) -> bool:
@@ -1100,6 +1111,8 @@ class Catalog:
                     # 叶子索引（名字→type_id/父id/基线）：持久化后重启仍能做
                     # 「规则本地化」重算，不必先等一轮 20~40 秒的全量重建。
                     "leaf_index": {sid: dict(v) for sid, v in self._leaf_index.items()},
+                    # 分类表指纹：重启后第一次重建仍走增量（不必全量重探）
+                    "class_hash": dict(self._class_hash),
                     "updated": int(self._updated),
                     "classes": {k: v for k, v in self._classes.items() if v},
                     "routes": {k: v for k, v in self._routes.items() if v},
@@ -1129,8 +1142,19 @@ class Catalog:
             return []
 
     # -------------------------------------------------- 分类表 / 路由
-    async def refresh_routes(self, sources: list[dict]) -> dict[str, Any]:
+    async def refresh_routes(self, sources: list[dict],
+                             full: bool = False) -> dict[str, Any]:
+        """重建分类路由。
+
+        full=False（默认）时走**增量**：分类表指纹与上一轮相同的源不重新探测，
+        直接继承上一轮的路由条目；只探测新增/分类变化/上一轮缺失的源。
+        full=True 强制全量（首轮、或用户点「全量重建」）。
+        """
         # T4 browsing is not CMS deep crawling; never pre-expand cloud plugins.
+        self._changed_sids = set()
+        self._unchanged_sids = set()
+        if full:
+            self._class_hash = {}
         sources = [s for s in sources if s.get("kind") not in ("t4", "live")]
         scopes = set(self.standalone_scopes())
         # drpy / csp 爬虫只服务「独立媒体库」：它们每页 20~40 条、靠 sidecar 串行，
@@ -1245,12 +1269,34 @@ class Catalog:
                         "at": int(time.time()),
                     }
 
+            # 增量：分类表没变的源直接继承上一轮路由条目，不重新探测。
+            # 只继承「上一轮真的建出来过」的条目（有 type_id）；上一轮缺的源
+            # 不在 _unchanged_sids 里，会被当成本轮探测对象重试，符合「失败即淘汰」。
+            _carried: set[str] = set()
+            _carry_map: dict[tuple[str, str], dict] = {}
+            if self._unchanged_sids:
+                for _k, _arr in (self._routes or {}).items():
+                    if ":" not in str(_k) or not isinstance(_arr, list):
+                        continue
+                    _cat0 = str(_k).split(":", 1)[1]
+                    if not _cat0:
+                        continue
+                    for _r in _arr:
+                        _sid0 = str((_r or {}).get("source_id") or "")
+                        if _sid0 in self._unchanged_sids and (_r or {}).get("type_id"):
+                            _carry_map[(_cat0, _sid0)] = dict(_r)
+                            _carried.add(_sid0)
+            if _carried:
+                _log.info("catalog: incremental, %d sources carried over",
+                          len(_carried))
             # 每个源每类先探测一个代表性叶子；首选超时/空时，回退探测该类下
             # 其它叶子，选能连通且页数最多的（部分私有源个别分类响应很慢）。
             # all_by_cat[(sid,cat)] = [cl,...]，首个为首选。
             all_by_cat: dict[tuple[str, str], list[dict]] = {}
             order: list[tuple[str, str]] = []
             for sid, classes in self._classes.items():
+                if sid in _carried:
+                    continue          # 增量：分类没变且上轮已建出路由
                 if sid in lazy_ids or _src_kind(self._source_by_id(sid) or {}) in ("drpy", "spider"):
                     continue          # 非 CMS 源不预探（见上）
                 per_cat: dict[str, list[dict]] = {}
@@ -1262,7 +1308,8 @@ class Catalog:
                     key = (sid, cat)
                     all_by_cat[key] = cls
                     order.append(key)
-            probed: dict[tuple[str, str], dict] = {}
+            # 先放进「沿用上一轮」的条目，再叠加本轮探测结果（同 key 后者覆盖）
+            probed: dict[tuple[str, str], dict] = dict(_carry_map)
             # 反应快、有搜索命中的源先建库：order 按 rank_sources 的位置排，
             # 慢源/死源沉到最后——即使这轮轮不到，也不影响前面的库先建出来。
             try:
@@ -1472,6 +1519,23 @@ class Catalog:
             return
         with self._lock:
             self._fetch_failed.discard(sid)
+        # 分类表指纹（增量建库）：type_id/名字/父id 的稳定哈希。分类表没变，说明
+        # 上一轮探测出的代表叶子依然有效，不必再打上千个分类页请求。
+        try:
+            _fp = hashlib.md5("|".join(
+                "%s|%s|%s" % (x.get("type_id"), x.get("type_name"),
+                              x.get("type_pid") or "0") for x in cls
+            ).encode("utf-8")).hexdigest()
+        except Exception:  # noqa: BLE001
+            _fp = ""
+        with self._lock:
+            _old_fp = self._class_hash.get(sid)
+            if _fp:
+                self._class_hash[sid] = _fp
+            if _fp and _old_fp and _fp == _old_fp:
+                self._unchanged_sids.add(sid)
+            else:
+                self._changed_sids.add(sid)
         # 只取叶子子类：苹果CMS 的父类（电影片/连续剧…）不聚合子类、只有零星条目，
         # 真正可深翻的是动作片/国产剧这类子分类。
         pids_with_child = {str(x.get("type_pid") or "0") for x in cls

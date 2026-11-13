@@ -382,7 +382,8 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div id="clsRules"></div>
         <div class="btn-row">
           <button class="small" onclick="loadClassRules()">刷新</button>
-          <button class="primary small" onclick="clsRebuild()">按当前规则重建海量库</button>
+          <button class="primary small" onclick="clsRebuild()">增量重建（只补变化/缺失）</button>
+          <button class="small" onclick="clsRebuildFull()" title="重新探测所有源的全部分类，8~10 分钟">全量重建</button>
         </div>
       </div>
 
@@ -2129,9 +2130,17 @@ async function clsDel(btn){
 }
 
 async function clsRebuild(){
-  if(!confirm("按当前规则重建海量库？后台进行，几十秒后生效，期间旧库照常可用。"))return;
+  if(!confirm("增量重建海量库？\n\n只补「分类表变化 / 新增 / 上一轮缺失」的源，通常 1~2 分钟；"
+             +"分类表没变的源直接沿用上一轮路由，不重复探测。期间旧库照常可用。"))return;
   const r=await jpost("/v/api/ext/classify/rebuild",{},15000);
   toast(r.msg||"已开始重建");
+  if(r.code===0)clsWatch();
+}
+async function clsRebuildFull(){
+  if(!confirm("全量重建海量库？\n\n会重新探测所有源的全部分类，现有 100+ 源约需 8~10 分钟。"
+             +"仅在「怀疑库内容不对 / 源站恢复后想彻底重算」时用。"))return;
+  const r=await jpost("/v/api/ext/classify/rebuild",{full:true},15000);
+  toast(r.msg||"已开始全量重建");
   if(r.code===0)clsWatch();
 }
 

@@ -10826,6 +10826,51 @@ async def ext_classify_rules_batch(request: Request):
             "local": local}
 
 
+@app.get("/v/api/ext/classify/rules-export")
+async def ext_classify_rules_export():
+    """导出规则 JSON（用户规则；用于备份 / 沉淀为基准规则）。"""
+    import json as _json
+    payload = {
+        "v": 1,
+        "kind": "fnmedia-ext-classify-rules",
+        "exported_at": int(time.time()),
+        "rules": [{"k": r.get("k"), "cat": r.get("cat"),
+                   "exact": bool(r.get("exact", True))}
+                  for r in catalogmod._read_rule_file()],
+    }
+    body = _json.dumps(payload, ensure_ascii=False, indent=1)
+    return Response(content=body, media_type="application/json",
+                    headers={"Content-Disposition":
+                             'attachment; filename="classify_rules.json"'})
+
+
+@app.post("/v/api/ext/classify/rules-import")
+async def ext_classify_rules_import(request: Request):
+    """导入规则 JSON。body: {rules:[{k,cat,exact}], replace?:bool}
+
+    默认与现有规则合并（同名同 exact 覆盖）；replace=true 整表替换。
+    导入后立即本地重算（不联网），并刷新搜索缓存。
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    items = body.get("rules")
+    if items is None and isinstance(body.get("data"), dict):
+        items = body["data"].get("rules")
+    if not isinstance(items, list) or not items:
+        return JSONResponse({"code": 400, "msg": "rules 需为非空数组"},
+                            status_code=400)
+    n, msg = catalogmod.merge_rules(items, replace=bool(body.get("replace")))
+    if n <= 0:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    local = _apply_rules_local_or_fallback(
+        [str(x.get("k") or x.get("name") or "") for x in items])
+    return {"code": 0, "msg": msg,
+            "data": {"imported": n, "rules": catalogmod.rules_snapshot()},
+            "local": local}
+
+
 @app.post("/v/api/ext/classify/rebuild")
 async def ext_classify_rebuild(request: Request):
     """按当前规则重建分类路由。后台跑，旧库在整表替换前一直可用。"""

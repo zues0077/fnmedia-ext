@@ -61,6 +61,12 @@ SLOW_LOAD_BATCH = int(os.environ.get("FNMD_SLOW_LOAD_BATCH") or 5)
 # 每轮最多补多少个慢源（其余下一轮轮转继续）：不限制的话 120 个慢源 × 批 5 ×
 # 10s 预算会把单轮重建拖到 8 分钟（2026-11-13 实测 494s）。
 SLOW_LIMIT = int(os.environ.get("FNMD_SLOW_LIMIT") or 40)
+# 探测阶段按「源」分批：每批几个源、每源同时探几个分类。
+PROBE_SRC_BATCH = int(os.environ.get("FNMD_PROBE_SRC_BATCH") or 5)
+PROBE_SRC_CONC = int(os.environ.get("FNMD_PROBE_SRC_CONC") or 6)
+# 探测单类预算：实测调到 6s 并不省总时长（总耗时不在超时上），路由反而少 5%
+# （668 → 633），所以默认回到 10s（等于原 BUILD_BUDGET），需要时用环境变量调。
+PROBE_BUDGET = float(os.environ.get("FNMD_PROBE_BUDGET") or 10.0)
 PROBE_BATCH = int(os.environ.get("FNMD_PROBE_BATCH") or 10)
 # >>> OPTIONAL:DISK CACHE
 # 分类表 + 路由落盘：重启后先按上次结果出库（秒开），后台再按 CLASS_REFRESH 刷。
@@ -1284,7 +1290,7 @@ class Catalog:
                     try:
                         _lst, pc = await asyncio.wait_for(
                             _fetch_category_page(client, source, cl["type_id"], 1),
-                            timeout=BUILD_BUDGET)
+                            timeout=PROBE_BUDGET)
                     except Exception:  # noqa: BLE001
                         return ("fail", None)
                     if not _lst:
@@ -1297,21 +1303,50 @@ class Catalog:
                 # 分批探测：order 是「源 × 分类」，150 源时可达数百个；一次性
                 # gather 会瞬间打出数百请求（第二轮每项再试 8 个叶子 → 上千），
                 # 源站直接限流，表现为「重建完成但路由为 0」（2026-11-13 实测）。
-                first: list = []
-                for _i in range(0, len(order), max(1, PROBE_BATCH)):
-                    _chunk = order[_i:_i + max(1, PROBE_BATCH)]
-                    first.extend(await asyncio.gather(
-                        *[probe_one(sid, cat, all_by_cat[(sid, cat)][0])
-                          for sid, cat in _chunk],
-                        return_exceptions=True))
+                # 按源分组（order 已按源质量排好序，_src_order 保持该顺序）
+                _by_src: dict[str, list[str]] = {}
+                _src_order: list[str] = []
+                for _sid, _cat in order:
+                    if _sid not in _by_src:
+                        _by_src[_sid] = []
+                        _src_order.append(_sid)
+                    _by_src[_sid].append(_cat)
+
                 missing: list[tuple[str, str]] = []
-                for (sid, cat), res in zip(order, first):
-                    st, payload = res if isinstance(res, tuple) else ("fail", None)
-                    if st == "ok" and isinstance(payload, dict):
-                        probed[(cat, sid)] = payload
-                    elif st == "empty":
-                        # 只对「能连通但空」的换叶子；连接失败的直接放弃本轮
-                        missing.append((sid, cat))
+
+                async def _probe_source_cats(sid: str) -> None:
+                    """探一个源的全部候选分类，单源内部限并发。
+
+                    按源分批：一批只有 PROBE_SRC_BATCH 个源、每源最多
+                    PROBE_SRC_CONC 个分类在飞 → 瞬时请求可控（默认 30），
+                    批数从「源×类/10」降到「源/5」。
+                    """
+                    _sem = asyncio.Semaphore(max(1, PROBE_SRC_CONC))
+                    cats = _by_src.get(sid) or []
+
+                    async def _one(cat: str):
+                        async with _sem:
+                            return cat, await probe_one(
+                                sid, cat, all_by_cat[(sid, cat)][0])
+
+                    res = await asyncio.gather(
+                        *[_one(c) for c in cats], return_exceptions=True)
+                    for item in res:
+                        if not isinstance(item, tuple):
+                            continue
+                        cat, r = item
+                        st, payload = r if isinstance(r, tuple) else ("fail", None)
+                        if st == "ok" and isinstance(payload, dict):
+                            probed[(cat, sid)] = payload
+                        elif st == "empty":
+                            # 只对「能连通但空」的换叶子；连接失败的直接放弃本轮
+                            missing.append((sid, cat))
+
+                for _i in range(0, len(_src_order), max(1, PROBE_SRC_BATCH)):
+                    await asyncio.gather(
+                        *[_probe_source_cats(_s)
+                          for _s in _src_order[_i:_i + max(1, PROBE_SRC_BATCH)]],
+                        return_exceptions=True)
 
                 # 第二轮：对首轮空页的(源,类)，并发尝试其余叶子，取页数最多者
                 async def rescue(sid, cat):
@@ -1329,10 +1364,25 @@ class Catalog:
                         probed[(cat, sid)] = ok[0]
                         # 记录备用叶子，供翻页超时/空页时同类并发竞速回退
                         self._fallbacks[(sid, cat)] = ok[1:7]
-                for _i in range(0, len(missing), max(1, PROBE_BATCH)):
+                # 第二轮同样按源分批：一个源的空页分类一起补，批间顺序。
+                _miss_by_src: dict[str, list[str]] = {}
+                for _sid, _cat in missing:
+                    _miss_by_src.setdefault(_sid, []).append(_cat)
+
+                async def _rescue_source(sid: str) -> None:
+                    _sem = asyncio.Semaphore(max(1, PROBE_SRC_CONC))
+                    async def _one(cat):
+                        async with _sem:
+                            await rescue(sid, cat)
+                    await asyncio.gather(*[_one(c) for c in _miss_by_src[sid]],
+                                         return_exceptions=True)
+
+                _msrc = list(_miss_by_src)
+                for _i in range(0, len(_msrc), max(1, PROBE_SRC_BATCH)):
                     await asyncio.gather(
-                        *[rescue(s, c) for s, c in missing[_i:_i + max(1, PROBE_BATCH)]],
-                                     return_exceptions=True)
+                        *[_rescue_source(_s)
+                          for _s in _msrc[_i:_i + max(1, PROBE_SRC_BATCH)]],
+                        return_exceptions=True)
 
             def routes_for_scope(scope: str) -> dict[str, list[dict]]:
                 out: dict[str, list[dict]] = {}

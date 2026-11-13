@@ -140,6 +140,11 @@ label.btn:hover,label.btn-sm:hover{background:var(--accent-soft)}
 .stat .l{font-size:12px;color:var(--muted)}
 .lib-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
 /* 分类规则：一行一个名字，紧凑不铺满整屏 */
+.cls-chips{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 8px}
+.cls-chip{border:1px solid var(--line);background:transparent;color:inherit;border-radius:14px;
+  padding:3px 10px;font-size:12px;cursor:pointer;line-height:1.4}
+.cls-chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.cls-chip:hover{border-color:var(--accent)}
 .cls-batch{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0 8px;padding:8px 10px;
   background:rgba(127,127,127,.06);border:1px solid rgba(127,127,127,.16);border-radius:8px}
 .cls-ck-ph{width:15px;height:15px;flex:0 0 auto;display:inline-block}
@@ -374,8 +379,7 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div class="hint" id="clsStat">加载中…</div>
         <div id="clsPool"></div>
         <div id="clsPending"></div>
-        <div id="clsUser"></div>
-        <div id="clsDefaults"></div>
+        <div id="clsRules"></div>
         <div class="btn-row">
           <button class="small" onclick="loadClassRules()">刷新</button>
           <button class="primary small" onclick="clsRebuild()">按当前规则重建海量库</button>
@@ -1825,37 +1829,7 @@ function renderClassRules(){
     }
   }
 
-  const users=rules.user||[],ubox=$("clsUser");
-  if(ubox){
-    ubox.innerHTML=users.length
-      ? '<div class="hint" style="margin-top:12px">你的自定义规则（'+users.length+' 条，可直接改分类后保存）</div>'
-        +'<div class="cls-rows">'+users.map(u=>{
-          const pend=CLS_PENDING.has(u.k);
-          return '<div class="cls-row" data-name="'+esc(u.k)+'">'
-            +'<span class="cls-name" title="'+esc(u.k)+'">'+esc(u.k)+'</span>'
-            +(pend
-              ? '<span class="tag warn">已保存 → '+esc(clsCatTitle(cats,u.cat))+'，建库中…</span>'
-              : '<select class="input cls-sel">'+clsOpts(cats,u.cat===undefined?null:u.cat)+'</select>'
-                +'<span class="muted sm">'+(u.overrides_default?"覆盖默认":"新增")+'</span>'
-                +'<button class="btn sm" onclick="clsSave(this)">保存</button>')
-            +'<button class="btn sm" data-k="'+esc(u.k)+'" data-e="'+(u.exact?1:0)+'" onclick="clsDel(this)">恢复默认</button></div>';
-        }).join("")+'</div>'
-      : '';
-  }
-  const pend=((CLSR||{}).rules||{}).pending||[];
-  const pb=$("clsPending");
-  if(pb){
-    pb.innerHTML=pend.length
-      ? '<div class="hint" style="margin-top:10px">已配好规则、等源恢复的 '+pend.length
-        +' 条（规则已生效，源一连通就自动归位）</div>'
-        +'<div class="cls-rows">'+pend.slice(0,12).map(x=>
-          '<div class="cls-row"><span class="cls-ck-ph"></span>'
-          +'<span class="cls-name">'+esc(x.k)+'</span>'
-          +'<span class="tag">'+esc(clsCatTitle(cats,x.cat))+'</span>'
-          +'<span class="muted sm">待源恢复</span></div>').join("")+'</div>'
-      : '';
-  }
-  renderDefaultRules();
+  renderRulesList();
 }
 
 async function clsSuggest(btn){
@@ -1881,6 +1855,102 @@ async function clsSuggest(btn){
     toast("已按建议预选 "+filled+" 条（其中高置信 "+conf+" 条）。核对后点「批量保存」即可。");
   }catch(e){toast("生成建议失败："+(e.message||e),"fail");}
   finally{btn.disabled=false;btn.textContent=old||"✨ 智能建议";}
+}
+
+let CLS_RF={q:"",src:"all",cat:"all"},CLS_RF_OPEN=false;
+function renderRulesList(){
+  const box=$("clsRules");if(!box)return;
+  const rules=(CLSR||{}).rules||{},cats=(CLSR||{}).cats||[];
+  const users=rules.user||[],defs=rules.defaults||[];
+  const uk=new Set(users.map(u=>(u.k||"").toLowerCase()));
+  const rows=[];
+  users.forEach(u=>rows.push({k:u.k,cat:u.cat,exact:u.exact!==false,src:"user",over:!!u.overrides_default}));
+  defs.forEach(d=>{
+    if(uk.has((d.k||"").toLowerCase()))return;
+    rows.push({k:d.k,cat:d.cat,exact:d.exact!==false,src:"default",over:false});
+  });
+  const q=(CLS_RF.q||"").toLowerCase();
+  const list=rows.filter(r=>{
+    if(q&&!(r.k||"").toLowerCase().includes(q))return false;
+    if(CLS_RF.src==="user"&&r.src!=="user")return false;
+    if(CLS_RF.src==="default"&&r.src!=="default")return false;
+    if(CLS_RF.cat!=="all"){
+      const c=r.cat===null?"__drop__":(r.cat||"__none__");
+      if(c!==CLS_RF.cat)return false;
+    }
+    return true;
+  });
+  const nUser=rows.filter(r=>r.src==="user").length;
+  const show=CLS_RF_OPEN?list:list.slice(0,30);
+  const opt=(v,t,cur)=>"<option value=\""+esc(v)+"\""+(v===cur?" selected":"")+">"+esc(t)+"</option>";
+  box.innerHTML="<div class=\"hint\" style=\"margin-top:14px\">已配置规则（共 "+rows.length
+      +" 条：用户配置 "+nUser+" · 系统默认 "+(rows.length-nUser)
+      +"）—— 同一分类名在哪源都归同一个库</div>"
+    +"<div class=\"cls-batch\">"
+    +"<input class=\"input\" placeholder=\"搜索名字…\" value=\""+esc(CLS_RF.q||"")+"\" oninput=\"clsRfQ(this.value)\" style=\"max-width:170px\"/>"
+    +"<select class=\"input\" onchange=\"clsRfSrc(this.value)\" style=\"max-width:130px\">"
+      +opt("all","全部来源",CLS_RF.src)+opt("user","用户配置",CLS_RF.src)+opt("default","系统默认",CLS_RF.src)+"</select>"
+    +"<select class=\"input\" onchange=\"clsRfCat(this.value)\" style=\"max-width:130px\">"
+      +opt("all","全部库",CLS_RF.cat)
+      +(cats||[]).map(c=>opt(c.id,c.title,CLS_RF.cat)).join("")
+      +opt("__drop__","✕ 不收录",CLS_RF.cat)+"</select>"
+    +"<span class=\"muted sm\">匹配 "+list.length+" 条</span>"
+    +"<select class=\"input\" id=\"clsRuleCat\" style=\"max-width:130px\">"+clsOpts(cats)+"</select>"+"<button class=\"btn sm\" onclick=\"clsRuleBatch(this)\">批量改库<span id=\"clsRuleN\"></span></button>"
+    +(list.length>30?"<button class=\"small\" onclick=\"clsRfToggle()\">"+(CLS_RF_OPEN?"收起":("展开全部 "+list.length+" 条"))+"</button>":"")
+    +"</div>"
+    +"<div class=\"cls-chips\">"
+      +"<b class=\"sm\">按分类：</b>"
+      +(function(){
+          const cnt={};
+          rows.forEach(r=>{const k=r.cat===null?"__drop__":(r.cat||"__none__");cnt[k]=(cnt[k]||0)+1;});
+          const one=(v,t)=>'<button class="cls-chip'+(CLS_RF.cat===v?' on':'')+'" onclick="clsRfCat(\''+v+'\')">'+esc(t)+' ('+(cnt[v]||0)+')</button>';
+          return one("all","全部")+(cats||[]).map(c=>one(c.id,c.title)).join("")
+                 +one("__drop__","不收录");
+        })()
+    +"</div>"
+    +"<div class=\"cls-rows\">"+show.map(r=>{
+        return "<div class=\"cls-row\" data-name=\""+esc(r.k)+"\">"
+          +"<input type=\"checkbox\" class=\"cls-rk\" data-name=\""+esc(r.k)+"\" onchange=\"clsRuleCount()\" style=\"width:15px;height:15px;flex:0 0 auto\"/>"
+          +"<span class=\"cls-name\" title=\""+esc(r.k)+"\">"+esc(r.k)+"</span>"
+          +(r.src==="user"
+            ?"<span class=\"tag warn\">用户配置"+(r.over?" · 覆盖默认":"")+"</span>"
+            :"<span class=\"tag\">系统默认</span>")
+          +"<select class=\"input cls-sel\">"+clsOpts(cats,r.cat===undefined?null:r.cat)+"</select>"
+          +"<button class=\"btn sm\" onclick=\"clsSave(this)\">保存</button>"
+          +(r.src==="user"
+            ?"<button class=\"btn sm\" data-k=\""+esc(r.k)+"\" data-e=\""+(r.exact?1:0)+"\" onclick=\"clsDel(this)\">恢复默认</button>"
+            :"")
+          +"</div>";
+      }).join("")+"</div>"
+    +(list.length===0?"<div class=\"muted sm\" style=\"padding:6px 0\">没有匹配的规则</div>":"");
+}
+function clsRfQ(v){CLS_RF.q=(v||"").trim();renderRulesList();}
+function clsRfSrc(v){CLS_RF.src=v||"all";renderRulesList();}
+function clsRfCat(v){CLS_RF.cat=v||"all";renderRulesList();}
+function clsRfToggle(){CLS_RF_OPEN=!CLS_RF_OPEN;renderRulesList();}
+function clsRuleCount(){
+  const n=document.querySelectorAll(".cls-rk:checked").length,el=$("clsRuleN");
+  if(el)el.textContent=n?("（"+n+"）"):"";
+}
+async function clsRuleBatch(btn){
+  const names=Array.from(document.querySelectorAll(".cls-rk:checked"))
+    .map(el=>el.getAttribute("data-name")||"").filter(Boolean);
+  if(!names.length){toast("先勾选要改的规则（可先用上方筛选缩小范围）","fail");return;}
+  const catSel=$("clsRuleCat");
+  const cat=catSel?catSel.value:"";
+  if(!cat){toast("先在「批量改库」左边的下拉里选目标库","fail");return;}
+  const real=cat==="__drop__"?null:cat;
+  btn.disabled=true;const old=btn.textContent;btn.textContent="保存中…";
+  try{
+    const r=await jpost("/v/api/ext/classify/rules-batch",
+      {items:names.map(n=>({name:n,cat:real})),exact:true},20000);
+    if(r.code===0){
+      if(r.data&&r.data.rules&&CLSR)CLSR.rules=r.data.rules;
+      toast("已改 "+names.length+" 条 → "+clsCatTitle((CLSR||{}).cats,real));
+      renderRulesList();
+    }else{toast(r.msg||"批量改库失败","fail");}
+  }catch(e){toast("批量改库失败："+(e.message||e),"fail");}
+  finally{btn.disabled=false;btn.textContent=old||"批量改库";clsRuleCount();}
 }
 
 function clsChecked(){
@@ -1921,31 +1991,7 @@ async function clsBatchSave(btn){
   }finally{btn.disabled=false;btn.textContent=old||"批量保存";clsSyncCount();}
 }
 
-let CLS_DEF_OPEN=false,CLS_DEF_Q="";
-function clsDefToggle(){CLS_DEF_OPEN=!CLS_DEF_OPEN;renderDefaultRules();}
-function clsDefSearch(v){CLS_DEF_Q=(v||"").trim();renderDefaultRules();}
-function renderDefaultRules(){
-  const box=$("clsDefaults");if(!box)return;
-  const cats=((CLSR||{}).cats)||[],defs=(((CLSR||{}).rules||{}).defaults)||[];
-  if(!defs.length){box.innerHTML="";return;}
-  const q=CLS_DEF_Q.toLowerCase();
-  const list=q?defs.filter(d=>(d.k||"").toLowerCase().includes(q)):defs;
-  const show=CLS_DEF_OPEN?list:list.slice(0,20);
-  box.innerHTML='<div class="hint" style="margin-top:12px">已生效的默认规则（'+defs.length+' 条，可直接改；改动会写进你的规则并覆盖默认）</div>'
-    +'<div class="cls-batch"><input class="input" placeholder="搜索名字…" value="'+esc(CLS_DEF_Q)+'" oninput="clsDefSearch(this.value)" style="max-width:200px"/>'
-    +'<span class="muted sm">共 '+list.length+' 条匹配</span></div>'
-    +'<div class="cls-rows">'+show.map(d=>
-        '<div class="cls-row" data-name="'+esc(d.k)+'">'
-        +'<span class="cls-ck-ph"></span>'
-        +'<span class="cls-name" title="'+esc(d.k)+'">'+esc(d.k)+'</span>'
-        +'<span class="muted sm">'+(d.exact?"精确":"关键词")+'</span>'
-        +(d.overridden?'<span class="tag warn">已被你覆盖</span>':'<span class="tag">默认</span>')
-        +'<select class="input cls-sel">'+clsOpts(cats,d.cat===undefined?null:d.cat)+'</select>'
-        +'<button class="btn sm" onclick="clsSave(this)">保存</button>'
-        +'</div>').join("")+'</div>'
-    +(list.length>20?'<div class="btn-row"><button class="small" onclick="clsDefToggle()">'
-      +(CLS_DEF_OPEN?'收起':('展开全部 '+list.length+' 条'))+'</button></div>':'');
-}
+/* 旧的「用户规则 / 默认规则」两块已合并到 renderRulesList（2026-11-13） */
 
 function clsToggle(){clsOpen=!clsOpen;renderClassRules();}
 

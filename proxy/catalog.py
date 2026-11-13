@@ -583,6 +583,9 @@ def rules_snapshot() -> dict:
         "default_total": len(_DEFAULT_RULES),
         "user": users,
         "defaults": defaults_list,
+        # 已配规则但当前没有源提供该分类（源失效/已删）：规则已生效，等源恢复自动归位
+        "pending": (globals().get("catalog").rules_pending_materialize()
+                    if globals().get("catalog") else []),
     }
 
 
@@ -1457,6 +1460,31 @@ class Catalog:
                         "conf": conf, "sources": len(sids)})
         return out
 
+    def rules_pending_materialize(self) -> list[dict]:
+        """已保存、但当前没有任何源提供该分类名的规则（源失效或已删）。
+
+        这类规则**已经落盘、已经生效**，只是暂时没有 type_id 可以建路由；
+        源恢复后下一轮重建会自动归位。给管理页显示「等源恢复」用。
+        """
+        names: set[str] = set()
+        for leaves in self._leaf_index.values():
+            names.update(leaves.keys())
+        with self._lock:
+            for names_list in self._unclassified.values():
+                names.update(str(n) for n in names_list)
+        out = []
+        seen = set()
+        for r in _read_rule_file():
+            k = str(r.get("k") or "").strip()
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            if k in names:
+                continue
+            out.append({"k": k, "cat": r.get("cat"),
+                        "exact": bool(r.get("exact", True))})
+        return out
+
     def apply_rules_local(self) -> dict:
         """规则本地化：只用本地缓存重算「分类 → 路由」，**完全不联网**。
 
@@ -1516,7 +1544,13 @@ class Catalog:
                 new_classes[sid] = items
         for sid, names_list in self._unclassified.items():
             if sid not in leaf and names_list:
-                new_unc[sid] = list(names_list)
+                # 源本轮没连通（走缓存）：没有 type_id 不能建路由，但**规则已经生效**，
+                # 名字要立刻从未归类池摘掉——否则用户点了分类还看到它，以为没成功。
+                # 等源恢复、下一轮重建拿到 type_id 后，规则会自动把它归到对应库。
+                new_unc[sid] = [nm for nm in names_list if not rule_hit(str(nm))[0]]
+                _dropped = len(names_list) - len(new_unc[sid])
+                if _dropped:
+                    changed += _dropped
         for sid, leaves in leaf.items():
             if sid not in enabled:
                 continue

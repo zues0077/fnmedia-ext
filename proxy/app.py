@@ -12589,13 +12589,14 @@ async def ext_import_subscription(request: Request):
             cms_added.append(c["name"])
             cms_added_ids.append(sid)
             existing.add(key)
-            # 成人站自动打 18：名字能判出来的立刻标；判不出来的交给后台内容判定
-            # （不拖慢导入）。打错会让源从全局搜索消失，所以判定一律保守。
+            # 成人站自动打 18：进「🔞福利」库而不是混进普通搜索/海量库。
+            # 名字能判出来的立刻标；判不出来的交给后台内容判定（不拖慢导入）。
             try:
                 if catalogmod.looks_adult_source(c["name"]):
                     if config.set_adult(sid, True)[0]:
                         cms_adult_auto.append(c["name"])
                 else:
+                    # 名字看不出（美少女/水机/香奶/湿妹/AV…）→ 落地后按内容再判
                     cms_adult_pending.append((sid, c["name"], c["api"]))
             except Exception:  # noqa: BLE001
                 pass

@@ -1162,12 +1162,15 @@ class Catalog:
         # 短剧站的子类叫「重生民国 / 都市脑洞 / 古装仙侠 / 闪婚离婚」，光看名字
         # 判不出类型（实测暴风资源 8 个这类分类）：不继承就会被「打 18」的兜底
         # 吞进福利库；不打 18 时更糟——整个被丢掉，短剧库永远是空的。
+        parent_base: dict[str, str | None] = {}
         parent_cat = {}
         for x in cls:
             try:
                 # 父类一律按「不带 18 授权」判，免得父类自己靠 adult 兜底成
                 # 福利库后，把子分类一起拖进去。
                 parent_cat[str(x.get("type_id"))] = classify_source_class(
+                    str(x.get("type_name") or ""), False)
+                parent_base[str(x.get("type_id"))] = classify_baseline(
                     str(x.get("type_name") or ""), False)
             except Exception:  # noqa: BLE001
                 continue
@@ -1199,8 +1202,18 @@ class Catalog:
                     cat = classify_source_class(name, adult_allowed)
                 if not is_leaf:
                     continue
-                _idx.setdefault(name, {"tid": tid, "pid": pid,
-                                       "base": classify_baseline(name, adult_allowed)})
+                # 基线必须和上面的判定顺序一致（名字 → 父类继承 → 18 兜底），
+                # 只是不含用户规则。漏了父类继承，本地重算会把短剧那类
+                # 「重生民国/都市脑洞」当成认不出丢掉，路由会越算越少
+                # （实测 45 → 3）。
+                _b = classify_baseline(name, False)
+                if _b is None and pid != "0" \
+                        and not any(k in name for k in _EXCLUDE_KW) \
+                        and not any(k in name.lower() for k in _NON_ADULT_KW):
+                    _b = parent_base.get(pid)
+                if _b is None:
+                    _b = classify_baseline(name, adult_allowed)
+                _idx.setdefault(name, {"tid": tid, "pid": pid, "base": _b})
                 if cat is None:
                     # 规则已命中但福利库关着，不算「没认出来」，别塞进池子让
                     # 用户以为规则没生效。

@@ -1004,6 +1004,7 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div class="card-title">🎬 fnmedia-ext · 飞牛影视在线扩展</div>
         <p class="card-sub">在原生搜索 / 媒体库注入在线影视并直接调用飞牛原生播放器播放。</p>
         <div class="stack sm muted">
+          <div style="color:var(--warn,#b45309);margin-top:6px">⚠ 本机管理页与写接口<b>没有登录鉴权</b>（既定设计，避免把自己锁在门外）：请不要把管理页/插件端口暴露到公网，只在局域网使用。</div>
           <div>维护者：<a href="https://github.com/zues0077/fnmedia-ext" target="_blank" rel="noopener">zues0077</a></div>
           <div>基于上游 <a href="https://github.com/funwukong/fnmedia-ext" target="_blank" rel="noopener">funwukong/fnmedia-ext</a> 的二次开发（Apache-2.0）</div>
         </div>
@@ -1105,8 +1106,11 @@ async function jget(p,timeoutMs){const ctrl=new AbortController();
   const t=setTimeout(()=>ctrl.abort(),timeoutMs||15000);
   try{const r=await fetch(p,{signal:ctrl.signal});if(!r.ok)throw new Error(p+" "+r.status);return r.json();}
   finally{clearTimeout(t);}}
-async function jpost(p,b){const r=await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify(b||{})});return r.json();}
+async function jpost(p,b,timeoutMs){const ctrl=new AbortController();
+  const t=setTimeout(()=>ctrl.abort(),timeoutMs||30000);
+  try{const r=await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(b||{}),signal:ctrl.signal});return await r.json();}
+  finally{clearTimeout(t);}}
 
 /* ---------- 页面切换 ---------- */
 async function switchPage(page){
@@ -1314,7 +1318,7 @@ const LIVE_STAGE={library:"媒体库",browse:"片单",search:"搜索",detail:"�
   hls:"清单",seg:"分片",direct:"直链",favorite:"收藏",history:"历史"};
 const LIVE_ORIGIN={local:["local","var(--ok)"],mixed:["mixed","#2563eb"],
   upstream:["upstream","#b45309"],redirect:["redirect","#7c3aed"]};
-function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+// esc 定义见文件前部（2026-11-13 去重：原先此处重复定义会覆盖前者，改前部不生效）
 function ago(a){return a<5?"刚刚":a<60?Math.floor(a)+"秒前":Math.floor(a/60)+"分前";}
 function liveOrigin(o){const [t,col]=LIVE_ORIGIN[o]||[o,"var(--muted)"];
   return `<span class="tag" style="color:${col};background:transparent;border:1px solid ${col}33">${t}</span>`;}
@@ -1668,7 +1672,13 @@ async function saveWelfareCfg(){
 let CLSR=null,clsOpen=false;
 /* 刚保存、等待重建生效的名字：池子里还挂着它们时显示「建库中…」，
    重建完成后逐一核对——消失就报喜，还在就提示可能是未连通源沿用了旧结果。 */
-let CLS_PENDING=new Set(),clsWatching=false;
+let CLS_PENDING=new Set(),clsWatching=false,CLS_START=0,CLS_TICK=null,CLS_NULL=0;
+function clsBuildTip(){
+  if(!clsWatching||!CLS_START)return '';
+  const sec=Math.max(0,Math.round((Date.now()-CLS_START)/1000));
+  return sec<3?' · <span class="tag wait">建库中…</span>'
+    :' · <span class="tag warn">建库中 '+sec+'s（通常 20~40 秒）</span>';
+}
 
 const clsSleep=ms=>new Promise(r=>setTimeout(r,ms));
 
@@ -1683,22 +1693,41 @@ async function clsCatalogStatus(){
    期间池子是上一轮快照，立刻刷新只会让用户以为保存没生效。 */
 async function clsWatch(){
   if(clsWatching)return;clsWatching=true;
+  CLS_START=Date.now();CLS_NULL=0;
+  if(CLS_TICK)clearInterval(CLS_TICK);
+  CLS_TICK=setInterval(()=>{
+    const el=$("clsBuild");
+    if(el)el.innerHTML=clsBuildTip();
+  },1000);
   renderClassRules();
   try{
     let started=false;
     for(let i=0;i<4&&!started;i++){        // 最多等 20s 让触发的重建跑起来
       const c=await clsCatalogStatus();
+      if(c==null){CLS_NULL++;}else{CLS_NULL=0;}
       if(c&&c.refreshing)started=true;
-      else await clsSleep(5000);
+      else if(c)await clsSleep(5000);
+      else await clsSleep(3000);           // 查不到状态就快些重试，别干等 5s
     }
-    if(started){
-      for(let i=0;i<96;i++){               // 最多盯 8 分钟
-        const c=await clsCatalogStatus();
-        if(!c||!c.refreshing)break;
-        await clsSleep(5000);
+    const deadline=Date.now()+5*60*1000;   // 建库最多等 5 分钟
+    while(started&&Date.now()<deadline){
+      const c=await clsCatalogStatus();
+      if(c==null){CLS_NULL++;}else{CLS_NULL=0;}
+      if(c&&!c.refreshing)break;
+      if(CLS_NULL>=10){                    // 连续查不到状态：不装死，明确告诉用户
+        const el=$("clsBuild");
+        if(el)el.innerHTML=' · <span class="tag warn">状态查询失败，仍在等待（'
+          +Math.round((Date.now()-CLS_START)/1000)+'s）</span>';
       }
+      await clsSleep(3000);
     }
-  }finally{clsWatching=false;}
+    if(started&&Date.now()>=deadline){
+      toast("建库超过 5 分钟还没结束：可能有多轮重建在排队，点「按当前规则重建」可再触发一次","fail");
+    }
+  }finally{
+    clsWatching=false;
+    if(CLS_TICK){clearInterval(CLS_TICK);CLS_TICK=null;}
+  }
   await loadClassRules();
   const still=[...CLS_PENDING].filter(nm=>{
     const items=((CLSR||{}).unclassified||{}).items||[];
@@ -1706,11 +1735,11 @@ async function clsWatch(){
   });
   if(CLS_PENDING.size&&still.length===0){
     toast("建库完成：保存的规则已生效，未归类池已更新","ok");
-  }else if(still.length){
+  }else if(still.length&&CLS_PENDING.size){
     toast("建库完成。「"+still[0]+"」等 "+still.length+
           " 个名字仍在池中——多半来自本轮未连通的源，源恢复后自动消失","fail");
   }
-  CLS_PENDING=new Set();
+  CLS_PENDING=new Set();CLS_START=0;
   renderClassRules();
 }
 
@@ -1732,10 +1761,11 @@ function clsCatTitle(cats,id){
   return c?c.title:id;
 }
 
-function clsOpts(cats){
+function clsOpts(cats,selected){
   return '<option value="">— 选库 —</option>'
-    +(cats||[]).map(c=>'<option value="'+esc(c.id)+'">'+esc(c.title)+'</option>').join("")
-    +'<option value="__drop__">✕ 不收录（丢弃）</option>';
+    +(cats||[]).map(c=>'<option value="'+esc(c.id)+'"'
+      +(c.id===selected?' selected':'')+'>'+esc(c.title)+'</option>').join("")
+    +'<option value="__drop__"'+(selected===null?' selected':'')+'>✕ 不收录（丢弃）</option>';
 }
 
 function clsRow(it,cats){
@@ -1763,7 +1793,7 @@ function renderClassRules(){
     :'';
   if(st)st.innerHTML=(total
     ? '未归类 <b>'+total+'</b> 条（'+nNames+' 个不同名字）· 已生效 '+(rules.exact||0)+' 精确 + '+(rules.keyword||0)+' 关键词'
-    : '全部分类都认出来了 · 已生效 '+(rules.exact||0)+' 精确 + '+(rules.keyword||0)+' 关键词')+failTip;
+    : '全部分类都认出来了 · 已生效 '+(rules.exact||0)+' 精确 + '+(rules.keyword||0)+' 关键词')+failTip+'<span id="clsBuild">'+clsBuildTip()+'</span>';
 
   const box=$("clsPool");
   if(box){
@@ -1783,13 +1813,18 @@ function renderClassRules(){
   const users=rules.user||[],ubox=$("clsUser");
   if(ubox){
     ubox.innerHTML=users.length
-      ? '<div class="hint" style="margin-top:12px">你的自定义规则（'+users.length+' 条，可恢复默认）</div>'
-        +'<div class="cls-rows">'+users.map(u=>
-          '<div class="cls-row"><span class="cls-name" title="'+esc(u.k)+'">'+esc(u.k)+'</span>'
-          +'<span class="tag">'+esc(clsCatTitle(cats,u.cat))+'</span>'
-          +'<span class="muted sm">'+(u.overrides_default?"覆盖默认":"新增")+'</span>'
-          +'<button class="btn sm" data-k="'+esc(u.k)+'" data-e="'+(u.exact?1:0)+'" onclick="clsDel(this)">恢复默认</button></div>'
-        ).join("")+'</div>'
+      ? '<div class="hint" style="margin-top:12px">你的自定义规则（'+users.length+' 条，可直接改分类后保存）</div>'
+        +'<div class="cls-rows">'+users.map(u=>{
+          const pend=CLS_PENDING.has(u.k);
+          return '<div class="cls-row" data-name="'+esc(u.k)+'">'
+            +'<span class="cls-name" title="'+esc(u.k)+'">'+esc(u.k)+'</span>'
+            +(pend
+              ? '<span class="tag warn">已保存 → '+esc(clsCatTitle(cats,u.cat))+'，建库中…</span>'
+              : '<select class="input cls-sel">'+clsOpts(cats,u.cat===undefined?null:u.cat)+'</select>'
+                +'<span class="muted sm">'+(u.overrides_default?"覆盖默认":"新增")+'</span>'
+                +'<button class="btn sm" onclick="clsSave(this)">保存</button>')
+            +'<button class="btn sm" data-k="'+esc(u.k)+'" data-e="'+(u.exact?1:0)+'" onclick="clsDel(this)">恢复默认</button></div>';
+        }).join("")+'</div>'
       : '';
   }
 }
@@ -1805,15 +1840,20 @@ async function clsSave(btn){
   const real=cat==="__drop__"?null:cat;
   btn.disabled=true;btn.textContent="保存中…";
   try{
-    const r=await jpost("/v/api/ext/classify/rule",{name:name,cat:real,exact:true});
+    const r=await jpost("/v/api/ext/classify/rule",{name:name,cat:real,exact:true},15000);
     if(r.code===0){
       toast("已保存："+name+" → "+clsCatTitle((CLSR||{}).cats,real)+
-            "。建库要 1~2 分钟，跑完自动刷新，不用再点。");
+            "。建库中（通常 20~40 秒），跑完自动刷新。");
       CLS_PENDING.add(name);
       clsWatch();
     }
     else{toast(r.msg||"保存失败","fail");btn.disabled=false;btn.textContent="保存";}
-  }catch(e){toast("保存失败："+(e.message||e),"fail");btn.disabled=false;btn.textContent="保存";}
+  }catch(e){
+    const ab=(e&&e.name==="AbortError");
+    toast(ab?"保存超时（15 秒未响应）：服务可能在重建库或刚重启。稍后点「刷新」看结果，别重复点"
+            :"保存失败："+(e.message||e),"fail");
+    btn.disabled=false;btn.textContent="保存";
+  }
 }
 
 async function clsDel(btn){
@@ -1827,7 +1867,7 @@ async function clsDel(btn){
 
 async function clsRebuild(){
   if(!confirm("按当前规则重建海量库？后台进行，几十秒后生效，期间旧库照常可用。"))return;
-  const r=await jpost("/v/api/ext/classify/rebuild",{});
+  const r=await jpost("/v/api/ext/classify/rebuild",{},15000);
   toast(r.msg||"已开始重建");
   if(r.code===0)clsWatch();
 }
@@ -2450,7 +2490,7 @@ function renderSubResult(d){
         ?'<div class="muted sm" style="padding:4px 2px">其中 '+cms.adult_auto.length+' 个按名字判定为成人站，已自动标「18」进福利库（可在资源站页取消）：'
           +esc(cms.adult_auto.join("、"))+'</div>'
         :'');
-    h+=subGrp('🍿 苹果CMS影视站　新增 '+cmsOk+' · 已存在 '+(cms.duplicate||0)
+    h+=subGrp('🍿 苹果CMS影视站　新增 '+cmsOk+(cmsOk?'（都标「待巡检」，检测交给巡检）':'')+' · 已存在 '+(cms.duplicate||0)
       +((cms.adult_auto||[]).length?(' · 自动标 18 '+cms.adult_auto.length):''),
       rows,(cms.added_names||[]).length);
   }

@@ -247,26 +247,25 @@ async def refresh_subscription(sub_id: str, *, preview: bool = False,
         if len(added_names) >= 200:      # 上限从 60 放宽到 200
             break
     if adult_pending:
+        # 后台判定，不阻塞刷新返回（名字判不出的源才跑，每源最多 2 个请求）
         import providers as _providers
-        sem2 = asyncio.Semaphore(6)
 
-        async def _adult_check(item):
-            sid, nm, api = item
-            async with sem2:
-                try:
-                    return sid, nm, await _providers.looks_adult_api(api)
-                except Exception:  # noqa: BLE001
-                    return sid, nm, False
+        async def _adult_judge():
+            sem2 = asyncio.Semaphore(3)
 
-        for sid, nm, hit in await asyncio.gather(
-                *[_adult_check(x) for x in adult_pending]):
-            if not hit:
-                continue
-            try:
-                if cfg.set_adult(sid, True)[0]:
-                    adult_auto.append(nm)
-            except Exception:  # noqa: BLE001
-                pass
+            async def _one(item):
+                sid, nm, api = item
+                async with sem2:
+                    try:
+                        if await _providers.looks_adult_api(api) and cfg.set_adult(sid, True)[0]:
+                            adult_auto.append(nm)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            await asyncio.gather(*[_one(x) for x in adult_pending],
+                                 return_exceptions=True)
+
+        asyncio.create_task(_adult_judge())
 
     # ---------- m3u8 直播源 ----------
     live_report = None

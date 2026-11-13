@@ -8903,15 +8903,16 @@ async def _resurrect_worker(picked: dict, mg: str, nkey: str) -> bool:
             _aggregate_briefs(title, maxn=10, fast_only=True), timeout=20)
         if await evaluate(briefs, True):
             return True
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # 回源第一轮失败（超时/聚合异常）不该静默：它会表现为「点开没反应」
+        _log.debug("resurrect fast pass failed: %s", type(exc).__name__)
     try:
         briefs = await asyncio.wait_for(
             _aggregate_briefs(title, maxn=10), timeout=30)
         if await evaluate(briefs, False):
             return True
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("resurrect slow pass failed: %s", type(exc).__name__)
     _RESURRECT_FAIL[nkey] = time.time()
     return False
 
@@ -12285,6 +12286,26 @@ async def ext_subscriptions_refresh(sid: str, request: Request):
             "data": result}
 
 
+async def _adult_judge_bg(items: list[tuple[str, str, str]]) -> None:
+    """后台判定新导入源是否成人内容（名字判不出时），命中就打 18。
+
+    不阻塞导入：每源最多 2 个请求（「无码」「麻豆」），并发 3，失败静默——
+    巡检会再兜，且这里判错代价是「源从全局搜索消失」，所以只在命中量大时才标。
+    """
+    sem = asyncio.Semaphore(3)
+
+    async def _one(it):
+        sid, _nm, api = it
+        async with sem:
+            try:
+                if await providers.looks_adult_api(api):
+                    config.set_adult(sid, True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    await asyncio.gather(*[_one(x) for x in items], return_exceptions=True)
+
+
 @app.post("/v/api/ext/source/import-subscription")
 async def ext_import_subscription(request: Request):
     """统一导入 TVBox / 影视仓 / OK影视 订阅（一个入口，自动分类、导入即可用）。
@@ -12355,80 +12376,47 @@ async def ext_import_subscription(request: Request):
     jar_url_global = groups.get("jar_url", "")
     skipped = list(groups["skipped"])
 
-    # ---------- 苹果 CMS：并发探测，通过即加入并启用 ----------
+    # ---------- 苹果 CMS：直接入库，检测交给巡检 ----------
+    # 2026-11-13 用户明确：订阅导入不探测、不在导入时判死活——探测会把 10~15 秒
+    # 才响应的正常源误判为失效（历史上就踩过），而且大订阅最坏要 200 秒，管理页
+    # 必超时。现在全部以 verified=False 入库（管理页标「待验证」），由定时巡检
+    # （多热词 + 25 秒超时）确认可用性，失效的由巡检自动停用。
     existing = {s.get("api", "").rstrip("/").lower() for s in config.all_sources()}
     cms_added, cms_dup = [], 0
-    cms_failed: list[tuple[str, str]] = []
     cms_adult_auto: list[str] = []
     cms_adult_pending: list[tuple[str, str, str]] = []
-    sem = asyncio.Semaphore(8)
-
-    async def _probe(c):
-        async with sem:
-            try:
-                pr = await asyncio.wait_for(
-                    providers.probe_source(c["api"], timeout=8.0), timeout=10)
-            except Exception:
-                pr = {"ok": False, "error": "探测超时"}
-            return c, pr
-
-    # 单轮最多探测 200 个（原来 80，超出部分静默丢弃 → 用户看到「有源没采到」）
-    probe_list = cms_cands[:200]
-    checked = await asyncio.gather(*[_probe(c) for c in probe_list])
-    for c, pr in checked:
+    cms_capped = 0
+    for c in cms_cands:
         key = c["api"].rstrip("/").lower()
         if key in existing:
             cms_dup += 1
             continue
-        if not pr.get("ok"):
-            cms_failed.append((c["name"], str(pr.get("error") or "探测不可达")))
+        if len(cms_added) >= 200:          # 单轮上限，超出记进跳过清单，不静默丢
+            cms_capped += 1
             continue
         ok, sid = config.add_source(c["name"], c["api"], True, standalone,
-                                    sub_id=sub_id)
+                                    sub_id=sub_id, verified=False)
         if ok:
             cms_added.append(c["name"])
             existing.add(key)
-            # 成人站自动打 18：进「🔞福利」库而不是混进普通搜索/海量库。
-            # 判定很保守（名字带 🔞 或命中成人强特征词且不含体育/综艺等反向词），
-            # 导入后在资源站页随时可以取消。
+            # 成人站自动打 18：名字能判出来的立刻标；判不出来的交给后台内容判定
+            # （不拖慢导入）。打错会让源从全局搜索消失，所以判定一律保守。
             try:
                 if catalogmod.looks_adult_source(c["name"]):
                     if config.set_adult(sid, True)[0]:
                         cms_adult_auto.append(c["name"])
                 else:
-                    # 名字看不出（美少女/水机/香奶/湿妹/AV…）→ 落地后按内容再判
                     cms_adult_pending.append((sid, c["name"], c["api"]))
             except Exception:  # noqa: BLE001
                 pass
         else:
             cms_dup += 1
-    # 名字判不出的新增源：按内容判定（搜「无码/麻豆」，正常站 0~3 条、成人站 20 条）
     if cms_adult_pending:
-        sem2 = asyncio.Semaphore(6)
-
-        async def _adult_check(item):
-            sid, nm, api = item
-            async with sem2:
-                try:
-                    return sid, nm, await providers.looks_adult_api(api)
-                except Exception:  # noqa: BLE001
-                    return sid, nm, False
-
-        for sid, nm, hit in await asyncio.gather(
-                *[_adult_check(x) for x in cms_adult_pending]):
-            if not hit:
-                continue
-            try:
-                if config.set_adult(sid, True)[0]:
-                    cms_adult_auto.append(nm)
-            except Exception:  # noqa: BLE001
-                pass
-    for nm, why in cms_failed:
-        skipped.append({"name": nm[:24], "reason": f"探测不可达（{why[:24]}）"})
-    if len(cms_cands) > len(probe_list):
-        for c in cms_cands[len(probe_list):]:
-            skipped.append({"name": c["name"][:24],
-                            "reason": "候选过多，本轮未探测（下次再导）"})
+        # 后台判定（每源最多 2 个请求，并发 3）：导入接口立刻返回，不卡管理页
+        asyncio.create_task(_adult_judge_bg(cms_adult_pending))
+    if cms_capped:
+        skipped.append({"name": "…共 %d 个" % cms_capped,
+                        "reason": "单轮新增上限 200，其余下次导入"})
 
     # ---------- csp_*Guard 加固源（仅完整私有构建） ----------
     guard_report = None
@@ -12566,6 +12554,8 @@ async def ext_import_subscription(request: Request):
             "added_names": cms_added,
             "duplicate": cms_dup,
             "adult_auto": cms_adult_auto,
+            # 本轮全部以 verified=False 入库，等巡检确认（不再导入时探测）
+            "pending_verify": len(cms_added),
         },
         "guard": guard_report,
         "csp": csp_report,

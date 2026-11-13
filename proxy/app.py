@@ -10871,6 +10871,34 @@ async def ext_classify_rules_import(request: Request):
             "local": local}
 
 
+@app.post("/v/api/ext/classify/bake-default")
+async def ext_classify_bake_default():
+    """把当前用户规则沉淀为随包内置默认（assets/classify_rules.default.json）。"""
+    n, msg, path = catalogmod.bake_default_rules()
+    if n <= 0:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    local = _apply_rules_local_or_fallback([])
+    _log.info("classify default rules baked: n=%s path=%s", n, path)
+    return {"code": 0, "msg": msg,
+            "data": {"baked": n, "path": path,
+                     "rules": catalogmod.rules_snapshot()},
+            "local": local}
+
+
+@app.post("/v/api/ext/classify/dedupe-default")
+async def ext_classify_dedupe_default():
+    """清理与内置默认完全一致的用户规则（沉淀后去冗余，让默认可随包升级）。"""
+    n, msg = catalogmod.dedupe_user_rules()
+    if n <= 0:
+        return {"code": 0, "msg": msg, "data": {"removed": 0,
+                                               "rules": catalogmod.rules_snapshot()}}
+    local = _apply_rules_local_or_fallback([])
+    _log.info("classify user rules deduped: removed=%s", n)
+    return {"code": 0, "msg": msg,
+            "data": {"removed": n, "rules": catalogmod.rules_snapshot()},
+            "local": local}
+
+
 @app.post("/v/api/ext/classify/rebuild")
 async def ext_classify_rebuild(request: Request):
     """按当前规则重建分类路由。后台跑，旧库在整表替换前一直可用。"""

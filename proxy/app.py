@@ -10780,14 +10780,23 @@ async def ext_classify_rule(request: Request):
         ok, msg = catalogmod.set_rule(name, cat, exact)
     if not ok:
         return JSONResponse({"code": 400, "msg": msg}, status_code=400)
-    # 立即生效：只作用于刚改的名字，未归类池马上更新；路由重建后台跑
+    # 规则本地化：按本地缓存重算分类与路由，不联网、毫秒级生效
+    local = _apply_rules_local_or_fallback([name])
+    return {"code": 0, "msg": msg, "data": catalogmod.rules_snapshot(),
+            "local": local}
+
+
+@app.get("/v/api/ext/classify/suggest")
+async def ext_classify_suggest():
+    """给未归类名字生成建议归属（只读，不写盘）。管理页「智能建议」用。"""
     try:
-        if not body.get("delete"):
-            catalogmod.catalog.apply_rules_now([name])
+        items = catalogmod.catalog.suggest_rules()
     except Exception as exc:  # noqa: BLE001
-        _log.debug("apply_rules_now failed: %s", type(exc).__name__)
-    _schedule_routes_refresh()
-    return {"code": 0, "msg": msg, "data": catalogmod.rules_snapshot()}
+        _log.warning("suggest_rules failed: %s", type(exc).__name__)
+        return JSONResponse({"code": 500, "msg": "生成建议失败：%s" % type(exc).__name__},
+                            status_code=500)
+    hit = sum(1 for it in items if it.get("cat") or it.get("reason") != "无建议")
+    return {"code": 0, "data": {"items": items, "total": len(items), "suggested": hit}}
 
 
 @app.post("/v/api/ext/classify/rules-batch")
@@ -10810,15 +10819,11 @@ async def ext_classify_rules_batch(request: Request):
     n, msg = catalogmod.set_rules_batch(items, exact=exact)
     if n <= 0:
         return JSONResponse({"code": 400, "msg": msg}, status_code=400)
-    try:
-        catalogmod.catalog.apply_rules_now(
-            [str(it.get("name") or "") for it in items])
-    except Exception as exc:  # noqa: BLE001
-        _log.debug("apply_rules_now failed: %s", type(exc).__name__)
-    _schedule_routes_refresh()
+    local = _apply_rules_local_or_fallback([str(it.get("name") or "") for it in items])
     return {"code": 0, "msg": msg,
             "data": {"saved": n, "rules": catalogmod.rules_snapshot(),
-                     "pool": catalogmod.catalog.unclassified()}}
+                     "pool": catalogmod.catalog.unclassified()},
+            "local": local}
 
 
 @app.post("/v/api/ext/classify/rebuild")
@@ -11703,6 +11708,30 @@ async def ext_set_source_proxy(request: Request):
                      "mode": mode,
                      "test_ok": (True if not px else test_ok),
                      "test_msg": ("直连（未设置代理）" if not px else test_msg)}}
+
+
+def _apply_rules_local_or_fallback(names: list[str]) -> dict:
+    """规则变更后优先走「本地重算路由」（不联网、毫秒级）。
+
+    本地重算需要叶子索引（建库时记录的每个分类的 type_id）；没有索引时
+    （首次启动、旧磁盘缓存）退回原方案：立刻摘池 + 后台全量重建。
+    """
+    try:
+        res = catalogmod.catalog.apply_rules_local()
+        if res.get("ok"):
+            _log.info("classify rules applied locally: changed=%s routes=%s",
+                      res.get("changed"), res.get("routes"))
+            _search_cache.clear()
+            _AGG_CACHE.clear()
+            return res
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("apply_rules_local failed: %s", type(exc).__name__)
+    try:
+        catalogmod.catalog.apply_rules_now(names)
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("apply_rules_now failed: %s", type(exc).__name__)
+    _schedule_routes_refresh()
+    return {"ok": False, "reason": "fallback-full-refresh"}
 
 
 _ROUTES_REFRESH_PENDING = False

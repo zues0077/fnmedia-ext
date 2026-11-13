@@ -1893,6 +1893,7 @@ function renderRulesList(){
       +" · 已识别 "+(cov.classified||0)+" · 未归类 "+(cov.unclassified||0)
       +" · 待源恢复 "+(cov.pending_rules||0)+" · 规则 "+(cov.rules_exact||0)+" 精确 + "
       +(cov.rules_keyword||0)+" 关键词</div>"
+    +buildCoverLine()
     +(cfs.length?'<div class=\"hint\" style=\"color:#c67\">⚠ 冲突 '+cfs.length
         +' 处（同名同时有精确+关键词规则，精确优先）：'
         +cfs.slice(0,5).map(x=>esc(x.k)).join("、")+(cfs.length>5?"…":"")
@@ -2025,6 +2026,16 @@ async function clsRuleBatch(btn){
     }else{toast(r.msg||"批量改库失败","fail");}
   }catch(e){toast("批量改库失败："+(e.message||e),"fail");}
   finally{btn.disabled=false;btn.textContent=old||"批量改库";clsRuleCount();}
+}
+
+function buildCoverLine(){
+  const b=(((STATUS||{}).catalog)||{}).build||{};
+  if(!b.sources)return "";
+  const miss=Number(b.missing_total||0);
+  if(!miss)return '<div class="muted sm" style="margin:0 0 8px">建库覆盖：'+b.loaded+'/'+b.sources+' 源已建库（全部覆盖）</div>';
+  return '<div class="muted sm" style="margin:0 0 8px;color:#c67">建库覆盖：'+b.loaded+'/'+b.sources
+    +' · 未建出 '+miss+' 个：'+((b.missing||[]).slice(0,6).map(esc).join("、"))
+    +(miss>6?"…":"")+'（多为超时/接口异常；下次巡检或重建会自动补）</div>';
 }
 
 function clsChecked(){
@@ -2205,9 +2216,12 @@ function renderQuality(){
     else if(g===2)gs='<span style="color:var(--err,#d64545)">高失败</span>';
     else if(g===3)gs='<span style="color:var(--err,#d64545)">熔断</span>';
     const isPin=pinned.has(s.id), isBlk=blocked.has(s.id);
+    const q0=s.quality||{};
+    const isNS=(s.no_search===true)||(q0.no_search===true);
+    const nsAuto=(s.no_search===undefined||s.no_search===null)&&q0.no_search===true;
     return `<tr>
       <td><div style="font-weight:500">${esc(s.name)} ${s.enabled?'':'<span class="muted sm">'+(s.sys_disabled?'(巡检停用)':(s.builtin?'(默认关闭)':'(停用)'))+'</span>'}
-        ${isPin?'<span class="tag">置顶</span>':''}${isBlk?'<span class="tag amber">屏蔽</span>':''}</div>
+        ${isPin?'<span class="tag">置顶</span>':''}${isBlk?'<span class="tag amber">屏蔽</span>':''}${isNS?'<span class="tag amber" title="不参与全局搜索，海量库照常可用">'+(nsAuto?'不参与搜索·自动':'不参与搜索')+'</span>':''}</div>
         <div class="meta">${esc(s.api)}</div></td>
       <td>${mrs}</td><td>${srs}</td><td>${lats}</td><td>${gs}</td>
       <td style="white-space:nowrap">
@@ -2215,6 +2229,9 @@ function renderQuality(){
           onclick="toggleSourcePin('${s.id}',${isPin?'false':'true'})" title="置顶：搜索结果永远排最前">${isPin?'★':'☆'}</button>
         <button class="small" style="${isBlk?'border-color:var(--danger);color:var(--danger)':''}"
           onclick="toggleSourceBlock('${s.id}',${isBlk?'false':'true'})" title="屏蔽：搜索结果沉到最后（不删源）">⊘</button>
+        <button class="small" style="${isNS?'border-color:var(--warn);color:var(--warn)':''}"
+          onclick="toggleSourceNoSearch('${s.id}',${isNS?'null':'true'})"
+          title="${isNS?'点击恢复：重新参与全局搜索':'不参与全局搜索（站点不支持搜索时用；海量库不受影响）'}">${isNS?'🚫':'🔍'}</button>
       </td></tr>`;
   }).join("");
   $("prioRows").innerHTML=rows||'<tr><td colspan="6" class="muted">暂无源</td></tr>';
@@ -2438,6 +2455,11 @@ async function loadHealth(){
 }
 async function resetHealth(key){
   await jpost("/v/api/ext/source-health/reset",{key});loadHealth();
+}
+async function toggleSourceNoSearch(id,on){
+  const r=await jpost("/v/api/ext/source/no-search",{id,on});
+  if(r.code===0){toast(on===null?"已恢复自动判定":"已设为不参与搜索");await loadStatus();}
+  else toast(r.msg||"操作失败","fail");
 }
 async function addSource(){
   const name=$("addName").value.trim(),api=$("addApi").value.trim(),standalone=$("addStandalone").checked;

@@ -898,6 +898,59 @@ _CONN_ERROR_NAMES = (
 )
 
 
+# 「明确不支持搜索」的站点返回（子串匹配）。只在搜索失败时用于判别，
+# 不参与正常解析；宁可判「不知道」（None）也不要误伤能搜的源。
+_NO_SEARCH_HINTS = (
+    "不支持搜索", "暂不支持搜索", "不支持关键词", "禁止搜索",
+    "搜索已关闭", "关闭了搜索", "搜索功能关闭", "不支持搜索功能",
+)
+
+
+async def probe_search_capability(api: str, *, keyword: str = "测试",
+                                  timeout: float = 10.0) -> bool | None:
+    """判断苹果CMS站是否支持关键词搜索。
+
+    返回 True=支持 / False=**明确**不支持 / None=判断不了（网络、5xx、未知错误）。
+
+    为什么要单独探一次：`probe_source()` 失败时只回异常类名（JSONDecodeError），
+    拿不到响应原文，无法区分「站点挂了」和「站点明说不支持搜索」。
+    实测牛牛资源（niuniuzy4）就是后者：HTTP 200 + 纯文本「暂不支持搜索」，
+    结果巡检一直判 state=ok、hit=0，搜索里白占名额（2026-11-13）。
+    """
+    api = (api or "").strip()
+    if not api.startswith(("http://", "https://")):
+        return None
+    try:
+        async with netutil.async_client(timeout=timeout) as client:
+            r = await client.get(
+                api, params={"ac": "detail", "wd": keyword},
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    if r.status_code != 200:
+        return None
+    body = r.text or ""
+    try:
+        j = parse_cms_response(r, api)
+    except Exception:  # noqa: BLE001
+        j = None
+    return judge_search_capability(body=body, parsed=j)
+
+
+def judge_search_capability(*, body: str, parsed) -> bool | None:
+    """纯判定：响应正文/解析结果 → True 支持搜索 / False 明确不支持 / None 不知道。"""
+    if not isinstance(parsed, dict):
+        low = (body or "")[:400]
+        return False if any(k in low for k in _NO_SEARCH_HINTS) else None
+    code = parsed.get("code")
+    if code in (1, "1") or (code in (None, "") and _cms_ok(parsed)):
+        return True
+    msg = str(parsed.get("msg") or "")
+    if str(code) == "1002" or any(k in msg for k in _NO_SEARCH_HINTS):
+        return False
+    return None
+
+
 async def probe_source_quality(source: dict, *, timeout: float = 25.0,
                                keyword: str | None = None) -> dict:
     """巡检专用探测：先用最轻的 ac=list，再按需补一次关键词命中。
@@ -990,6 +1043,18 @@ async def probe_source_quality(source: dict, *, timeout: float = 25.0,
                 out["ok"] = True
         except Exception:  # noqa: BLE001
             pass
+        # 搜不到时再判一次「是不是根本不能搜」：支持→清标记，明确不支持→标记
+        # no_search（搜索取源时排除它，不再白占名额；库不受影响）。
+        if not out["hit"]:
+            try:
+                cap = await probe_search_capability(api, keyword=keyword,
+                                                    timeout=timeout)
+            except Exception:  # noqa: BLE001
+                cap = None
+            if cap is False:
+                out["no_search"] = True
+            elif cap is True:
+                out["no_search"] = False
     return out
 
 

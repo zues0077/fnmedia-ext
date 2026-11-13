@@ -5,7 +5,12 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="30"/>
+    <!-- usesCleartextTraffic：targetSdk=30 时 Android 默认禁止明文 HTTP，
+         而 spider jar 内部要访问 127.0.0.1 的本地代理与部分 http 站点，
+         不放开会直接抛 UnknownServiceException: CLEARTEXT ... not permitted
+         （2026-11-13 实测日志确认）。bridge 只在本机 redroid 内运行。 -->
     <application android:label="CatvodBridge" android:allowBackup="false"
+        android:usesCleartextTraffic="true"
         android:name="com.fnmedia.bridge.HostApp">
         <activity android:name="com.fnmedia.bridge.BootActivity" android:exported="true"
             android:theme="@android:style/Theme.NoDisplay" android:excludeFromRecents="true">

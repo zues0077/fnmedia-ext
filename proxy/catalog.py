@@ -404,33 +404,50 @@ def rule_hit(name: str) -> tuple[bool, str | None]:
 
 
 def bake_default_rules() -> tuple[int, str, str]:
-    """把当前用户规则沉淀为「随包内置默认」（写入 proxy/assets/classify_rules.default.json）。
+    """把**当前生效的全部规则**沉淀为「随包内置默认」。
 
-    - 跳过红线词（萝莉/换脸等）：它们在任何规则之前就被拦截，写进默认只会造成误解；
-    - 跳过 cat 非法的条目；
-    - 用户规则文件保持不动（覆盖关系不变，升级不丢用户改动）。
+    源必须是「生效规则集」= 代码内置 + 已有默认文件 + 用户规则（用户优先），
+    不能只读用户规则文件——用户规则去重（dedupe_user_rules）之后，很多规则
+    只存在于默认文件里，只读用户文件会把它们丢掉（2026-11-13 踩过：143 → 8）。
+
+    过滤：红线词跳过（分类前就被拦截，写进默认只会误导）；
+    自定义库（lib2/lib5/…）跳过（本机自建，随包到别的机器上是死规则）。
+    用户规则文件保持不动。
     """
-    rules: list[dict] = []
-    skipped_red = 0
-    known = set(all_cats()) | {ADULT_CAT}
+    effective: dict[tuple[str, bool], tuple[str, str | None, bool]] = {}
+    for k, cat, ex in tuple(_DEFAULT_RULES) + tuple(_DEFAULT_FILE_RULES):
+        kk = str(k).strip()
+        if kk:
+            effective[(kk.lower(), bool(ex))] = (kk, cat, bool(ex))
     for r in _read_rule_file():
-        k = str(r.get("k") or "").strip()
-        if not k:
-            continue
-        if is_redline(k):
-            skipped_red += 1
+        kk = str(r.get("k") or "").strip()
+        if not kk:
             continue
         cat = r.get("cat")
         cat = str(cat).strip() if isinstance(cat, str) else None
-        if cat is not None and cat not in known:
+        effective[(kk.lower(), bool(r.get("exact", True)))] = (
+            kk, cat, bool(r.get("exact", True)))
+
+    known = set(CATS) | {ADULT_CAT}
+    rules: list[dict] = []
+    skipped_red = 0
+    skipped_custom = 0
+    for kk, cat, ex in effective.values():
+        if is_redline(kk):
+            skipped_red += 1
             continue
-        rules.append({"k": k, "cat": cat, "exact": bool(r.get("exact", True))})
+        if cat is not None and cat not in known:
+            skipped_custom += 1
+            continue
+        rules.append({"k": kk, "cat": cat, "exact": ex})
     if not rules:
         return 0, "没有可沉淀的规则", ""
+    rules.sort(key=lambda x: (x["exact"] is False, x["k"]))
     payload = {
         "v": 1,
         "kind": "fnmedia-ext-classify-rules-default",
-        "note": "随包内置默认规则：新装即生效；用户规则（state/classify_rules.json）优先级更高。",
+        "note": ("随包内置默认规则：新装即生效；用户规则（state/classify_rules.json）"
+                 "优先级更高，升级不会覆盖用户改动。"),
         "updated": int(time.time()),
         "rules": rules,
     }
@@ -446,38 +463,9 @@ def bake_default_rules() -> tuple[int, str, str]:
     msg = "已沉淀 %d 条为内置默认" % len(rules)
     if skipped_red:
         msg += "（跳过红线词 %d 条）" % skipped_red
+    if skipped_custom:
+        msg += "（跳过自定义库 %d 条：只在你的机器上有意义）" % skipped_custom
     return len(rules), msg, str(_DEFAULT_RULES_FILE)
-
-
-def dedupe_user_rules() -> tuple[int, str]:
-    """删掉与内置默认「完全一致」的用户规则（同名同 exact 同库）。
-
-    沉淀之后这些用户规则变成纯冗余：它们会一直覆盖默认，导致以后升级默认规则
-    时改动不生效。清掉它们，用户规则里只留真正的个人偏差。
-    """
-    known: dict[tuple[str, bool], str | None] = {}
-    for k, cat, ex in tuple(_DEFAULT_FILE_RULES) + tuple(_DEFAULT_RULES):
-        key = (str(k).strip().lower(), bool(ex))
-        if key[0]:
-            known[key] = cat
-    rules = _read_rule_file()
-    keep: list[dict] = []
-    removed = 0
-    for r in rules:
-        k = str(r.get("k") or "").strip()
-        if not k:
-            continue
-        key = (k.lower(), bool(r.get("exact", True)))
-        if key in known and known[key] == r.get("cat"):
-            removed += 1
-            continue
-        keep.append(r)
-    if not removed:
-        return 0, "没有与默认重复的用户规则"
-    if not _write_rule_file(keep):
-        return 0, "写入失败（检查 state 目录权限）"
-    reload_rules()
-    return removed, "已清理 %d 条与默认重复的用户规则" % removed
 
 
 def merge_rules(items: list[dict], *, replace: bool = False) -> tuple[int, str]:

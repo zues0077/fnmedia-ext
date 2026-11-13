@@ -374,6 +374,7 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div class="hint" id="clsStat">加载中…</div>
         <div id="clsPool"></div>
         <div id="clsUser"></div>
+        <div id="clsDefaults"></div>
         <div class="btn-row">
           <button class="small" onclick="loadClassRules()">刷新</button>
           <button class="primary small" onclick="clsRebuild()">按当前规则重建海量库</button>
@@ -1840,6 +1841,7 @@ function renderClassRules(){
         }).join("")+'</div>'
       : '';
   }
+  renderDefaultRules();
 }
 
 async function clsSuggest(btn){
@@ -1903,6 +1905,32 @@ async function clsBatchSave(btn){
     const ab=(e&&e.name==="AbortError");
     toast(ab?"保存超时（20 秒未响应）":"保存失败："+(e.message||e),"fail");
   }finally{btn.disabled=false;btn.textContent=old||"批量保存";clsSyncCount();}
+}
+
+let CLS_DEF_OPEN=false,CLS_DEF_Q="";
+function clsDefToggle(){CLS_DEF_OPEN=!CLS_DEF_OPEN;renderDefaultRules();}
+function clsDefSearch(v){CLS_DEF_Q=(v||"").trim();renderDefaultRules();}
+function renderDefaultRules(){
+  const box=$("clsDefaults");if(!box)return;
+  const cats=((CLSR||{}).cats)||[],defs=(((CLSR||{}).rules||{}).defaults)||[];
+  if(!defs.length){box.innerHTML="";return;}
+  const q=CLS_DEF_Q.toLowerCase();
+  const list=q?defs.filter(d=>(d.k||"").toLowerCase().includes(q)):defs;
+  const show=CLS_DEF_OPEN?list:list.slice(0,20);
+  box.innerHTML='<div class="hint" style="margin-top:12px">已生效的默认规则（'+defs.length+' 条，可直接改；改动会写进你的规则并覆盖默认）</div>'
+    +'<div class="cls-batch"><input class="input" placeholder="搜索名字…" value="'+esc(CLS_DEF_Q)+'" oninput="clsDefSearch(this.value)" style="max-width:200px"/>'
+    +'<span class="muted sm">共 '+list.length+' 条匹配</span></div>'
+    +'<div class="cls-rows">'+show.map(d=>
+        '<div class="cls-row" data-name="'+esc(d.k)+'">'
+        +'<span class="cls-ck-ph"></span>'
+        +'<span class="cls-name" title="'+esc(d.k)+'">'+esc(d.k)+'</span>'
+        +'<span class="muted sm">'+(d.exact?"精确":"关键词")+'</span>'
+        +(d.overridden?'<span class="tag warn">已被你覆盖</span>':'<span class="tag">默认</span>')
+        +'<select class="input cls-sel">'+clsOpts(cats,d.cat===undefined?null:d.cat)+'</select>'
+        +'<button class="btn sm" onclick="clsSave(this)">保存</button>'
+        +'</div>').join("")+'</div>'
+    +(list.length>20?'<div class="btn-row"><button class="small" onclick="clsDefToggle()">'
+      +(CLS_DEF_OPEN?'收起':('展开全部 '+list.length+' 条'))+'</button></div>':'');
 }
 
 function clsToggle(){clsOpen=!clsOpen;renderClassRules();}

@@ -363,6 +363,42 @@ def rule_hit(name: str) -> tuple[bool, str | None]:
     return (False, None)
 
 
+def set_rules_batch(items: list[dict], exact: bool = True) -> tuple[int, str]:
+    """批量写规则：一次落盘、一次 reload（管理页「多选 → 选库 → 保存」用）。
+
+    单条保存走 set_rule 时每次都要写一遍文件并触发一轮重建；连存十几条就是
+    十几轮排队（实测一轮 28s，用户要等好几分钟）。这里合并成一次。
+    """
+    pairs: list[dict] = []
+    for it in items or []:
+        k = str((it or {}).get("name") or "").strip()
+        if not k:
+            continue
+        if len(k) > 40:
+            return 0, "分类名过长：%s" % k
+        cat = it.get("cat")
+        if isinstance(cat, str):
+            cat = cat.strip()
+            if cat in ("", "__drop__", "drop", "none", "null"):
+                cat = None
+        else:
+            cat = None
+        if cat is not None and cat not in all_cats() and cat != ADULT_CAT:
+            return 0, "未知分类：%s" % cat
+        pairs.append({"k": k, "cat": cat, "exact": bool(exact)})
+    if not pairs:
+        return 0, "没有可保存的项"
+    keys = {(p["k"].lower(), p["exact"]) for p in pairs}
+    rules = [r for r in _read_rule_file()
+             if (str(r.get("k") or "").strip().lower(),
+                 bool(r.get("exact", True))) not in keys]
+    rules.extend(pairs)
+    if not _write_rule_file(rules):
+        return 0, "写入失败（检查 state 目录权限）"
+    reload_rules()
+    return len(pairs), "已保存 %d 条" % len(pairs)
+
+
 def reload_rules() -> None:
     """规则改动后清缓存，下次建库即生效。"""
     global _rules_cache
@@ -1225,6 +1261,30 @@ class Catalog:
         with self._lock:
             failed = len(self._fetch_failed)
         return {"total": total, "names": len(items), "items": items, "failed": failed}
+
+    def apply_rules_now(self, names: list[str]) -> int:
+        """把刚保存的规则**立即反映到未归类池**（不等整轮重建）。
+
+        注意：`_classes` 里只存「已归类」的项，未归类的名字只存在于
+        `_unclassified`（没有 type_id，无法凭空补进路由）。所以这里只做一件事：
+        把已经能被规则判定的名字从未归类池里摘掉——用户保存后立刻看到它消失；
+        真正的分类路由仍由后台重建生成（约 20~40 秒）。
+        """
+        want = {str(n).strip() for n in (names or []) if str(n).strip()}
+        if not want:
+            return 0
+        changed = 0
+        with self._lock:
+            for sid, names_list in list(self._unclassified.items()):
+                keep = []
+                for nm in names_list:
+                    hit, _rcat = rule_hit(str(nm))
+                    if hit:
+                        changed += 1      # 规则已能判定（含「确认丢弃」）→ 移出池
+                        continue
+                    keep.append(nm)
+                self._unclassified[sid] = keep
+        return changed
 
     def _uhd_fallback_routes(self, scope: str) -> list[dict]:
         """4K 回退路由：源没有“4K”分类名时，借电影分类的路由翻页，

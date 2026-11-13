@@ -3047,7 +3047,7 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
                # 只针对 CMS：spider/drpy 的探测口径不同（要占 redroid/Node），由各自
                # 健康状态管，不能和 CMS 用同一把尺子。巡检通过置 verified=True 自动纳入。
                and not (s.get("verified") is False
-                        and str(s.get("stype") or "cms") == "cms")
+                        and cfgmod.source_type(s) == "cms")
                and (include_t4 or s.get("kind") not in ("t4", "live"))]
     if fast_only:
         # 快路径只排掉「要重型运行时」的源：加固（redroid 真机）、csp 爬虫（按 jar

@@ -1100,6 +1100,39 @@ class Config:
             return [dict(s) for s in self._cfg["sources"]
                     if s.get("live") and s.get("enabled")]
 
+    @staticmethod
+    def source_no_search(s: dict) -> bool:
+        """该源是否**不参与全局搜索**（不影响海量库/独立库）。
+
+        两层：源记录顶层 `no_search`（用户手动开关，优先）；否则看巡检自动判定
+        `quality.no_search`（站点明确返回「暂不支持搜索」时打上）。
+        缺省 = 参与搜索，老源行为不变。
+        """
+        v = (s or {}).get("no_search")
+        if v is not None:
+            return bool(v)
+        q = (s or {}).get("quality")
+        return bool(q.get("no_search")) if isinstance(q, dict) else False
+
+    def set_source_no_search(self, sid: str, on: bool | None
+                             ) -> tuple[bool, str]:
+        """手动开关「不参与搜索」。on=None 表示恢复自动判定（删掉手动值）。"""
+        sid = (sid or "").strip()
+        if not sid:
+            return False, "缺少源 id"
+        with _LOCK:
+            cfg = self.get()
+            target = next((s for s in cfg.get("sources") or []
+                           if s.get("id") == sid), None)
+            if target is None:
+                return False, "源不存在"
+            if on is None:
+                target.pop("no_search", None)
+            else:
+                target["no_search"] = bool(on)
+            self._persist(cfg)
+        return True, "ok"
+
     def set_source_priority(self, mapping: dict) -> tuple[bool, str]:
         """整体保存源优先级（id -> 整数权重），忽略未知源与非法值。"""
         with _LOCK:

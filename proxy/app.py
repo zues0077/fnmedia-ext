@@ -3048,6 +3048,9 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
                # 健康状态管，不能和 CMS 用同一把尺子。巡检通过置 verified=True 自动纳入。
                and not (s.get("verified") is False
                         and cfgmod.source_type(s) == "cms")
+               # 站点明确不支持关键词搜索（如牛牛资源返回「暂不支持搜索」）：
+               # 不进全局搜索，免得白占首轮名额；海量库/独立库不受影响。
+               and not config.source_no_search(s)
                and (include_t4 or s.get("kind") not in ("t4", "live"))]
     if fast_only:
         # 快路径只排掉「要重型运行时」的源：加固（redroid 真机）、csp 爬虫（按 jar
@@ -11284,6 +11287,26 @@ async def ext_source_pin(request: Request):
         pass
     return {"code": 0, "msg": "已置顶" if on else "已取消置顶",
             "data": {"pinned": sorted(config.pinned_ids())}}
+
+
+@app.post("/v/api/ext/source/no-search")
+async def ext_source_no_search(request: Request):
+    """手动开关「不参与全局搜索」（不影响海量库/独立库）。
+
+    body: {id, on}；on=true 强制不搜，on=false 强制参与，on=null 恢复自动判定
+    （巡检发现站点明确不支持搜索时会自动打标记）。
+    """
+    body = await request.json()
+    sid = str(body.get("id") or "").strip()
+    on = body.get("on")
+    ok, msg = config.set_source_no_search(sid, on)
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    try:
+        _search_cache.clear(); _AGG_CACHE.clear()
+    except Exception:  # noqa: BLE001
+        pass
+    return {"code": 0, "msg": "ok"}
 
 
 @app.post("/v/api/ext/source/block")

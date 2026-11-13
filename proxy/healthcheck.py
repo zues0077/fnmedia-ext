@@ -350,6 +350,11 @@ async def _scan_group(sources: list[dict], settings: dict, *, group: str,
                 "list_count": e["list_count"],
                 "ok_rate": ok_rate(sid),
                 "fails": fails,
+                # 自动判定：站点明确不支持搜索（牛牛资源返回「暂不支持搜索」）。
+                # 写 quality 而非顶层——顶层 no_search 是用户手动开关，优先于这里。
+                # None（判断不了）时不写，保留上一轮结论，避免抖动。
+                **({"no_search": bool(res["no_search"])}
+                   if res.get("no_search") is not None else {}),
                 "checked_at": now,
                 "error": e["last_error"],
             },

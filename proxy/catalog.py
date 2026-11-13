@@ -53,6 +53,15 @@ XSRC_CLASS_TIMEOUT = 25.0
 # 而 40/82 个源 3 秒内就返回了）。建库是尽力而为的冷启动动作：超预算的源
 # 记为「本次没有分类表」，等下一轮刷新或用户真正翻到它时再补，不让单点拖全局。
 BUILD_BUDGET = 10.0
+# 建库并发参数（2026-11-13）：一次性全并发会打满 httpx 连接池（默认 100），
+# 队尾在排队里耗光预算被静默取消 → 部分源永远建不出库、探测阶段甚至全军覆没。
+# 做成模块常量 + 环境变量覆盖，便于按实测量参数（FNMD_LOAD_BATCH / FNMD_PROBE_BATCH）。
+LOAD_BATCH = int(os.environ.get("FNMD_LOAD_BATCH") or 10)
+SLOW_LOAD_BATCH = int(os.environ.get("FNMD_SLOW_LOAD_BATCH") or 5)
+# 每轮最多补多少个慢源（其余下一轮轮转继续）：不限制的话 120 个慢源 × 批 5 ×
+# 10s 预算会把单轮重建拖到 8 分钟（2026-11-13 实测 494s）。
+SLOW_LIMIT = int(os.environ.get("FNMD_SLOW_LIMIT") or 40)
+PROBE_BATCH = int(os.environ.get("FNMD_PROBE_BATCH") or 10)
 # >>> OPTIONAL:DISK CACHE
 # 分类表 + 路由落盘：重启后先按上次结果出库（秒开），后台再按 CLASS_REFRESH 刷。
 # 体积实测约 160 KB（82 源 / 1591 条分类 / 400 余条路由），同目录 titles.json 已 3.8 MB。
@@ -965,6 +974,8 @@ class Catalog:
         # 不标的话，用户看到的「未归类 N 条」其实是「本轮连通的那批源」的快照，
         # 源一抖动数字就变，会被误判成规则失效（2026-11-12 实测：112 → 260）。
         self._fetch_failed: set[str] = set()
+        # 上一轮建库覆盖报告：{sources, loaded, missing:[名字], at}
+        self._build_report: dict[str, Any] = {}
 
     # 移植上游 v0.2.54（缓存管理）：清空海量库分类路由/分页/聚合缓冲
     # （管理页一键清缓存），下次浏览海量库时重新探测分类并深翻。
@@ -1150,9 +1161,83 @@ class Catalog:
             # 与本文件 _load_page 的两处用法一致。
             async with netutil.async_client(
                     timeout=HTTP_TIMEOUT) as client:
-                await asyncio.gather(
-                    *[_bounded(self._load_source_classes(client, s)) for s in sources],
-                    return_exceptions=True)
+                # 分批装载：150+ 个源一次性 gather 会打满 httpx 连接池（默认 100），
+                # 队尾的源在排队里耗光 10s 预算被静默取消（CancelledError 不会被
+                # `except Exception` 捕获，连日志都没有）→ 表现为「部分源永远建不出库」。
+                # 2026-11-13 实测：150 个启用源只产出 82 个 leaf_index（牛牛资源就
+                # 是其中之一，单独跑它的分类装载明明 59 个分类全成功）。
+                # 两阶段装载（2026-11-13 实测）：排序前 30 的快源用批 10 →
+                # 39s 建出 269 条路由 / 16 个库、覆盖 29/30；而 150 个源混在一起
+                # 跑，任何批大小都只有 0~12 条路由 —— 慢源/死源占满连接与源站
+                # 配额，会把好源一起拖垮。所以先建「反应快 / 有搜索命中」的源，
+                # 慢源另用小批补（批间顺序，批内并发）。
+                try:
+                    from config import config as _cfgm2
+                    _ranked_all = _cfgm2.rank_sources(list(sources))
+                except Exception:  # noqa: BLE001
+                    _ranked_all = list(sources)
+                _fast, _slow = [], []
+                for _s in _ranked_all:
+                    _q = _s.get("quality") if isinstance(_s.get("quality"), dict) else {}
+                    try:
+                        _lat = float(_q.get("lat_ms") or 0)
+                    except (TypeError, ValueError):
+                        _lat = 0.0
+                    try:
+                        _hits = int(_q.get("hits") or 0)
+                    except (TypeError, ValueError):
+                        _hits = 0
+                    (_fast if (_hits > 0 or (_lat and _lat < 3000)) else _slow).append(_s)
+                _log.info("catalog: load %d fast(+10) / %d slow(+5) sources",
+                          len(_fast), len(_slow))
+                # 慢源轮转：每轮只补 SLOW_LIMIT 个，下一轮从上次位置继续，
+                # 避免单轮重建被 100+ 个慢源拖到 8 分钟，也保证最终都能轮到。
+                if _slow:
+                    _cur = int(getattr(self, "_slow_cursor", 0) or 0) % len(_slow)
+                    _sel = _slow[_cur:_cur + max(1, SLOW_LIMIT)]
+                    _sel += _slow[:(_cur + max(1, SLOW_LIMIT)) % max(1, len(_slow))]
+                    _sel = _sel[:max(1, SLOW_LIMIT)]
+                    self._slow_cursor = (_cur + len(_sel)) % max(1, len(_slow))
+                else:
+                    _sel = []
+                for _group, _bs in ((_fast, LOAD_BATCH), (_sel, SLOW_LOAD_BATCH)):
+                    _bs = max(1, _bs)
+                    for _i in range(0, len(_group), _bs):
+                        await asyncio.gather(
+                            *[_bounded(self._load_source_classes(client, s))
+                              for s in _group[_i:_i + _bs]],
+                            return_exceptions=True)
+                # 补跑：本轮仍没产出叶子的源单独再来一次（低并发，避免再被挤掉）。
+                _want = {str(s.get("id") or "") for s in sources
+                         if _src_kind(s) not in ("drpy", "spider")
+                         or str(s.get("id") or "") in scopes}
+                _missing = [s for s in sources
+                            if str(s.get("id") or "") in _want
+                            and str(s.get("id") or "") not in self._leaf_index]
+                if _missing:
+                    _log.info("catalog: retry %d sources without leaves",
+                              len(_missing))
+                    for _i in range(0, len(_missing), 5):
+                        await asyncio.gather(
+                            *[_bounded(self._load_source_classes(client, s))
+                              for s in _missing[_i:_i + 5]],
+                            return_exceptions=True)
+                # 建库覆盖报告：管理页据此显示「X/Y 已建库、哪些没建出来」，
+                # 不再让「某些源没进库」变成看不见的静默失败。
+                _still = [s for s in _missing
+                          if str(s.get("id") or "") not in self._leaf_index]
+                with self._lock:
+                    self._build_report = {
+                        "sources": len(sources),
+                        "slow_pending": max(0, len(_slow) - len(_sel)),
+                        "loaded": len([s for s in sources
+                                       if str(s.get("id") or "")
+                                       in self._leaf_index]),
+                        "missing": [str(s.get("name") or s.get("id"))[:20]
+                                    for s in _still][:30],
+                        "missing_total": len(_still),
+                        "at": int(time.time()),
+                    }
 
             # 每个源每类先探测一个代表性叶子；首选超时/空时，回退探测该类下
             # 其它叶子，选能连通且页数最多的（部分私有源个别分类响应很慢）。
@@ -1172,6 +1257,17 @@ class Catalog:
                     all_by_cat[key] = cls
                     order.append(key)
             probed: dict[tuple[str, str], dict] = {}
+            # 反应快、有搜索命中的源先建库：order 按 rank_sources 的位置排，
+            # 慢源/死源沉到最后——即使这轮轮不到，也不影响前面的库先建出来。
+            try:
+                from config import config as _cfgm
+                _cands = [x for x in (self._source_by_id(sid)
+                                      for sid, _ in order) if x]
+                _pos = {str(x.get("id") or ""): i
+                        for i, x in enumerate(_cfgm.rank_sources(_cands))}
+            except Exception:  # noqa: BLE001
+                _pos = {}
+            order.sort(key=lambda k: _pos.get(k[0], 10 ** 6))
 
             async with netutil.async_client(
                     timeout=HTTP_TIMEOUT) as client:
@@ -1198,10 +1294,16 @@ class Catalog:
                                    "pagecount": int(pc or 0)})
 
                 # 第一轮：每个 (源,类) 只探首选
-                first = await asyncio.gather(
-                    *[probe_one(sid, cat, all_by_cat[(sid, cat)][0])
-                      for sid, cat in order],
-                    return_exceptions=True)
+                # 分批探测：order 是「源 × 分类」，150 源时可达数百个；一次性
+                # gather 会瞬间打出数百请求（第二轮每项再试 8 个叶子 → 上千），
+                # 源站直接限流，表现为「重建完成但路由为 0」（2026-11-13 实测）。
+                first: list = []
+                for _i in range(0, len(order), max(1, PROBE_BATCH)):
+                    _chunk = order[_i:_i + max(1, PROBE_BATCH)]
+                    first.extend(await asyncio.gather(
+                        *[probe_one(sid, cat, all_by_cat[(sid, cat)][0])
+                          for sid, cat in _chunk],
+                        return_exceptions=True))
                 missing: list[tuple[str, str]] = []
                 for (sid, cat), res in zip(order, first):
                     st, payload = res if isinstance(res, tuple) else ("fail", None)
@@ -1213,7 +1315,7 @@ class Catalog:
 
                 # 第二轮：对首轮空页的(源,类)，并发尝试其余叶子，取页数最多者
                 async def rescue(sid, cat):
-                    cls = all_by_cat[(sid, cat)][1:9]  # 最多再试 8 个叶子
+                    cls = all_by_cat[(sid, cat)][1:5]  # 最多再试 4 个叶子（原 8：第二轮请求量翻倍）
                     if not cls:
                         return
                     res = await asyncio.gather(
@@ -1227,7 +1329,9 @@ class Catalog:
                         probed[(cat, sid)] = ok[0]
                         # 记录备用叶子，供翻页超时/空页时同类并发竞速回退
                         self._fallbacks[(sid, cat)] = ok[1:7]
-                await asyncio.gather(*[rescue(s, c) for s, c in missing],
+                for _i in range(0, len(missing), max(1, PROBE_BATCH)):
+                    await asyncio.gather(
+                        *[rescue(s, c) for s, c in missing[_i:_i + max(1, PROBE_BATCH)]],
                                      return_exceptions=True)
 
             def routes_for_scope(scope: str) -> dict[str, list[dict]]:
@@ -1438,6 +1542,8 @@ class Catalog:
                 # 本轮抓分类表失败的源数：这些源沿用上一轮结果，池子数字不含
                 # 它们的最新变化，管理页要据此提示「数字是快照不是全量」。
                 "source_failed": len(self._fetch_failed),
+                # 建库覆盖：loaded/sources，missing 是本轮仍没建出库的源名（最多 30 个）
+                "build": dict(self._build_report),
                 "categories": {
                     cat: {
                         "routes": len(self._routes.get(

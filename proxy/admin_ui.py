@@ -140,9 +140,6 @@ label.btn:hover,label.btn-sm:hover{background:var(--accent-soft)}
 .stat .l{font-size:12px;color:var(--muted)}
 .lib-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
 /* 分类规则：一行一个名字，紧凑不铺满整屏 */
-.cls-batch{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0 8px;padding:8px 10px;
-  background:rgba(127,127,127,.06);border:1px solid rgba(127,127,127,.16);border-radius:8px}
-.cls-ck-ph{width:15px;height:15px;flex:0 0 auto;display:inline-block}
 .cls-rows{display:flex;flex-direction:column;gap:6px;margin:8px 0}
 .cls-row{display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--line);
   border-radius:8px;background:var(--card)}
@@ -1777,9 +1774,6 @@ function clsRow(it,cats){
   const pending=CLS_PENDING.has(nm);
   const savedCat=pending?((CLSR&&CLSR.rules&&CLSR.rules.user)||[]).find(u=>u.k===nm):null;
   return '<div class="cls-row" data-name="'+esc(nm)+'">'
-    +(pending?'<span class="cls-ck-ph"></span>'
-             :'<input type="checkbox" class="cls-ck" data-name="'+esc(nm)+'"'
-              +' onchange="clsSyncCount()" style="width:15px;height:15px;flex:0 0 auto"/>')
     +'<span class="cls-name" title="'+esc(tip||nm)+'">'+esc(nm)+'</span>'
     +'<span class="muted sm">'+(it.sources||0)+' 个源</span>'
     +(pending
@@ -1808,12 +1802,6 @@ function renderClassRules(){
     }else{
       const show=clsOpen?items:items.slice(0,15);
       box.innerHTML='<div class="hint" style="margin-top:10px">未归类（按涉及源数排序，悬停看示例源）</div>'
-        +'<div class="cls-batch">'
-        +'<label class="sm"><input type="checkbox" id="clsAll" onchange="clsCheckAll(this.checked)" style="width:15px;height:15px"/> 全选本页</label>'
-        +'<select class="input" id="clsBatchCat" style="max-width:190px">'+clsOpts(cats)+'</select>'
-        +'<button class="btn sm" onclick="clsBatchSave(this)">批量保存<span id="clsBatchN"></span></button>'
-        +'<span class="muted sm">选中多项 → 选库 → 一次保存（只重建一轮）</span>'
-        +'</div>'
         +'<div class="cls-rows">'+show.map(it=>clsRow(it,cats)).join("")+'</div>'
         +(items.length>15
           ?'<div class="btn-row"><button class="small" onclick="clsToggle()">'
@@ -1839,44 +1827,6 @@ function renderClassRules(){
         }).join("")+'</div>'
       : '';
   }
-}
-
-function clsChecked(){
-  return Array.from(document.querySelectorAll(".cls-ck:checked"))
-    .map(el=>el.getAttribute("data-name")||"").filter(Boolean);
-}
-function clsSyncCount(){
-  const n=clsChecked().length,el=$("clsBatchN");
-  if(el)el.textContent=n?("（"+n+"）"):"";
-}
-function clsCheckAll(on){
-  document.querySelectorAll(".cls-ck").forEach(el=>{el.checked=!!on;});
-  clsSyncCount();
-}
-async function clsBatchSave(btn){
-  const names=clsChecked();
-  if(!names.length){toast("先勾选要做归类的项（或点「全选本页」）","fail");return;}
-  const sel=$("clsBatchCat"),cat=sel?sel.value:"";
-  if(!cat){toast("先选一个库（或选「不收录」）","fail");return;}
-  const real=cat==="__drop__"?null:cat;
-  btn.disabled=true;const old=btn.textContent;btn.textContent="保存中…";
-  try{
-    const r=await jpost("/v/api/ext/classify/rules-batch",
-      {items:names.map(n=>({name:n,cat:real})),exact:true},20000);
-    if(r.code===0){
-      names.forEach(n=>CLS_PENDING.add(n));
-      // 后端已经把规则就地作用到缓存：用返回的池子立即刷新，不用等整轮重建
-      if(r.data&&r.data.pool&&CLSR)CLSR.unclassified=r.data.pool;
-      if(r.data&&r.data.rules&&CLSR)CLSR.rules=r.data.rules;
-      toast("已保存 "+names.length+" 条 → "+clsCatTitle((CLSR||{}).cats,real)
-            +"。已立即生效，路由在后台重建（约 20~40 秒）。");
-      renderClassRules();
-      clsWatch();
-    }else{toast(r.msg||"批量保存失败","fail");}
-  }catch(e){
-    const ab=(e&&e.name==="AbortError");
-    toast(ab?"保存超时（20 秒未响应）":"保存失败："+(e.message||e),"fail");
-  }finally{btn.disabled=false;btn.textContent=old||"批量保存";clsSyncCount();}
 }
 
 function clsToggle(){clsOpen=!clsOpen;renderClassRules();}
@@ -2540,7 +2490,7 @@ function renderSubResult(d){
         ?'<div class="muted sm" style="padding:4px 2px">其中 '+cms.adult_auto.length+' 个按名字判定为成人站，已自动标「18」进福利库（可在资源站页取消）：'
           +esc(cms.adult_auto.join("、"))+'</div>'
         :'');
-    h+=subGrp('🍿 苹果CMS影视站　新增 '+cmsOk+(cmsOk?'（后台验证中，通过后自动进入搜索）':'')+' · 已存在 '+(cms.duplicate||0)
+    h+=subGrp('🍿 苹果CMS影视站　新增 '+cmsOk+(cmsOk?'（都标「待巡检」，检测交给巡检）':'')+' · 已存在 '+(cms.duplicate||0)
       +((cms.adult_auto||[]).length?(' · 自动标 18 '+cms.adult_auto.length):''),
       rows,(cms.added_names||[]).length);
   }

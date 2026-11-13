@@ -3042,12 +3042,6 @@ async def __aggregate_briefs_inner(keyword: str, maxn: int | None = None,
     # 可选特性源不进入全局搜索（公开构建下该开关恒关，等价于不过滤）。
     sources = [s for s in config.enabled_sources()
                if not (features.ADULT and s.get("adult"))
-               # 2026-11-13：订阅灌入不探测，CMS 新源以 verified=False 入库。未验证的
-               # CMS 先不进全局搜索——否则死源/慢源白占搜索预算（实测冷搜索被拖到 6~8s）。
-               # 只针对 CMS：spider/drpy 的探测口径不同（要占 redroid/Node），由各自
-               # 健康状态管，不能和 CMS 用同一把尺子。巡检通过置 verified=True 自动纳入。
-               and not (s.get("verified") is False
-                        and cfgmod.source_type(s) == "cms")
                and (include_t4 or s.get("kind") not in ("t4", "live"))]
     if fast_only:
         # 快路径只排掉「要重型运行时」的源：加固（redroid 真机）、csp 爬虫（按 jar
@@ -10780,123 +10774,8 @@ async def ext_classify_rule(request: Request):
         ok, msg = catalogmod.set_rule(name, cat, exact)
     if not ok:
         return JSONResponse({"code": 400, "msg": msg}, status_code=400)
-    # 规则本地化：按本地缓存重算分类与路由，不联网、毫秒级生效
-    local = _apply_rules_local_or_fallback([name])
-    return {"code": 0, "msg": msg, "data": catalogmod.rules_snapshot(),
-            "local": local}
-
-
-@app.get("/v/api/ext/classify/suggest")
-async def ext_classify_suggest():
-    """给未归类名字生成建议归属（只读，不写盘）。管理页「智能建议」用。"""
-    try:
-        items = catalogmod.catalog.suggest_rules()
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("suggest_rules failed: %s", type(exc).__name__)
-        return JSONResponse({"code": 500, "msg": "生成建议失败：%s" % type(exc).__name__},
-                            status_code=500)
-    hit = sum(1 for it in items if it.get("cat") or it.get("reason") != "无建议")
-    return {"code": 0, "data": {"items": items, "total": len(items), "suggested": hit}}
-
-
-@app.post("/v/api/ext/classify/rules-batch")
-async def ext_classify_rules_batch(request: Request):
-    """批量保存分类规则：多选 → 选库 → 一次落盘、一次重建（管理页用）。
-
-    body: {items: [{name, cat}], exact?}
-    与逐条保存的区别：只写一遍规则文件、只触发一轮重建（逐条存 N 条会排 N 轮，
-    一轮 20~40 秒，用户要等好几分钟）。
-    """
-    try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001
-        body = {}
-    items = body.get("items")
-    if not isinstance(items, list) or not items:
-        return JSONResponse({"code": 400, "msg": "items 需为非空数组"},
-                            status_code=400)
-    exact = bool(body.get("exact", True))
-    n, msg = catalogmod.set_rules_batch(items, exact=exact)
-    if n <= 0:
-        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
-    local = _apply_rules_local_or_fallback([str(it.get("name") or "") for it in items])
-    return {"code": 0, "msg": msg,
-            "data": {"saved": n, "rules": catalogmod.rules_snapshot(),
-                     "pool": catalogmod.catalog.unclassified()},
-            "local": local}
-
-
-@app.get("/v/api/ext/classify/rules-export")
-async def ext_classify_rules_export():
-    """导出规则 JSON（用户规则；用于备份 / 沉淀为基准规则）。"""
-    import json as _json
-    payload = {
-        "v": 1,
-        "kind": "fnmedia-ext-classify-rules",
-        "exported_at": int(time.time()),
-        "rules": [{"k": r.get("k"), "cat": r.get("cat"),
-                   "exact": bool(r.get("exact", True))}
-                  for r in catalogmod._read_rule_file()],
-    }
-    body = _json.dumps(payload, ensure_ascii=False, indent=1)
-    return Response(content=body, media_type="application/json",
-                    headers={"Content-Disposition":
-                             'attachment; filename="classify_rules.json"'})
-
-
-@app.post("/v/api/ext/classify/rules-import")
-async def ext_classify_rules_import(request: Request):
-    """导入规则 JSON。body: {rules:[{k,cat,exact}], replace?:bool}
-
-    默认与现有规则合并（同名同 exact 覆盖）；replace=true 整表替换。
-    导入后立即本地重算（不联网），并刷新搜索缓存。
-    """
-    try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001
-        body = {}
-    items = body.get("rules")
-    if items is None and isinstance(body.get("data"), dict):
-        items = body["data"].get("rules")
-    if not isinstance(items, list) or not items:
-        return JSONResponse({"code": 400, "msg": "rules 需为非空数组"},
-                            status_code=400)
-    n, msg = catalogmod.merge_rules(items, replace=bool(body.get("replace")))
-    if n <= 0:
-        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
-    local = _apply_rules_local_or_fallback(
-        [str(x.get("k") or x.get("name") or "") for x in items])
-    return {"code": 0, "msg": msg,
-            "data": {"imported": n, "rules": catalogmod.rules_snapshot()},
-            "local": local}
-
-
-@app.post("/v/api/ext/classify/bake-default")
-async def ext_classify_bake_default():
-    """把当前用户规则沉淀为随包内置默认（assets/classify_rules.default.json）。"""
-    n, msg, path = catalogmod.bake_default_rules()
-    if n <= 0:
-        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
-    local = _apply_rules_local_or_fallback([])
-    _log.info("classify default rules baked: n=%s path=%s", n, path)
-    return {"code": 0, "msg": msg,
-            "data": {"baked": n, "path": path,
-                     "rules": catalogmod.rules_snapshot()},
-            "local": local}
-
-
-@app.post("/v/api/ext/classify/dedupe-default")
-async def ext_classify_dedupe_default():
-    """清理与内置默认完全一致的用户规则（沉淀后去冗余，让默认可随包升级）。"""
-    n, msg = catalogmod.dedupe_user_rules()
-    if n <= 0:
-        return {"code": 0, "msg": msg, "data": {"removed": 0,
-                                               "rules": catalogmod.rules_snapshot()}}
-    local = _apply_rules_local_or_fallback([])
-    _log.info("classify user rules deduped: removed=%s", n)
-    return {"code": 0, "msg": msg,
-            "data": {"removed": n, "rules": catalogmod.rules_snapshot()},
-            "local": local}
+    _schedule_routes_refresh()
+    return {"code": 0, "msg": msg, "data": catalogmod.rules_snapshot()}
 
 
 @app.post("/v/api/ext/classify/rebuild")
@@ -11783,48 +11662,8 @@ async def ext_set_source_proxy(request: Request):
                      "test_msg": ("直连（未设置代理）" if not px else test_msg)}}
 
 
-def _apply_rules_local_or_fallback(names: list[str]) -> dict:
-    """规则变更后优先走「本地重算路由」（不联网、毫秒级）。
-
-    本地重算需要叶子索引（建库时记录的每个分类的 type_id）；没有索引时
-    （首次启动、旧磁盘缓存）退回原方案：立刻摘池 + 后台全量重建。
-    """
-    try:
-        res = catalogmod.catalog.apply_rules_local()
-        if res.get("ok"):
-            _log.info("classify rules applied locally: changed=%s routes=%s",
-                      res.get("changed"), res.get("routes"))
-            _search_cache.clear()
-            _AGG_CACHE.clear()
-            return res
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("apply_rules_local failed: %s", type(exc).__name__)
-    try:
-        catalogmod.catalog.apply_rules_now(names)
-    except Exception as exc:  # noqa: BLE001
-        _log.debug("apply_rules_now failed: %s", type(exc).__name__)
-    _schedule_routes_refresh()
-    return {"ok": False, "reason": "fallback-full-refresh"}
-
-
-_ROUTES_REFRESH_PENDING = False
-
-
 def _schedule_routes_refresh():
-    global _ROUTES_REFRESH_PENDING
-    if _ROUTES_REFRESH_PENDING:
-        # 已经有一轮在等（它会等当前轮结束后按**最新规则**再跑一遍）：
-        # 连续保存 N 条时不要排 N 轮，否则用户要等 N×30 秒。
-        return
-
     async def _run_after_current():
-        global _ROUTES_REFRESH_PENDING
-        try:
-            await _run_refresh_once()
-        finally:
-            _ROUTES_REFRESH_PENDING = False
-
-    async def _run_refresh_once():
         # 刷新进行中时不能丢事件：连续“关→开”切换若把“开”丢掉，
         # 关状态的重建会先落地且再无重建，扩展库卡永远回不来。
         # 等当前这轮结束再按最新配置补跑一次（refresh_routes 自身有重入保护）。
@@ -11835,11 +11674,10 @@ def _schedule_routes_refresh():
         if not catalog._refreshing:
             await catalog.refresh_routes(config.enabled_sources())
 
-    _ROUTES_REFRESH_PENDING = True
     try:
         asyncio.create_task(_run_after_current())
     except Exception:
-        _ROUTES_REFRESH_PENDING = False
+        pass
 
 
 @app.post("/v/api/ext/source/add")
@@ -12024,24 +11862,16 @@ async def ext_patrol_run(request: Request):
     except Exception:  # noqa: BLE001
         body = {}
     force = bool(body.get("force", True))
-    ids = body.get("ids")
-    if not isinstance(ids, list):
-        ids = None
 
     async def _run():
         try:
-            if ids:
-                # 只验证指定源（如「待验证」列表）：单源 25s、CMS 并发 8、上限 60
-                r = await healthcheck.verify_batch([str(x) for x in ids])
-            else:
-                r = await healthcheck.scan_once(force=force)
+            r = await healthcheck.scan_once(force=force)
             _log.info("patrol manual run: %s", r)
         except Exception as exc:  # noqa: BLE001
             _log.warning("patrol manual run failed: %s", exc)
 
     asyncio.create_task(_run())
-    return {"code": 0, "msg": ("已开始验证指定源，稍后刷新查看" if ids
-                              else "巡检已在后台开始，稍后刷新查看结果")}
+    return {"code": 0, "msg": "巡检已在后台开始，稍后刷新查看结果"}
 
 
 @app.get("/v/api/ext/source/removed")
@@ -12456,24 +12286,6 @@ async def ext_subscriptions_refresh(sid: str, request: Request):
             "data": result}
 
 
-async def _verify_imported(ids: list[str]) -> None:
-    """导入/刷新后立刻验证这批新源，通过即 verified=True（自动进全局搜索）。
-
-    阈值：单源 25s（实测正常源 1~8s、慢源 15s 左右，25s 兜住绝大多数）；
-    CMS 并发 8、spider/drpy 2；单批最多 60 个，溢出交周期巡检。
-    失败不删不降级：连续失败 3 次且跨 12h 才由巡检停用，避免误杀慢源。
-    """
-    try:
-        import healthcheck
-        rep = await healthcheck.verify_batch(ids)
-        _log.info("import verify: checked=%s ok=%s disabled=%s",
-                  rep.get("checked"), rep.get("ok"), len(rep.get("disabled") or []))
-        _search_cache.clear()
-        _AGG_CACHE.clear()
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("import verify failed: %s", type(exc).__name__)
-
-
 async def _adult_judge_bg(items: list[tuple[str, str, str]]) -> None:
     """后台判定新导入源是否成人内容（名字判不出时），命中就打 18。
 
@@ -12571,7 +12383,6 @@ async def ext_import_subscription(request: Request):
     # （多热词 + 25 秒超时）确认可用性，失效的由巡检自动停用。
     existing = {s.get("api", "").rstrip("/").lower() for s in config.all_sources()}
     cms_added, cms_dup = [], 0
-    cms_added_ids: list[str] = []
     cms_adult_auto: list[str] = []
     cms_adult_pending: list[tuple[str, str, str]] = []
     cms_capped = 0
@@ -12587,7 +12398,6 @@ async def ext_import_subscription(request: Request):
                                     sub_id=sub_id, verified=False)
         if ok:
             cms_added.append(c["name"])
-            cms_added_ids.append(sid)
             existing.add(key)
             # 成人站自动打 18：名字能判出来的立刻标；判不出来的交给后台内容判定
             # （不拖慢导入）。打错会让源从全局搜索消失，所以判定一律保守。
@@ -12604,10 +12414,6 @@ async def ext_import_subscription(request: Request):
     if cms_adult_pending:
         # 后台判定（每源最多 2 个请求，并发 3）：导入接口立刻返回，不卡管理页
         asyncio.create_task(_adult_judge_bg(cms_adult_pending))
-    if cms_added_ids:
-        # 「灌入不探测」不等于「不管」：导入后立刻验证这批新源（单源 25s、CMS 并发 8、
-        # 溢出留给周期巡检），通过即 verified=True 自动进搜索。
-        asyncio.create_task(_verify_imported(cms_added_ids))
     if cms_capped:
         skipped.append({"name": "…共 %d 个" % cms_capped,
                         "reason": "单轮新增上限 200，其余下次导入"})

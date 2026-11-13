@@ -373,6 +373,7 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
           选个库点「保存」就写进规则，下次建库所有源同时生效。</p>
         <div class="hint" id="clsStat">加载中…</div>
         <div id="clsPool"></div>
+        <div id="clsPending"></div>
         <div id="clsUser"></div>
         <div id="clsDefaults"></div>
         <div class="btn-row">
@@ -1839,6 +1840,19 @@ function renderClassRules(){
                 +'<button class="btn sm" onclick="clsSave(this)">保存</button>')
             +'<button class="btn sm" data-k="'+esc(u.k)+'" data-e="'+(u.exact?1:0)+'" onclick="clsDel(this)">恢复默认</button></div>';
         }).join("")+'</div>'
+      : '';
+  }
+  const pend=((CLSR||{}).rules||{}).pending||[];
+  const pb=$("clsPending");
+  if(pb){
+    pb.innerHTML=pend.length
+      ? '<div class="hint" style="margin-top:10px">已配好规则、等源恢复的 '+pend.length
+        +' 条（规则已生效，源一连通就自动归位）</div>'
+        +'<div class="cls-rows">'+pend.slice(0,12).map(x=>
+          '<div class="cls-row"><span class="cls-ck-ph"></span>'
+          +'<span class="cls-name">'+esc(x.k)+'</span>'
+          +'<span class="tag">'+esc(clsCatTitle(cats,x.cat))+'</span>'
+          +'<span class="muted sm">待源恢复</span></div>').join("")+'</div>'
       : '';
   }
   renderDefaultRules();

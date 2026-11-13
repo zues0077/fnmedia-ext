@@ -236,7 +236,12 @@ def _welfare_on() -> bool:
 # 规则没命中才轮到 classify() 的关键词猜。cat=None 与「没认出来」是两回事：
 # 前者不再进未归类池，也不会被源级 18 兜底捞回福利库。
 _RULES_FILE = Path(__file__).resolve().parent.parent / "state" / "classify_rules.json"
+# 内置默认规则（随包发布）：用户确认过的规则沉淀到这里，新装即认全；
+# 用户规则（state/classify_rules.json）优先级更高，升级不会覆盖用户改动。
+_DEFAULT_RULES_FILE = (Path(__file__).resolve().parent / "assets"
+                       / "classify_rules.default.json")
 RULES_VERSION = 1
+_DEFAULT_FILE_RULES: tuple[tuple[str, str | None, bool], ...] = ()
 
 # 默认规则，全部取自 246 实测的未归类名，只收实际观测到的、跨源通用的叫法。
 # 每条 (分类名, 目标库 或 None=丢弃, 是否精确匹配)。
@@ -324,6 +329,41 @@ def _write_rule_file(rules: list[dict]) -> bool:
         return False
 
 
+def _load_default_file() -> tuple[tuple[str, str | None, bool], ...]:
+    """读取随包的内置默认规则；文件缺失/损坏时返回空（不影响代码内置表）。"""
+    try:
+        if not _DEFAULT_RULES_FILE.exists():
+            return ()
+        data = json.loads(_DEFAULT_RULES_FILE.read_text(encoding="utf-8"))
+        rows = data.get("rules") if isinstance(data, dict) else data
+        out: list[tuple[str, str | None, bool]] = []
+        known = set(all_cats()) | {ADULT_CAT}
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            k = str(r.get("k") or r.get("name") or "").strip()
+            if not k or len(k) > 40:
+                continue
+            cat = r.get("cat")
+            if isinstance(cat, str):
+                cat = cat.strip() or None
+            else:
+                cat = None
+            if cat is not None and cat not in known:
+                continue
+            out.append((k, cat, bool(r.get("exact", True))))
+        return tuple(out)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("classify default rules load failed: %s", exc)
+        return ()
+
+
+def _reload_default_file() -> None:
+    global _DEFAULT_FILE_RULES
+    _DEFAULT_FILE_RULES = _load_default_file()
+    reload_rules()
+
+
 def _rule_index():
     """合并默认规则与用户规则，建索引。用户同 key 同 exact 覆盖默认。"""
     global _rules_cache
@@ -332,7 +372,7 @@ def _rule_index():
             return _rules_cache
         exact: dict[str, str | None] = {}
         kw: dict[str, str | None] = {}
-        for k, cat, is_exact in _DEFAULT_RULES:
+        for k, cat, is_exact in tuple(_DEFAULT_RULES) + tuple(_DEFAULT_FILE_RULES):
             (exact if is_exact else kw)[k.lower()] = cat
         for r in _read_rule_file():
             k = str(r.get("k") or "").strip().lower()
@@ -361,6 +401,83 @@ def rule_hit(name: str) -> tuple[bool, str | None]:
         if k and k in n:
             return (True, cat)
     return (False, None)
+
+
+def bake_default_rules() -> tuple[int, str, str]:
+    """把当前用户规则沉淀为「随包内置默认」（写入 proxy/assets/classify_rules.default.json）。
+
+    - 跳过红线词（萝莉/换脸等）：它们在任何规则之前就被拦截，写进默认只会造成误解；
+    - 跳过 cat 非法的条目；
+    - 用户规则文件保持不动（覆盖关系不变，升级不丢用户改动）。
+    """
+    rules: list[dict] = []
+    skipped_red = 0
+    known = set(all_cats()) | {ADULT_CAT}
+    for r in _read_rule_file():
+        k = str(r.get("k") or "").strip()
+        if not k:
+            continue
+        if is_redline(k):
+            skipped_red += 1
+            continue
+        cat = r.get("cat")
+        cat = str(cat).strip() if isinstance(cat, str) else None
+        if cat is not None and cat not in known:
+            continue
+        rules.append({"k": k, "cat": cat, "exact": bool(r.get("exact", True))})
+    if not rules:
+        return 0, "没有可沉淀的规则", ""
+    payload = {
+        "v": 1,
+        "kind": "fnmedia-ext-classify-rules-default",
+        "note": "随包内置默认规则：新装即生效；用户规则（state/classify_rules.json）优先级更高。",
+        "updated": int(time.time()),
+        "rules": rules,
+    }
+    try:
+        _DEFAULT_RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _DEFAULT_RULES_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        os.replace(tmp, _DEFAULT_RULES_FILE)
+    except Exception as exc:  # noqa: BLE001
+        return 0, "写入失败：%s" % exc, ""
+    reload_default_rules()
+    msg = "已沉淀 %d 条为内置默认" % len(rules)
+    if skipped_red:
+        msg += "（跳过红线词 %d 条）" % skipped_red
+    return len(rules), msg, str(_DEFAULT_RULES_FILE)
+
+
+def dedupe_user_rules() -> tuple[int, str]:
+    """删掉与内置默认「完全一致」的用户规则（同名同 exact 同库）。
+
+    沉淀之后这些用户规则变成纯冗余：它们会一直覆盖默认，导致以后升级默认规则
+    时改动不生效。清掉它们，用户规则里只留真正的个人偏差。
+    """
+    known: dict[tuple[str, bool], str | None] = {}
+    for k, cat, ex in tuple(_DEFAULT_FILE_RULES) + tuple(_DEFAULT_RULES):
+        key = (str(k).strip().lower(), bool(ex))
+        if key[0]:
+            known[key] = cat
+    rules = _read_rule_file()
+    keep: list[dict] = []
+    removed = 0
+    for r in rules:
+        k = str(r.get("k") or "").strip()
+        if not k:
+            continue
+        key = (k.lower(), bool(r.get("exact", True)))
+        if key in known and known[key] == r.get("cat"):
+            removed += 1
+            continue
+        keep.append(r)
+    if not removed:
+        return 0, "没有与默认重复的用户规则"
+    if not _write_rule_file(keep):
+        return 0, "写入失败（检查 state 目录权限）"
+    reload_rules()
+    return removed, "已清理 %d 条与默认重复的用户规则" % removed
 
 
 def merge_rules(items: list[dict], *, replace: bool = False) -> tuple[int, str]:
@@ -433,8 +550,19 @@ def set_rules_batch(items: list[dict], exact: bool = True) -> tuple[int, str]:
 
 
 def reload_rules() -> None:
-    """规则改动后清缓存，下次建库即生效。"""
+    """规则改动后清缓存；同时重读内置默认文件（可能被运维更新）。
+
+    注意：_reload_default_file() 内部会再调 reload_rules，用参数避免递归。
+    """
     global _rules_cache
+    with _rules_lock:
+        _rules_cache = None
+
+
+def reload_default_rules() -> None:
+    """显式重载内置默认规则文件（改完文件后调用）。"""
+    global _DEFAULT_FILE_RULES, _rules_cache
+    _DEFAULT_FILE_RULES = _load_default_file()
     with _rules_lock:
         _rules_cache = None
 
@@ -600,13 +728,15 @@ def rules_snapshot() -> dict:
     user_keys = {(u["k"].lower(), u["exact"]) for u in users}
     defaults_list = []
     seen_def: set[tuple[str, bool]] = set()
-    for k, cat, ex in _DEFAULT_RULES:
+    _all_defaults = ([(k, c, e, "file") for k, c, e in _DEFAULT_FILE_RULES]
+                     + [(k, c, e, "builtin") for k, c, e in _DEFAULT_RULES])
+    for k, cat, ex, _src in _all_defaults:
         key = (str(k).strip().lower(), bool(ex))
         if not key[0] or key in seen_def:
             continue
         seen_def.add(key)
         defaults_list.append({"k": str(k).strip(), "cat": cat, "exact": bool(ex),
-                              "overridden": key in user_keys})
+                              "src": _src, "overridden": key in user_keys})
     defaults_list.sort(key=lambda x: (x["exact"] is False, x["k"]))
     return {
         "file": str(_RULES_FILE),
@@ -2192,5 +2322,11 @@ class Catalog:
         pool = all_cats() + [ADULT_CAT] if (_welfare_on() and src and src.get("adult")) else all_cats()
         return any(self.available(c, scope) for c in pool)
 
+
+# 模块加载时读一次随包的内置默认规则（文件缺失则只用代码内置表）
+try:
+    _DEFAULT_FILE_RULES = _load_default_file()
+except Exception:  # noqa: BLE001
+    _DEFAULT_FILE_RULES = ()
 
 catalog = Catalog()

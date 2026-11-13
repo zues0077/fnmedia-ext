@@ -24,7 +24,7 @@ import binascii
 import json
 import re
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -226,6 +226,55 @@ def _json_loads_dict(text: str) -> dict | None:
     return None
 
 
+def _json_loads_list(text: str) -> list | None:
+    """json.loads 取顶层**数组**（配合 JSONC 去注释）。"""
+    if not text or not text.lstrip().startswith("["):
+        return None
+    for candidate in (text, _strip_jsonc(text)):
+        try:
+            j = json.loads(candidate)
+            return j if isinstance(j, list) else None
+        except Exception:
+            continue
+    return None
+
+
+def _cms_interfaces_to_config(arr: list) -> dict | None:
+    """顶层数组 → 苹果CMS 接口清单，包装成标准 {"sites":[...]}。
+
+    典型输入（https://www.ziyuanzu.com/download/ziyuanzu-cms-interfaces.json）：
+      [{"name": "360资源站", "api": "https://360zy.com/api.php/provide/vod/",
+        "apiType": "json", "uptime": "99.999%", "speed": "fast"}, ...]
+
+    这类清单没有 TVBox 的 sites 字段，只是「一组苹果CMS接口」。过去
+    parse_config_text 只认 dict，整份清单被判「不是订阅」直接丢弃 —— 用户把
+    URL 加成订阅后每轮拉取都是 sites=0 静默空转（2026-11-13 实测）。
+
+    只收「元素是 dict 且 api 为 http(s)」的条目；一条都不合格就返回 None，
+    避免把任意数组误判成订阅。apiType=xml 的按苹果CMS xml（type=0），
+    其余按 json（type=1）。
+    """
+    sites: list[dict] = []
+    for i, item in enumerate(arr or []):
+        if not isinstance(item, dict):
+            continue
+        api = str(item.get("api") or "").strip()
+        if not api.startswith(("http://", "https://")):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            try:
+                name = urlsplit(api).netloc or ("接口%d" % (i + 1))
+            except Exception:  # noqa: BLE001
+                name = "接口%d" % (i + 1)
+        typ = 0 if str(item.get("apiType") or "").strip().lower() == "xml" else 1
+        sites.append({"key": "cmslist_%03d" % i, "name": name[:40],
+                      "type": typ, "api": api})
+    if not sites:
+        return None
+    return {"sites": sites}
+
+
 # 伪装成图片（.bmp/.jpg）的订阅：图片字节之后追加 base64 配置。
 _B64_ALPHA = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
 _B64_WS = set(b"\r\n\t ")
@@ -330,11 +379,22 @@ def parse_config_text(text: str) -> dict | None:
     cfg = _json_loads_dict(text)
     if cfg is not None:
         return cfg
+    # 顶层数组 = 苹果CMS 接口清单（ziyuanzu 那类），包装成 sites 再走原流程
+    arr = _json_loads_list(text)
+    if arr is not None:
+        cfg = _cms_interfaces_to_config(arr)
+        if cfg is not None:
+            return cfg
     decoded = _b64_try(text)
     if decoded:
         cfg = _json_loads_dict(decoded)
         if cfg is not None:
             return cfg
+        arr = _json_loads_list(decoded)
+        if arr is not None:
+            cfg = _cms_interfaces_to_config(arr)
+            if cfg is not None:
+                return cfg
     # Base58 包裹（LunaTV 订阅链接：整段 Base58 编码的 JSON）
     decoded = _b58_decode(text)
     if decoded:

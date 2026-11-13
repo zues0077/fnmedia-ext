@@ -158,6 +158,9 @@ def _preview_report(sub: dict, raw_sites: list, groups: dict) -> dict:
     }
 
 
+_BG_TASKS: set = set()
+
+
 async def refresh_subscription(sub_id: str, *, preview: bool = False,
                                csp_keys: list[str] | None = None) -> dict:
     """拉取单个订阅并「只增不减」导入。返回报告 dict。
@@ -343,7 +346,10 @@ async def refresh_subscription(sub_id: str, *, preview: bool = False,
         # 灌入后立即验证这批新源（不等 6h 周期轮）；通过即 verified=True 进搜索
         try:
             import healthcheck as _hc
-            asyncio.create_task(_hc.verify_batch(added_ids))
+            # 必须保留强引用，否则任务可能在执行前被 GC（见 app._spawn_bg 注释）
+            _t = asyncio.create_task(_hc.verify_batch(added_ids))
+            _BG_TASKS.add(_t)
+            _t.add_done_callback(_BG_TASKS.discard)
         except Exception:  # noqa: BLE001
             pass
     cfg.mark_subscription_update(sub_id, True)

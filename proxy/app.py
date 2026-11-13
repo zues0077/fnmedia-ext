@@ -12456,6 +12456,21 @@ async def ext_subscriptions_refresh(sid: str, request: Request):
             "data": result}
 
 
+# 一次性后台任务的强引用：asyncio.create_task 返回的 Task 只被 event loop 弱引用，
+# 没有其它引用时**可能在开始执行前就被 GC**（Python 3.10+ 常见）。
+# 2026-11-13 实测：订阅首次导入 37 个新源，_verify_imported 连一行日志都没打出来，
+# 结果 37 个源全部停在 verified=False（手动 patrol/run 才把 23 个验证通过）。
+_BG_TASKS: set = set()
+
+
+def _spawn_bg(coro, *, name: str = ""):
+    """创建一个必须跑完的后台任务，并保留强引用直到它结束。"""
+    t = asyncio.create_task(coro, name=name) if name else asyncio.create_task(coro)
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    return t
+
+
 async def _verify_imported(ids: list[str]) -> None:
     """导入/刷新后立刻验证这批新源，通过即 verified=True（自动进全局搜索）。
 
@@ -12604,11 +12619,11 @@ async def ext_import_subscription(request: Request):
             cms_dup += 1
     if cms_adult_pending:
         # 后台判定（每源最多 2 个请求，并发 3）：导入接口立刻返回，不卡管理页
-        asyncio.create_task(_adult_judge_bg(cms_adult_pending))
+        _spawn_bg(_adult_judge_bg(cms_adult_pending), name="adult-judge")
     if cms_added_ids:
         # 「灌入不探测」不等于「不管」：导入后立刻验证这批新源（单源 25s、CMS 并发 8、
         # 溢出留给周期巡检），通过即 verified=True 自动进搜索。
-        asyncio.create_task(_verify_imported(cms_added_ids))
+        _spawn_bg(_verify_imported(cms_added_ids), name="verify-imported")
     if cms_capped:
         skipped.append({"name": "…共 %d 个" % cms_capped,
                         "reason": "单轮新增上限 200，其余下次导入"})

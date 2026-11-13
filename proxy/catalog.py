@@ -562,6 +562,19 @@ def rules_snapshot() -> dict:
         e = bool(r.get("exact", True))
         users.append({"k": k, "cat": r.get("cat"), "exact": e,
                       "overrides_default": (k.lower(), e) in defaults})
+    # 默认规则明细（供管理页「已生效规则」列表复核/修改）：标出哪些已被用户
+    # 规则覆盖，未覆盖的也能直接改成别的库（写用户规则覆盖它）。
+    user_keys = {(u["k"].lower(), u["exact"]) for u in users}
+    defaults_list = []
+    seen_def: set[tuple[str, bool]] = set()
+    for k, cat, ex in _DEFAULT_RULES:
+        key = (str(k).strip().lower(), bool(ex))
+        if not key[0] or key in seen_def:
+            continue
+        seen_def.add(key)
+        defaults_list.append({"k": str(k).strip(), "cat": cat, "exact": bool(ex),
+                              "overridden": key in user_keys})
+    defaults_list.sort(key=lambda x: (x["exact"] is False, x["k"]))
     return {
         "file": str(_RULES_FILE),
         "file_exists": _RULES_FILE.exists(),
@@ -569,6 +582,7 @@ def rules_snapshot() -> dict:
         "keyword": len(kws),
         "default_total": len(_DEFAULT_RULES),
         "user": users,
+        "defaults": defaults_list,
     }
 
 

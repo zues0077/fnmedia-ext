@@ -1857,7 +1857,7 @@ async function clsSuggest(btn){
   finally{btn.disabled=false;btn.textContent=old||"✨ 智能建议";}
 }
 
-let CLS_RF={q:"",src:"all",cat:"all"},CLS_RF_OPEN=false;
+let CLS_RF={q:"",src:"all",cat:"all",cf:null},CLS_RF_OPEN=false;
 function renderRulesList(){
   const box=$("clsRules");if(!box)return;
   const rules=(CLSR||{}).rules||{},cats=(CLSR||{}).cats||[];
@@ -1871,6 +1871,7 @@ function renderRulesList(){
   });
   const q=(CLS_RF.q||"").toLowerCase();
   const list=rows.filter(r=>{
+    if(CLS_RF.cf&&!CLS_RF.cf.has((r.k||"").toLowerCase()))return false;
     if(q&&!(r.k||"").toLowerCase().includes(q))return false;
     if(CLS_RF.src==="user"&&r.src!=="user")return false;
     if(CLS_RF.src==="default"&&r.src!=="default")return false;
@@ -1883,9 +1884,23 @@ function renderRulesList(){
   const nUser=rows.filter(r=>r.src==="user").length;
   const show=CLS_RF_OPEN?list:list.slice(0,30);
   const opt=(v,t,cur)=>"<option value=\""+esc(v)+"\""+(v===cur?" selected":"")+">"+esc(t)+"</option>";
+  const cov=(rules.coverage||{}),cfs=(rules.conflicts||[]);
   box.innerHTML="<div class=\"hint\" style=\"margin-top:14px\">已配置规则（共 "+rows.length
       +" 条：用户配置 "+nUser+" · 系统默认 "+(rows.length-nUser)
       +"）—— 同一分类名在哪源都归同一个库</div>"
+    +"<div class=\"muted sm\" style=\"margin:2px 0 8px\">覆盖率：分类名 "+(cov.total||0)
+      +" · 已识别 "+(cov.classified||0)+" · 未归类 "+(cov.unclassified||0)
+      +" · 待源恢复 "+(cov.pending_rules||0)+" · 规则 "+(cov.rules_exact||0)+" 精确 + "
+      +(cov.rules_keyword||0)+" 关键词</div>"
+    +(cfs.length?'<div class=\"hint\" style=\"color:#c67\">⚠ 冲突 '+cfs.length
+        +' 处（同名同时有精确+关键词规则，精确优先）：'
+        +cfs.slice(0,5).map(x=>esc(x.k)).join("、")+(cfs.length>5?"…":"")
+        +' <button class=\"small\" onclick=\"clsRfConflict()\">只看冲突</button></div>':'')
+    +"<div class=\"btn-row\" style=\"margin:0 0 8px\">"
+      +"<a class=\"btn sm\" href=\"/v/api/ext/classify/rules-export\" download>⇩ 导出规则</a>"
+      +"<button class=\"btn sm\" onclick=\"$('clsImportFile').click()\">⇧ 导入规则</button>"
+      +"<input type=\"file\" id=\"clsImportFile\" accept=\".json,application/json\" style=\"display:none\" onchange=\"clsImport(this)\"/>"
+    +"</div>"
     +"<div class=\"cls-batch\">"
     +"<input class=\"input\" placeholder=\"搜索名字…\" value=\""+esc(CLS_RF.q||"")+"\" oninput=\"clsRfQ(this.value)\" style=\"max-width:170px\"/>"
     +"<select class=\"input\" onchange=\"clsRfSrc(this.value)\" style=\"max-width:130px\">"
@@ -1923,6 +1938,30 @@ function renderRulesList(){
           +"</div>";
       }).join("")+"</div>"
     +(list.length===0?"<div class=\"muted sm\" style=\"padding:6px 0\">没有匹配的规则</div>":"");
+}
+function clsRfConflict(){
+  if(CLS_RF.cf){CLS_RF.cf=null;renderRulesList();return;}   // 再点一次取消
+  const cfs=(((CLSR||{}).rules)||{}).conflicts||[];
+  CLS_RF.q="";CLS_RF.src="all";CLS_RF.cat="all";
+  CLS_RF.cf=new Set(cfs.map(x=>(x.k||"").toLowerCase()));
+  CLS_RF_OPEN=true;renderRulesList();
+}
+async function clsImport(inp){
+  const f=inp&&inp.files&&inp.files[0];if(!f)return;
+  try{
+    const txt=await f.text();
+    const obj=JSON.parse(txt);
+    const rules=Array.isArray(obj)?obj:(obj.rules||[]);
+    if(!rules.length){toast("文件里没有规则","fail");return;}
+    if(!confirm("导入 "+rules.length+" 条规则？（同名同类型会覆盖，不影响其它规则）"))return;
+    const r=await jpost("/v/api/ext/classify/rules-import",{rules:rules},30000);
+    if(r.code===0){
+      if(r.data&&r.data.rules&&CLSR)CLSR.rules=r.data.rules;
+      toast(r.msg||"已导入");
+      renderRulesList();
+    }else{toast(r.msg||"导入失败","fail");}
+  }catch(e){toast("导入失败："+(e.message||e),"fail");}
+  finally{if(inp)inp.value="";}
 }
 function clsRfQ(v){CLS_RF.q=(v||"").trim();renderRulesList();}
 function clsRfSrc(v){CLS_RF.src=v||"all";renderRulesList();}

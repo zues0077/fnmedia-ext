@@ -363,6 +363,39 @@ def rule_hit(name: str) -> tuple[bool, str | None]:
     return (False, None)
 
 
+def merge_rules(items: list[dict], *, replace: bool = False) -> tuple[int, str]:
+    """导入规则：默认与现有规则合并（同名同 exact 覆盖），replace=True 则整表替换。"""
+    pairs: list[dict] = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        k = str(it.get("k") or it.get("name") or "").strip()
+        if not k or len(k) > 40:
+            continue
+        cat = it.get("cat")
+        if isinstance(cat, str):
+            cat = cat.strip() or None
+            if cat in ("__drop__", "drop", "none", "null"):
+                cat = None
+        else:
+            cat = None
+        if cat is not None and cat not in all_cats() and cat != ADULT_CAT:
+            continue
+        pairs.append({"k": k, "cat": cat, "exact": bool(it.get("exact", True))})
+    if not pairs:
+        return 0, "没有可用规则"
+    rules = [] if replace else _read_rule_file()
+    keys = {(p["k"].lower(), p["exact"]) for p in pairs}
+    rules = [r for r in rules
+             if (str(r.get("k") or "").strip().lower(),
+                 bool(r.get("exact", True))) not in keys]
+    rules.extend(pairs)
+    if not _write_rule_file(rules):
+        return 0, "写入失败（检查 state 目录权限）"
+    reload_rules()
+    return len(pairs), ("已导入 %d 条%s" % (len(pairs), "（整表替换）" if replace else ""))
+
+
 def set_rules_batch(items: list[dict], exact: bool = True) -> tuple[int, str]:
     """批量写规则：一次落盘、一次 reload（管理页「多选 → 选库 → 保存」用）。
 
@@ -586,6 +619,10 @@ def rules_snapshot() -> dict:
         # 已配规则但当前没有源提供该分类（源失效/已删）：规则已生效，等源恢复自动归位
         "pending": (globals().get("catalog").rules_pending_materialize()
                     if globals().get("catalog") else []),
+        "coverage": (globals().get("catalog").rules_coverage()
+                     if globals().get("catalog") else {}),
+        "conflicts": (Catalog.rules_conflicts()
+                      if "Catalog" in globals() else []),
     }
 
 
@@ -1471,6 +1508,48 @@ class Catalog:
                     reason, conf = "同源多数票", 0.4
             out.append({"name": name, "cat": cat, "reason": reason or "无建议",
                         "conf": conf, "sources": len(sids)})
+        return out
+
+    def rules_coverage(self) -> dict:
+        """规则覆盖率：分类名总量 / 已识别 / 未归类 / 待源恢复。"""
+        leaves: set[str] = set()
+        for v in self._leaf_index.values():
+            leaves.update(v.keys())
+        with self._lock:
+            classified: set[str] = set()
+            for items in self._classes.values():
+                for it in items:
+                    nm = str(it.get("type_name") or "").strip()
+                    if nm:
+                        classified.add(nm)
+            unc: set[str] = set()
+            for names in self._unclassified.values():
+                unc.update(str(n) for n in names)
+        total = len(leaves | classified | unc)
+        try:
+            pending = len(self.rules_pending_materialize())
+        except Exception:  # noqa: BLE001
+            pending = 0
+        return {"total": total, "classified": len(classified | (leaves - unc)),
+                "unclassified": len(unc), "pending_rules": pending,
+                "rules_exact": len(_rule_index()[0]),
+                "rules_keyword": len(_rule_index()[1])}
+
+    @staticmethod
+    def rules_conflicts() -> list[dict]:
+        """同一名字同时有「精确」和「关键词」规则 → 冲突（精确优先，静默择一）。"""
+        bucket: dict[str, list[dict]] = {}
+        for r in _read_rule_file():
+            k = str(r.get("k") or "").strip()
+            if not k:
+                continue
+            bucket.setdefault(k.lower(), []).append(
+                {"k": k, "cat": r.get("cat"), "exact": bool(r.get("exact", True))})
+        out = []
+        for _lk, arr in bucket.items():
+            kinds = {bool(x["exact"]) for x in arr}
+            if len(arr) > 1 and len(kinds) > 1:
+                out.append({"k": arr[0]["k"], "items": arr})
         return out
 
     def rules_pending_materialize(self) -> list[dict]:

@@ -2490,7 +2490,7 @@ function renderSubResult(d){
         ?'<div class="muted sm" style="padding:4px 2px">其中 '+cms.adult_auto.length+' 个按名字判定为成人站，已自动标「18」进福利库（可在资源站页取消）：'
           +esc(cms.adult_auto.join("、"))+'</div>'
         :'');
-    h+=subGrp('🍿 苹果CMS影视站　新增 '+cmsOk+(cmsOk?'（后台验证中，通过后自动进入搜索）':'')+' · 已存在 '+(cms.duplicate||0)
+    h+=subGrp('🍿 苹果CMS影视站　新增 '+cmsOk+(cmsOk?'（都标「待巡检」，检测交给巡检）':'')+' · 已存在 '+(cms.duplicate||0)
       +((cms.adult_auto||[]).length?(' · 自动标 18 '+cms.adult_auto.length):''),
       rows,(cms.added_names||[]).length);
   }

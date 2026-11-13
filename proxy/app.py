@@ -10780,8 +10780,45 @@ async def ext_classify_rule(request: Request):
         ok, msg = catalogmod.set_rule(name, cat, exact)
     if not ok:
         return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    # 立即生效：只作用于刚改的名字，未归类池马上更新；路由重建后台跑
+    try:
+        if not body.get("delete"):
+            catalogmod.catalog.apply_rules_now([name])
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("apply_rules_now failed: %s", type(exc).__name__)
     _schedule_routes_refresh()
     return {"code": 0, "msg": msg, "data": catalogmod.rules_snapshot()}
+
+
+@app.post("/v/api/ext/classify/rules-batch")
+async def ext_classify_rules_batch(request: Request):
+    """批量保存分类规则：多选 → 选库 → 一次落盘、一次重建（管理页用）。
+
+    body: {items: [{name, cat}], exact?}
+    与逐条保存的区别：只写一遍规则文件、只触发一轮重建（逐条存 N 条会排 N 轮，
+    一轮 20~40 秒，用户要等好几分钟）。
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    items = body.get("items")
+    if not isinstance(items, list) or not items:
+        return JSONResponse({"code": 400, "msg": "items 需为非空数组"},
+                            status_code=400)
+    exact = bool(body.get("exact", True))
+    n, msg = catalogmod.set_rules_batch(items, exact=exact)
+    if n <= 0:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    try:
+        catalogmod.catalog.apply_rules_now(
+            [str(it.get("name") or "") for it in items])
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("apply_rules_now failed: %s", type(exc).__name__)
+    _schedule_routes_refresh()
+    return {"code": 0, "msg": msg,
+            "data": {"saved": n, "rules": catalogmod.rules_snapshot(),
+                     "pool": catalogmod.catalog.unclassified()}}
 
 
 @app.post("/v/api/ext/classify/rebuild")
@@ -11668,8 +11705,24 @@ async def ext_set_source_proxy(request: Request):
                      "test_msg": ("直连（未设置代理）" if not px else test_msg)}}
 
 
+_ROUTES_REFRESH_PENDING = False
+
+
 def _schedule_routes_refresh():
+    global _ROUTES_REFRESH_PENDING
+    if _ROUTES_REFRESH_PENDING:
+        # 已经有一轮在等（它会等当前轮结束后按**最新规则**再跑一遍）：
+        # 连续保存 N 条时不要排 N 轮，否则用户要等 N×30 秒。
+        return
+
     async def _run_after_current():
+        global _ROUTES_REFRESH_PENDING
+        try:
+            await _run_refresh_once()
+        finally:
+            _ROUTES_REFRESH_PENDING = False
+
+    async def _run_refresh_once():
         # 刷新进行中时不能丢事件：连续“关→开”切换若把“开”丢掉，
         # 关状态的重建会先落地且再无重建，扩展库卡永远回不来。
         # 等当前这轮结束再按最新配置补跑一次（refresh_routes 自身有重入保护）。
@@ -11680,10 +11733,11 @@ def _schedule_routes_refresh():
         if not catalog._refreshing:
             await catalog.refresh_routes(config.enabled_sources())
 
+    _ROUTES_REFRESH_PENDING = True
     try:
         asyncio.create_task(_run_after_current())
     except Exception:
-        pass
+        _ROUTES_REFRESH_PENDING = False
 
 
 @app.post("/v/api/ext/source/add")

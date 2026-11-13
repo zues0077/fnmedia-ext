@@ -1812,6 +1812,7 @@ function renderClassRules(){
         +'<label class="sm"><input type="checkbox" id="clsAll" onchange="clsCheckAll(this.checked)" style="width:15px;height:15px"/> 全选本页</label>'
         +'<select class="input" id="clsBatchCat" style="max-width:190px">'+clsOpts(cats)+'</select>'
         +'<button class="btn sm" onclick="clsBatchSave(this)">批量保存<span id="clsBatchN"></span></button>'
+        +'<button class="btn sm" onclick="clsSuggest(this)" title="按关键词/相似名字/同源多数票自动预选，仍需你确认后保存">✨ 智能建议</button>'
         +'<span class="muted sm">选中多项 → 选库 → 一次保存（只重建一轮）</span>'
         +'</div>'
         +'<div class="cls-rows">'+show.map(it=>clsRow(it,cats)).join("")+'</div>'
@@ -1839,6 +1840,31 @@ function renderClassRules(){
         }).join("")+'</div>'
       : '';
   }
+}
+
+async function clsSuggest(btn){
+  btn.disabled=true;const old=btn.textContent;btn.textContent="分析中…";
+  try{
+    const r=await fetch("/v/api/ext/classify/suggest").then(x=>x.json());
+    if(r.code!==0){toast(r.msg||"生成建议失败","fail");return;}
+    const items=(r.data&&r.data.items)||[];
+    const map={};items.forEach(it=>{map[it.name]=it;});
+    let filled=0,conf=0;
+    document.querySelectorAll(".cls-row").forEach(row=>{
+      const nm=row.getAttribute("data-name")||"";const it=map[nm];if(!it)return;
+      const has=(it.cat!==undefined)&&(it.reason&&it.reason!=="无建议");
+      if(!has)return;
+      const sel=row.querySelector(".cls-sel");const ck=row.querySelector(".cls-ck");
+      if(sel){sel.value=it.cat===null?"__drop__":it.cat;}
+      // 低置信（同源多数票 0.4）只预填、不自动勾选，避免把错的一股脑带上
+      if(ck&&(it.conf||0)>=0.5)ck.checked=true;
+      row.title=(it.reason||"")+(it.conf?("（置信 "+it.conf+"）"):"");
+      filled++; if((it.conf||0)>=0.8)conf++;
+    });
+    clsSyncCount();
+    toast("已按建议预选 "+filled+" 条（其中高置信 "+conf+" 条）。核对后点「批量保存」即可。");
+  }catch(e){toast("生成建议失败："+(e.message||e),"fail");}
+  finally{btn.disabled=false;btn.textContent=old||"✨ 智能建议";}
 }
 
 function clsChecked(){

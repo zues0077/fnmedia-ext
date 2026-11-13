@@ -2054,10 +2054,16 @@ async function clsBatchSave(btn){
       // 后端已经把规则就地作用到缓存：用返回的池子立即刷新，不用等整轮重建
       if(r.data&&r.data.pool&&CLSR)CLSR.unclassified=r.data.pool;
       if(r.data&&r.data.rules&&CLSR)CLSR.rules=r.data.rules;
-      toast("已保存 "+names.length+" 条 → "+clsCatTitle((CLSR||{}).cats,real)
-            +"。已立即生效，路由在后台重建（约 20~40 秒）。");
-      renderClassRules();
-      clsWatch();
+      const loc=r.local||{};
+      if(loc.ok){
+        toast("已生效 "+names.length+" 条 → "+clsCatTitle((CLSR||{}).cats,real));
+        await loadClassRules();
+      }else{
+        toast("已保存 "+names.length+" 条 → "+clsCatTitle((CLSR||{}).cats,real)
+              +"。本次需要整库重建（约 20~40 秒）。");
+        renderClassRules();
+        clsWatch();
+      }
     }else{toast(r.msg||"批量保存失败","fail");}
   }catch(e){
     const ab=(e&&e.name==="AbortError");
@@ -2080,10 +2086,18 @@ async function clsSave(btn){
   try{
     const r=await jpost("/v/api/ext/classify/rule",{name:name,cat:real,exact:true},15000);
     if(r.code===0){
-      toast("已保存："+name+" → "+clsCatTitle((CLSR||{}).cats,real)+
-            "。建库中（通常 20~40 秒），跑完自动刷新。");
-      CLS_PENDING.add(name);
-      clsWatch();
+      const loc=r.local||{};
+      if(loc.ok){
+        // 规则本地重算已完成（毫秒级）：直接刷新，不进「建库中」流程
+        if(CLSR&&r.data)CLSR.rules=r.data;
+        toast("已生效："+name+" → "+clsCatTitle((CLSR||{}).cats,real));
+        await loadClassRules();
+      }else{
+        toast("已保存："+name+" → "+clsCatTitle((CLSR||{}).cats,real)
+              +"。本次需要整库重建（约 20~40 秒），跑完自动刷新。");
+        CLS_PENDING.add(name);
+        clsWatch();
+      }
     }
     else{toast(r.msg||"保存失败","fail");btn.disabled=false;btn.textContent="保存";}
   }catch(e){

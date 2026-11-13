@@ -1058,6 +1058,13 @@ class Catalog:
             self._unclassified = {
                 str(k): [str(n) for n in v] for k, v in unc.items()
                 if isinstance(v, list) and (not cfg_ok or str(k) in live)}
+            li = data.get("leaf_index") or {}
+            if isinstance(li, dict) and li:
+                self._leaf_index = {
+                    str(sid): {str(nm): dict(meta) for nm, meta in leaves.items()
+                               if isinstance(meta, dict)}
+                    for sid, leaves in li.items()
+                    if isinstance(leaves, dict) and (not cfg_ok or str(sid) in live)}
         return True
 
     def save_disk(self) -> bool:
@@ -1073,6 +1080,9 @@ class Catalog:
                 payload = {
                     "v": DISK_VERSION,
                     "saved_at": int(time.time()),
+                    # 叶子索引（名字→type_id/父id/基线）：持久化后重启仍能做
+                    # 「规则本地化」重算，不必先等一轮 20~40 秒的全量重建。
+                    "leaf_index": {sid: dict(v) for sid, v in self._leaf_index.items()},
                     "updated": int(self._updated),
                     "classes": {k: v for k, v in self._classes.items() if v},
                     "routes": {k: v for k, v in self._routes.items() if v},

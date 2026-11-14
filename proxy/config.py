@@ -220,6 +220,14 @@ JUNK_KEYWORDS = [
     "彩蛋", "删减", "片场", "开机", "特辑",
 ]
 
+# 内容红线关键词（出厂词表）：涉未成年人性化、非自愿（换脸等）的内容。
+# 与噪音词不同，命中是**整条丢弃**（不进聚合库/独立库/搜索），不只影响展示。
+# 后台「搜索设置 → 内容安全 · 红线关键词」可增删改，配置里保存**完整词表**，
+# 因此删掉默认词同样是永久生效的；下面这份只用于首次初始化与配置损坏时兜底。
+REDLINE_KEYWORDS = [
+    "萝莉", "童贞", "换脸",
+]
+
 DEFAULTS = {
     "config_version": CONFIG_VERSION,
     "sources": [dict(s) for s in DEFAULT_SOURCES],
@@ -232,6 +240,9 @@ DEFAULTS = {
     "max_per_keyword": 12,
     "filter_junk": True,
     "junk_keywords": JUNK_KEYWORDS,
+    # 内容红线关键词（完整词表，后台可增删改）：标题/备注/分类名命中即整条丢弃。
+    # 出厂值见 REDLINE_KEYWORDS；用户删光后为 []，即不再拦截。
+    "redline_keywords": list(REDLINE_KEYWORDS),
     # 在线资源前排展示（在线片库更齐全，默认前排）
     "online_first": True,
     # 播放线路健康探测与自动换线：当前线路解析失败/文件不存在时，自动探测同集其他
@@ -441,6 +452,8 @@ class Config:
     def __init__(self):
         self._cfg: dict = {}
         self._mtime = 0
+        # 红线词表缓存（元组不可变，供 is_redline 热路径直接复用）；任何落盘/重载都置空
+        self._redline_cache: tuple[str, ...] | None = None
         self.load()
 
     # >>> PRIVATE:GUARD
@@ -723,6 +736,7 @@ class Config:
                     _log.warning("admin token persist failed: %s: %s",
                                  type(e).__name__, e)
             self._cfg = cfg
+            self._redline_cache = None
             try:
                 self._mtime = _STATE.stat().st_mtime
             except FileNotFoundError:
@@ -940,6 +954,7 @@ class Config:
         if backup:
             _backup_config()
         self._cfg = cfg
+        self._redline_cache = None
         self._mtime = _STATE.stat().st_mtime
 
     @staticmethod
@@ -1816,6 +1831,34 @@ class Config:
     def reset_junk_keywords(self) -> list[str]:
         self.save({"junk_keywords": list(JUNK_KEYWORDS)})
         return list(JUNK_KEYWORDS)
+
+    # ---- 内容红线关键词（后台可增删改，命中即整条丢弃）----
+    def set_redline_keywords(self, raw) -> list[str]:
+        """保存完整红线词表（去重、去空、限长）；传空列表即不再拦截。"""
+        kws = self.normalize_keywords(raw)
+        self.save({"redline_keywords": kws})
+        return kws
+
+    def reset_redline_keywords(self) -> list[str]:
+        self.save({"redline_keywords": list(REDLINE_KEYWORDS)})
+        return list(REDLINE_KEYWORDS)
+
+    def redline_keywords(self) -> tuple[str, ...]:
+        """当前生效的红线词表。空元组代表用户已清空（不做拦截）。
+
+        配置缺键/类型不对时退回出厂词表——宁可多拦，也不因配置损坏全线放行。
+        结果按元组缓存，`load()`/`_persist()` 会清空缓存，改配置即时生效。
+        """
+        cached = self._redline_cache
+        if cached is not None:
+            return cached
+        raw = self._cfg.get("redline_keywords")
+        if not isinstance(raw, (list, tuple)):
+            kws: tuple[str, ...] = tuple(REDLINE_KEYWORDS)
+        else:
+            kws = tuple(str(k).strip() for k in raw if str(k).strip())
+        self._redline_cache = kws
+        return kws
 
     def is_junk(self, title: str, remarks: str = "") -> bool:
         if not self._cfg.get("filter_junk", True):

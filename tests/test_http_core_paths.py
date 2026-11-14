@@ -426,7 +426,9 @@ class HttpCorePathsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("application/vnd.apple.mpegurl",
                       r.headers.get("content-type", ""))
         self.assertIn("#EXTM3U", r.text)
-        self.assertIn("main.m3u8?index=0&line=A", r.text)
+        # 2026-11-14 A2：普通起播不再 pin line，首个变体带 auto=1 由 main 竞速选最快；
+        # 带 line 会让 preset 只输出一条线，播放器就没有「线路」菜单可换源了。
+        self.assertIn("main.m3u8?index=0&auto=1", r.text)
 
     async def test_main_m3u8_proxies_remote_playlist_rewritten(self):
         _og, mg, _link = await self._cms_preset_link()

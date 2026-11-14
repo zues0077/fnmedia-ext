@@ -1,12 +1,12 @@
-"""TVBox 式二级线路海报墙与线路种子播放（移植上游 v1.0.0）。
+"""TVBox 式二级线路海报墙与线路卡固定播放（移植上游 v1.0.0）。
 
-fork 适配（冻结约束）：上游的 _fixed_media_target / _fixed_line=True
-（play_link 去 auto=1、跳过竞速）与冻结的竞速 first-success-wins /
-吞吐打分 / 最快线记忆冲突，不搬。fork 用 _seeded_media_target /
-_line_seed：线路身份只定“播哪条线的第几集”（选集不串线），起播仍带
-auto=1 走竞速，种子只在竞速候选排序里作最后一级 tiebreak。
-本文件原样搬上游 tests/test_vod_line_folders.py 的覆盖点，凡断言
-“固定线、无 auto”的地方一律改写为种子 + auto=1 的断言。
+2026-11-14 A2「手动换源」改造后的语义：
+- 线路卡 = 用户手动点选的源 → play_link 带 `line` + `pin=1`，起播**固定**该线，
+  不竞速、失败不自动换源（`_ensure_playable(strict=True)`）。
+- 自动起播（点卡片直接播）= preset 不带 line，枚举全部线路，首变体 `auto=1`
+  走后端竞速，默认播最快的源；用户在播放器「线路」菜单手动切到某条时才 pin。
+本文件原样搬上游 tests/test_vod_line_folders.py 的覆盖点，其中
+“固定线”相关断言按上面语义改写（上游用 _fixed_line 标记，fork 用 pin 查询参数）。
 """
 from __future__ import annotations
 
@@ -175,7 +175,8 @@ class VodLineFolderTests(unittest.IsolatedAsyncioTestCase):
             appmod._parse_line_item_guid(data["list"][0]["guid"])[1], "dytt::dyttm3u8")
 
     def test_seeded_media_target_uses_exact_line_without_pinning(self):
-        # 冻结适配：种子只定选集身份（_line_seed），绝不产生 _fixed_line 固定标记。
+        # 线路卡只标记 _line_seed（用于识别线路卡），固定语义由 play_link 的
+        # pin=1 查询参数表达，不引入上游的 _fixed_line 标志。
         b = brief()
         with patch.object(appmod.store, "get_title_by_guid", return_value=b), \
                 patch.object(appmod.store, "resolve_episode", return_value=target()):
@@ -313,9 +314,9 @@ class VodLineFolderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["files"][0]["can_play"], 1)
         self.assertEqual(data["video_streams"][0]["media_guid"], "media1")
 
-    async def test_play_play_seeded_line_keeps_auto_race_and_seed(self):
-        # 冻结改写：上游原测试断言固定线 play_link“无 auto=1”；冻结要求相反——
-        # 种子起播必须带 auto=1 走竞速，种子经 seed_line 传递，不 pin line。
+    async def test_play_play_seeded_line_pins_that_line(self):
+        # 2026-11-14 A2：线路卡＝用户手动点选，play_link 必须**固定**该线路——
+        # 带 line 且带 pin=1，不带 auto=1（auto 只属于自动起播）。
         b = brief()
         guid = appmod._line_item_guid("og", "baofeng::bfzym3u8", 0)
         async def receive():
@@ -332,9 +333,9 @@ class VodLineFolderTests(unittest.IsolatedAsyncioTestCase):
             response = await appmod.play_play(request)
         data = json.loads(response.body)["data"]
         qs = urllib.parse.parse_qs(urllib.parse.urlsplit(data["play_link"]).query)
-        self.assertEqual(qs.get("auto"), ["1"])
-        self.assertEqual(qs.get("seed_line"), ["baofeng::bfzym3u8"])
-        self.assertNotIn("line", qs)
+        self.assertEqual(qs.get("line"), ["baofeng::bfzym3u8"])
+        self.assertEqual(qs.get("pin"), ["1"])
+        self.assertNotIn("auto", qs)
 
 
 if __name__ == "__main__":

@@ -960,6 +960,24 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
       </div>
 
       <div class="card">
+        <div class="card-title">内容安全 · 红线关键词</div>
+        <p class="card-sub">标题、备注或分类名命中即整条丢弃：不进聚合库、不进独立库、搜索结果不出现。出厂词表只用于初始化与配置损坏时兜底——删掉即永久不再拦截，可随时「恢复默认」找回。</p>
+        <label class="field"><span>红线关键词 <span id="rkN" class="muted"></span>
+          <span style="float:right">
+            <button class="small" type="button" onclick="resetRk()">恢复默认</button>
+            <button class="small" type="button" onclick="toggleRkEdit()">批量编辑</button>
+          </span></span>
+          <div id="rkChips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px"></div>
+          <div id="rkEdit" style="display:none;margin-bottom:8px">
+            <textarea id="rkArea" rows="4" placeholder="每行一个，或逗号/顿号分隔"></textarea>
+            <button class="small" type="button" onclick="applyRkText()" style="margin-top:6px">应用文本</button>
+          </div>
+          <div class="row"><input type="text" id="rkAdd" placeholder="添加关键词后回车" style="flex:1"/>
+            <button class="small" type="button" onclick="addRk()">添加</button></div>
+        </label>
+      </div>
+
+      <div class="card">
         <div class="card-title">播放线路</div>
         <label class="switch-row"><input type="checkbox" id="lineFastest"/>
           <span>自动选最快线路<span class="sub">起播时并行测速、自动选首字节最快的线路；同一集短时间内固定用它</span></span></label>
@@ -1104,7 +1122,7 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
 <script>
 const $=(id)=>document.getElementById(id);
 const $$=(sel)=>Array.from(document.querySelectorAll(sel));
-let CFG=null,KWS=[],STATUS=null,PRIO={};
+let CFG=null,KWS=[],RK=[],STATUS=null,PRIO={};
 // >>> PRIVATE:FEATURE_FLAGS
 const FEAT_DDUO=true,FEAT_ADULT=true;
 // <<< PRIVATE:FEATURE_FLAGS
@@ -3677,6 +3695,34 @@ async function resetKw(){
   if(r.code===0){KWS=r.data.junk_keywords;CFG.junk_keywords=KWS.slice();renderKw();$("kwEdit").style.display="none";toast("已恢复默认");}
   else toast("失败","fail");
 }
+/* ---------- 内容安全：红线关键词（命中即整条丢弃，独立于噪音词） ---------- */
+function renderRk(){
+  $("rkN").textContent="（共 "+RK.length+" 个）";
+  $("rkChips").innerHTML=RK.map((k,i)=>`<span class="chip">${esc(k)}<b data-i="${i}" title="删除">×</b></span>`).join("");
+  $("rkChips").querySelectorAll("b").forEach(b=>b.onclick=()=>{RK.splice(+b.dataset.i,1);saveRk();});
+}
+async function saveRk(){
+  const r=await jpost("/v/api/ext/redline-keywords",{keywords:RK});
+  if(r.code===0){RK=r.data.redline_keywords;CFG.redline_keywords=RK.slice();renderRk();toast("红线词已保存");}
+  else toast(r.msg||"保存失败","fail");
+}
+async function addRk(){
+  const v=$("rkAdd").value.trim();if(!v)return;
+  v.split(/[,，、\s]+/).filter(Boolean).forEach(k=>{if(!RK.includes(k))RK.push(k);});
+  $("rkAdd").value="";await saveRk();
+}
+function toggleRkEdit(){const box=$("rkEdit");const show=box.style.display==="none";
+  box.style.display=show?"block":"none";if(show)$("rkArea").value=RK.join("\n");}
+async function applyRkText(){
+  RK=$("rkArea").value.split(/[,，、\n\r;；\s]+/).map(s=>s.trim()).filter(Boolean).filter((k,i,a)=>a.indexOf(k)===i);
+  $("rkEdit").style.display="none";await saveRk();
+}
+async function resetRk(){
+  if(!confirm("恢复为出厂红线词表？当前自定义词会被一并清空。"))return;
+  const r=await jpost("/v/api/ext/redline-keywords",{reset:true});
+  if(r.code===0){RK=r.data.redline_keywords;CFG.redline_keywords=RK.slice();renderRk();$("rkEdit").style.display="none";toast("已恢复默认");}
+  else toast("失败","fail");
+}
 async function saveCfg(){
   const body={max_per_keyword:parseInt($("maxn").value)||12,filter_junk:$("junk").checked,online_first:$("onlineFirst").checked};
   const r=await jpost("/v/api/ext/config",body);
@@ -4037,6 +4083,7 @@ async function init(){
   }
   if(lastErr)throw lastErr;
   KWS=Array.isArray(CFG.junk_keywords)?CFG.junk_keywords.slice():[];
+  RK=Array.isArray(CFG.redline_keywords)?CFG.redline_keywords.slice():[];
   $("maxn").value=CFG.max_per_keyword;
   $("junk").checked=CFG.filter_junk;
   $("onlineFirst").checked=CFG.online_first!==false;
@@ -4047,7 +4094,7 @@ async function init(){
   $("linePredict").checked=CFG.linepredict_enabled!==false;
   $("linePredictMax").value=CFG.linepredict_max_lines||3;
   $("linePredictTtl").value=CFG.linepredict_ttl_min||30;
-  renderKw();renderSources();loadProxy();loadCacheStatus();
+  renderKw();renderRk();renderSources();loadProxy();loadCacheStatus();
   const gs=$("globalState");gs.textContent="接管运行中 · 已缓存 "+STATUS.cached_titles;gs.className="dot ok";
   const ed=$("aboutEdition");if(ed)ed.textContent=(FEAT_DDUO?"完整版（本地全功能）":"公开版")+" · 在飞牛原生搜索与媒体库中注入在线影视";
   loadOnline();

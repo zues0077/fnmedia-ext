@@ -3149,7 +3149,6 @@ def _merge_online_titles(titles: list, ranked: list[dict], keyword: str,
     # 每标题每线路的可播集数只算一遍（按线路分组的 {线路名: [可播集]}），
     # 归并循环直接复用，不再对每条线路重算一次。
     cand: list = []
-    year_votes: dict[str, dict[str, int]] = {}
     for t in titles:
         try:
             if catalogmod.is_redline(t.title, t.remarks):
@@ -3165,20 +3164,61 @@ def _merge_online_titles(titles: list, ranked: list[dict], keyword: str,
                 playable_by_line[lname] = play
         if not playable_by_line:
             continue
-        nt = _norm_title(t.title)
+        # 合并键 = (基础片名, 季号)：剥掉「第46集/全40集/完结/粤语/4K」等备注，
+        # 让同一部剧在不同源的写法能并成一条（各源成为可切换线路）。
+        nt = _merge_key(t.title)
         cand.append((t, nt, playable_by_line))
-        if t.year:
-            year_votes.setdefault(nt, {})
-            year_votes[nt][t.year] = year_votes[nt].get(t.year, 0) + 1
 
-    def _group_key_for(ntitle: str, year: str) -> tuple:
-        if year:
-            return (ntitle, year)
-        votes = year_votes.get(ntitle)
-        if votes:
-            best_year = max(votes, key=votes.get)
-            return (ntitle, best_year)
-        return (ntitle, year)
+    # 前缀别名归一：同季下「甄嬛传」被「后宫甄嬛传」包含（字数差 ≤4）就算同一部，
+    # 归到更长的那个名字上。带「之」的衍生剧（庆余年之少年风流）不参与，
+    # 否则「庆余年」会把所有衍生剧吞成一部。
+    by_season: dict[int | None, set[str]] = {}
+    for _t, (base, season), _p in cand:
+        by_season.setdefault(season, set()).add(base)
+    canonical: dict[tuple[str, int | None], tuple[str, int | None]] = {}
+    # 多出来的那部分含这些词＝衍生/特辑，属另一部作品，不能被前缀别名吞掉
+    deriv_marks = ("之", "特别篇", "特别版", "特辑", "番外", "前传", "外传",
+                   "续集", "大结局", "剧场版", "篇外")
+    for season, bases in by_season.items():
+        ordered = sorted(bases, key=len, reverse=True)
+        for b in bases:
+            target = b
+            for longer in ordered:
+                if longer == b or len(longer) - len(b) > 4:
+                    continue
+                if b not in longer:
+                    continue
+                extra = longer.replace(b, "", 1)
+                if any(m in extra for m in deriv_marks):
+                    continue
+                target = longer
+                break
+            canonical[(b, season)] = (target, season)
+
+    # 年份跨度：同片名+季号下「最晚-最早 > 10 年」才认为真有不同版本（重拍片）。
+    # 阈值 10 年由用户 2026-11-14 拍板：5 年内的差异（2019 vs 2024）属源站写混，
+    # 一律合并；像「射雕英雄传」1983 / 2017 这种差 30+ 年的必须拆开。
+    years: dict[tuple, set[int]] = {}
+    for _t, _nt, _p in cand:
+        _ck = canonical.get(_nt, _nt)
+        _y = str(getattr(_t, "year", "") or "")
+        if _y.isdigit():
+            years.setdefault(_ck, set()).add(int(_y))
+
+    def _group_key_for(ntitle: tuple, year: str = "") -> tuple:
+        """分组键 = (基础片名, 季号)；只有年份跨度 >10 年时才把年份并进键。
+
+        剥掉的备注见 `_merge_key`。季号始终参与，所以第一季/第二季不会混。
+        """
+        ck = canonical.get(ntitle, ntitle)
+        ys = years.get(ck) or set()
+        if len(ys) < 2 or (max(ys) - min(ys)) <= 10:
+            return ck
+        y = str(year or "")
+        if y.isdigit():
+            return (ck, int(y))
+        # 缺年份（采集源常见）并入最早的那一版
+        return (ck, min(ys))
 
     for t, nt, playable_by_line in cand:
         key = _group_key_for(nt, t.year)
@@ -3335,13 +3375,98 @@ def _search_card(brief: dict) -> dict:
 
 
 def _norm_title(t: str) -> str:
-    """跨源同名归并的片名规范化：去空白/标点/常见后缀，便于把不同站的同一部片聚到一起。"""
+    """跨源同名归并的片名规范化：去空白/标点/常见后缀，便于把不同站的同一部片聚到一起。
+
+    注意：榜单「按片名搜源」也用它（见 resolve_chart），语义必须保持稳定；
+    搜索聚合的合并请用 `_merge_key`（会额外剥掉季/集/语言/清晰度备注）。
+    """
     t = (t or "").strip().lower()
     # 去掉空格与常见分隔标点
     t = re.sub(r"[\s·・:：,，.。!！?？'’\"\-—_()（）\[\]【】]+", "", t)
     # 去掉年份尾缀（年份单独作为合并键）
     t = re.sub(r"(19|20)\d{2}$", "", t)
     return t
+
+
+# ---- 搜索合并键：源站习惯把季/集/语言/清晰度写进片名 ----
+# 不剥掉这些备注，同一部剧就会被拆成多条搜索结果（2026-11-14 实测：
+# 「庆余年 第一季 ·第46集」与「庆余年 第一季」算成两条，各占一张卡）。
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_BRACKET_RE = re.compile(r"[【\[（(]([^】\]）)]*)[】\]）)]")
+_EP_TAIL_RE = re.compile(
+    r"(第\s*\d+\s*[-~至]\s*\d+\s*集|第\s*\d+\s*集|全\s*\d+\s*集"
+    r"|更新至?\s*\d+\s*集?|\d+\s*集全|已?完结)")
+_LANG_RE = re.compile(r"(国语|粤语|普通话|中文字幕|中字|双语|原声|台配|日语|韩语)")
+_QUAL_RE = re.compile(r"(4k|8k|2160p?|1080p?|720p?|hdr|hd|高清|超清|蓝光|原画)")
+_SEASON_CN_RE = re.compile(r"第\s*([0-9零一二三四五六七八九十]+)\s*季")
+_SEASON_S_RE = re.compile(r"[sS]\s*(\d{1,2})(?![\dpP])")
+# 「特别篇 / 特别版 / 特辑」是同一部特辑的不同写法，统一成一个词才能合并。
+_SPECIAL_RE = re.compile(r"(特别篇|特别版|特别辑|特辑|sp特别篇)")
+# 括号里的备注（【直连】[国语]（全40集））才整段丢掉；括号里若是季号
+# 之类有效信息（庆余年（第二季））必须保留内容，否则会把两季并成一条。
+def _strip_note_brackets(s: str) -> str:
+    """按内容决定括号去留：只有季号/年份（有效信息）才保留文字，其余整段丢掉。
+
+    实测坑（2026-11-14）：
+    - 全丢 → 「庆余年（第二季）」退化成无季，会和「庆余年」混并；
+    - 全留 → 「…（庆余年之大凉太子爷）」把别名当片名，与不带别名的同一条
+      结果反而合不到一起（同一部剧两条卡）。
+    所以只保留能提供季/年信息的括号内容。
+    """
+
+    def repl(m: re.Match) -> str:
+        inner = (m.group(1) or "").strip()
+        if not inner:
+            return ""
+        if (_SEASON_CN_RE.search(inner) or _SEASON_S_RE.search(inner)
+                or re.search(r"(19|20)\d{2}", inner)):
+            return inner
+        return ""
+
+    return _BRACKET_RE.sub(repl, s)
+
+
+def _merge_key(title: str) -> tuple[str, int | None]:
+    """搜索合并键：(基础片名, 季号)。只用于跨源同名归并，不影响榜单匹配。
+
+    与 `_norm_title` 的差别：把源站塞进片名的「第N集 / 全N集 / 完结 / 国语 /
+    粤语 / 4K / HDR /【直连】」等备注剥掉，并把季号统一成 int
+    （第二季 = 第2季 = S2 = 庆余年2）。
+
+    取舍（用户 2026-11-14 定）：
+    - 季号参与合并 → 第一季与第二季永不并成一条（内容不同）；
+    - 语言版（粤语/国语…）并入同一部，作为该剧的另一条可播线路；
+    - 无季标注就是 None，不猜成第一季，避免两季被混成一条。
+    """
+    s = (title or "").strip()
+    if not s:
+        return ("", None)
+    s = _strip_note_brackets(s)          # 【直连】[国语]（全40集）去掉；（第二季）留字
+    s = s.lower()
+    s = _QUAL_RE.sub("", s)             # 4K/HDR/蓝光/高清…
+    s = _LANG_RE.sub("", s)             # 国语/粤语/中字…
+    s = _EP_TAIL_RE.sub("", s)          # 第46集 / 全40集 / 更新至24集 / 完结
+    s = _SPECIAL_RE.sub("特别篇", s)     # 特别版/特辑 → 特别篇（同一部特辑）
+    s = re.sub(r"[\s·・:：,，.。!！?？'’\"\-—_]+", "", s)
+    s = re.sub(r"(19|20)\d{2}$", "", s)  # 尾部年份单独进合并键
+    season: int | None = None
+    m = _SEASON_CN_RE.search(s)          # 第N季 / 第N季（中文数字）
+    if m:
+        tok = m.group(1)
+        season = int(tok) if tok.isdigit() else _CN_DIGITS.get(tok)
+        s = s[:m.start()] + s[m.end():]
+    else:
+        m = _SEASON_S_RE.search(s)       # S2 / s02
+        if m:
+            season = int(m.group(1))
+            s = s[:m.start()] + s[m.end():]
+        else:
+            m = re.search(r"(\d{1,2})$", s)   # 庆余年2 / 叶问4
+            if m:
+                season = int(m.group(1))
+                s = s[:m.start()]
+    return (s, season)
 
 
 _CJK_RE = re.compile(r"[一-鿿]")
@@ -5024,10 +5149,9 @@ async def _xlib_play_info(guid: str) -> dict | None:
 
 # ------------------------------------------------- 二级线路海报墙（移植上游 v1.0.0）
 # 上游：proxy/app.py _line_folder_guid / _vod_line_card / _vod_line_detail /
-# _vod_line_folder（v1.0.0）。fork 适配点（冻结约束，见 _seeded_media_target）：
-# 线路身份只作“选集不串线 + 竞速优先种子”，绝不固定单线、绝不跳过竞速。
-# 上游的 _fixed_line=True（play_link 去 auto=1、_pick_episode 优先直出）与
-# 冻结的竞速/first-success-wins/吞吐打分/最快线记忆冲突，本移植不搬那一部分。
+# _vod_line_folder（v1.0.0）。fork 适配点：线路卡是用户手动点选，必须**固定**
+# 该线路（pin=1，不竞速、失败不自动换源）；自动起播（点卡片直接播）另走不带
+# line 的 preset，由后端竞速选最快线。两套语义互不干扰。
 _LINE_FOLDER_PREFIX = "fnmedia-line-folder:"
 _LINE_ITEM_PREFIX = "fnmedia-line-item:"
 _LINE_SEASON_PREFIX = "fnmedia-line-season:"
@@ -5169,14 +5293,12 @@ def _vod_line_card(brief: dict, line: str, index: int, parent: str) -> dict:
 
 
 def _seeded_media_target(mg: str, request: Request | None = None) -> dict | None:
-    """线路卡 guid -> 该线路的播放目标（选集身份），但只是竞速种子，不是固定线。
+    """线路卡 guid -> 该线路的播放目标（选集身份），并标记 _line_seed。
 
-    上游 v1.0.0 的 _fixed_media_target 在此返回 _fixed_line=True，调用方据此
-    去掉 auto=1、跳过竞速——与冻结的竞速/最快线记忆冲突，不搬。
-    这里只标记 _line_seed：调用方（play/play、media/range、stream）仍按
-    auto=1 起播走竞速，种子只决定“播哪条线的第几集”、并在竞速候选排序里
-    作最后一级 tiebreak；绝不改 _race_fastest / _race_candidates 的
-    吞吐打分与最快线记忆主导顺序。
+    语义（2026-11-14 A2 手动换源改造后）：线路卡是**用户手动点选**的源，
+    调用方据此在播放链接上带 pin=1，起播固定这条线、不竞速、失败不自动换源。
+    自动起播（点卡片直接播）走的是不带 line 的 preset，仍由后端竞速选最快线，
+    两条路径互不影响。_line_seed 只用来识别“这是线路卡”，不再参与竞速排序。
     """
     parsed = _parse_line_item_guid(mg)
     if not parsed:
@@ -7260,11 +7382,16 @@ async def media_range(mg: str, request: Request):
     # 同样【不在此同步解析】（会卡 App 起播、像点了没反应）：先瞬时 302 到对应代理，
     # 由 preset/main、direct 内部在播放加载阶段解析，并有双向 302 兜底。
     _wrapper, is_hls = _guess_wrapper(target)
-    # 线路卡：auto=1 + 种子，不 pin line，起播仍走竞速（冻结）。
     if target.get("_line_seed"):
-        q = urllib.parse.urlencode({"auto": "1", "seed_line": target["line"],
-                                    "index": target["index"]})
+        # 线路卡＝用户手动点选：pin 该线，起播不竞速、失败不偷偷换源
+        q = urllib.parse.urlencode({"line": target["line"],
+                                    "index": target["index"], "pin": "1"})
+    elif is_hls:
+        # 普通起播：不带 line，preset 才会枚举全部线路（播放器出「线路」菜单），
+        # 首个变体带 auto=1 走竞速 → 默认播最快的源
+        q = urllib.parse.urlencode({"index": target["index"]})
     else:
+        # 非 HLS 直链必须带 line（direct 要知道取哪条），保持常规故障切换
         q = urllib.parse.urlencode({"line": target["line"], "index": target["index"]})
     if is_hls:
         return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/preset.m3u8?{q}",
@@ -7366,11 +7493,14 @@ async def play_play(request: Request):
     # 卡在海报墙像“点了没反应”）。先瞬时返回播放地址让播放器立刻进入加载页转圈，
     # 真正的解析延迟到播放器内部取 main.m3u8 / direct 时再做（那里本就有加载指示）。
     wrapper, is_hls = _guess_wrapper(target)
-    # 线路卡起播：仍带 auto=1 走竞速；种子只经 seed_line 传递，不 pin line。
-    # （冻结：上游 _fixed_line 式“去 auto + 固定线”不搬；见 _seeded_media_target。）
+    # A2 手动换源：线路卡（用户点选）+ pin → 起播固定该线，不竞速、失败不换源；
+    # 普通起播不带 line → preset 枚举全部线路（播放器「线路」菜单），
+    # 首个变体 auto=1 走竞速，默认播最快的源。
     if base_target.get("_line_seed"):
-        q = urllib.parse.urlencode({"auto": "1", "seed_line": target["line"],
-                                    "index": target["index"]})
+        q = urllib.parse.urlencode({"line": target["line"],
+                                    "index": target["index"], "pin": "1"})
+    elif is_hls:
+        q = urllib.parse.urlencode({"index": target["index"]})
     else:
         q = urllib.parse.urlencode({"line": target["line"], "index": target["index"]})
     if is_hls:
@@ -7450,9 +7580,11 @@ async def direct_proxy(mg: str, request: Request):
     if _online_target_viewable(request, target, mg, _ctx=_viewer_ctx(request)) is False:
         return _denied_lib_response(status_code=403)
     # 线路健康探测 + 自动换线（直链/小雅等非 HLS 线路）
+    # pin=1：用户手动指定的线，严格模式——只探当前线，失败也不换源。
+    pinned = request.query_params.get("pin") == "1"
     request.state._play_mg = mg
     if _autofail_on():
-        target = await _ensure_playable(target, request)
+        target = await _ensure_playable(target, request, strict=pinned)
     else:
         await _resolve_if_needed(target, request)
     src_url = target["url"]
@@ -7463,7 +7595,9 @@ async def direct_proxy(mg: str, request: Request):
         # 兜底再验死活（小雅对不存在文件回 200+JSON 假活），坏则换线
         if not (await _probe_target(target, request)):
             _mark_line_bad(target)
-            alt = await _find_playable(target, request, skip_current=True)
+            # pin=1：用户手动指定的线，不换源
+            alt = None if pinned else await _find_playable(target, request,
+                                                           skip_current=True)
             if alt is not None:
                 target = alt
                 src_url = target["url"]
@@ -7498,7 +7632,12 @@ async def direct_proxy(mg: str, request: Request):
         req = ext_client(request).build_request("GET", src_url, headers=fwd)
         r = await ext_client(request).send(req, stream=True)
     except Exception as exc:
-        # 直链连接失败：记忆坏线并自动换线重试一次
+        # 直链连接失败：pin=1 时只报错不换源（用户手动指定的线由用户自己决定换不换）
+        if pinned:
+            _mark_line_bad(target)
+            return Response("该线路暂时不可用，请返回切换其他线路",
+                            status_code=502)
+        # 否则记忆坏线并自动换线重试一次
         if _autofail_on():
             _mark_line_bad(target)
             alt = await _find_playable(target, request, skip_current=True)
@@ -7528,6 +7667,12 @@ async def direct_proxy(mg: str, request: Request):
         else:
             return _direct_to_placeholder(mg, request)
     # 上游明确 4xx/5xx（文件被删/鉴权失败）：记忆坏线，换线重定向重试
+    # pin=1：用户手动指定的线，只报错不换源
+    if pinned and r.status_code >= 400:
+        await r.aclose()
+        _mark_line_bad(target)
+        return Response("该线路暂时不可用，请返回切换其他线路",
+                        status_code=502)
     if r.status_code >= 400 and _autofail_on():
         await r.aclose()
         _mark_line_bad(target)
@@ -9166,13 +9311,29 @@ async def _race_fastest(picked: dict, request: Request) -> dict | None:
 
 
 async def _ensure_playable(picked: dict, request: Request,
-                           auto: bool = False) -> dict:
+                           auto: bool = False,
+                           strict: bool = False) -> dict:
     """取流前确保目标可播。
 
     - auto=True（播放器自动起播，非用户手动切线）且开启最快线：并行竞速选最快线。
-    - 否则（用户手动选了某条线）：先探当前线，失败才记忆坏线并故障切换到首个可用线。
+    - strict=True（用户手动指定了这条线路）：只认这一条。不竞速、不故障切换到
+      别的源；探测失败就留在原目标上，由上层明确报错让用户自己换线。
+      语义来源：线路墙/播放器线路菜单的手动选择必须是承诺，不能被“自动换源”偷偷改掉。
+    - 否则（用户显式选了某条线但非严格场景，如 mp4 直链自动起播）：先探当前线，
+      失败才记忆坏线并故障切换到首个可用线。
     返回应播放的 picked（可能已换成另一线路）。"""
     if not picked or not picked.get("online_guid"):
+        return picked
+    if strict:
+        if not _autofail_on():
+            await _resolve_if_needed(picked, request)
+            return picked
+        if await _probe_target(picked, request):
+            return picked
+        # 只记坏线，不找替代：用户选的源就是它，换不换由用户决定
+        _mark_line_bad(picked)
+        _log.info("手动指定线路不可用（严格模式，不自动换源）: %s",
+                  picked.get("line"))
         return picked
     if auto and _autofail_on() and _fastest_on():
         winner = await _race_fastest(picked, request)
@@ -9748,15 +9909,22 @@ async def hls_preset(mg: str, request: Request):
 
     def variant_uri(t: dict, is_auto_first: bool = False) -> str:
         q = {"index": idx, "line": t["line"]}
-        # 仅播放器自动起播的首选变体带 auto=1（取 main 时触发竞速选最快线）；
-        # 用户手动切到的其它变体不带，严格尊重其选择
+        # 仅播放器自动起播的首选变体带 auto=1（取 main 时触发竞速选最快线），
+        # 且必须去掉 line——main 只有「auto=1 且无显式 line」才走竞速；
+        # 带上 line 会把竞速变成“固定这条线”，自动起播就再也选不到最快的源了。
+        # 用户手动切到的其它变体不带 auto（也不带 pin），但请求里带 line，
+        # main 据此判定为手动选线并严格固定，失败不自动换源。
         if is_auto_first:
             q["auto"] = "1"
+            q.pop("line")
             if seed_line:
-                # 种子首变体不 pin line：main 见到 auto=1 且无显式 line 才会
-                # 真正跑并行竞速（_race_fastest）；种子经 seed_line 参与候选排序。
-                q.pop("line")
+                # 种子只决定优先顺序，不 pin line
                 q["seed_line"] = seed_line
+        elif request.query_params.get("pin") == "1" or auto_mode:
+            # 菜单里的非首变体＝用户手动挑的线路：pin 让它固定下来，
+            # 失败只提示不自动换源。auto_mode=False（竞速关闭）时不加 pin，
+            # 保持原有故障切换行为。
+            q["pin"] = "1"
         return "main.m3u8?" + urllib.parse.urlencode(q)
 
     if len(hls_targets) == 1:
@@ -9767,8 +9935,15 @@ async def hls_preset(mg: str, request: Request):
     else:
         # 多线路：无 RESOLUTION 的变体，飞牛 HLS 播放器呈现为可切换「线路」
         out = ["#EXTM3U", "#EXT-X-VERSION:3"]
+        seen_name: dict[str, int] = {}
         for i, t in enumerate(hls_targets):
-            name = _line_display_name(t)
+            # 同一站点常有多条技术线路（dytt + dyttm3u8），清洗后同名会让人分不清，
+            # 第二条起追加序号「·2」，保证菜单里每项都能对应到具体一条线。
+            name = _line_display_name(t).replace('"', "'")
+            n = seen_name.get(name, 0) + 1
+            seen_name[name] = n
+            if n > 1:
+                name = f"{name} ·{n}"
             # NAME 供支持的播放器显示线路名；BANDWIDTH 差异化避免变体被合并
             out.append(f'#EXT-X-STREAM-INF:BANDWIDTH={1000000 + i * 100000},'
                        f'PROGRAM-ID=1,NAME="{name}"')
@@ -9783,31 +9958,99 @@ _PROVIDER_CN = {
     "youku": "优酷", "guangsu": "光速", "ruyi": "如意", "jisu": "极速",
     "xinlang": "新狼", "dytt": "电影天堂", "s360": "360",
 }
-_GROUP_CN = {"m3u8": "主线路", "yun": "云播", "ff": "非凡", "uk": "优酷",
-             "gs": "光速", "bf": "暴风", "lz": "量子"}
+# 技术组名 → 用户嘴里的站名（vod_play_from 的各种写法）。
+# 目的：源名和组名指同一个站时（非凡资源 + ff），菜单只显示一次「非凡」。
+_GROUP_ALIAS = {
+    "ff": "非凡", "feifan": "非凡", "ffm3u8": "非凡", "ffzy": "非凡",
+    "bf": "暴风", "bfzym3u8": "暴风", "bfzy": "暴风",
+    "dytt": "电影天堂", "dyttm3u8": "电影天堂",
+    "lz": "量子", "lzi": "量子", "lzm3u8": "量子", "lzzy": "量子",
+    "gs": "光速", "gsm3u8": "光速", "guangsu": "光速",
+    "wj": "无尽", "wjm3u8": "无尽", "wjzy": "无尽", "wujin": "无尽",
+    "sd": "闪电", "sdm3u8": "闪电", "shandian": "闪电",
+    "db": "豆瓣", "dbm3u8": "豆瓣", "douban": "豆瓣",
+    "mt": "茅台", "mtm3u8": "茅台", "maotai": "茅台",
+    "hy": "虎牙", "hym3u8": "虎牙", "huya": "虎牙",
+    "jisu": "极速", "js": "极速", "ruyi": "如意", "ry": "如意",
+    "hn": "红牛", "hnm3u8": "红牛", "hongniu": "红牛",
+    "xinlang": "新浪", "xl": "新浪", "youku": "优酷", "uk": "优酷",
+    "s360": "360", "360": "360", "baidu": "百度", "bd": "百度",
+}
+# 源名里的通用尾巴：去掉后才是用户平时叫的站名（「非凡资源站」→「非凡」）。
+_SRC_TAIL_WORDS = ("资源站", "资源网", "资源", "采集站", "采集",
+                   "影视站", "影视", "点播", "影院", "短剧", "直连")
+# emoji / 装饰符号（源名里大量存在：🎬 ❤ 🔞 🌻 🐂 🌪️ …）
+_DECOR_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u2B00-\u2BFF]")
+
+
+def _clean_source_label(name: str) -> str:
+    """源名清洗：去 emoji/装饰、去「| 采集」「资源站」这类尾巴，只留核心站名。"""
+    s = _DECOR_RE.sub("", name or "")
+    for ch in "|┃｜-—–·•/\\":
+        s = s.replace(ch, " ")
+    s = re.sub(r"[\[\]()（）{}<>《》【】]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    changed = True
+    while changed and s:
+        changed = False
+        for tail in _SRC_TAIL_WORDS:
+            if s.endswith(tail) and len(s) > len(tail):
+                s = s[: -len(tail)].strip()
+                changed = True
+                break
+    return s
+
+
+def _source_display_name(provider: str) -> str:
+    """源 id → 播放器里显示的站名。
+
+    优先级：用户在「资源站」里配的源名 → 内置中文名表 → 原 id。
+    源名清洗后为空（纯 emoji 之类）才退回下一级；成人源保留 🔞 前缀，
+    否则用户从名字上分不出哪条是福利库的源。
+    """
+    raw = ""
+    try:
+        s = next((x for x in config.all_sources() if x.get("id") == provider), None)
+        raw = str((s or {}).get("name") or "").strip()
+    except Exception:  # noqa: BLE001
+        raw = ""
+    adult = "🔞" in raw
+    label = _clean_source_label(raw) or _clean_source_label(
+        _PROVIDER_CN.get(provider, "")) or provider
+    if adult and "🔞" not in label:
+        label = f"🔞 {label}"
+    return label
 
 
 def _friendly_line(key: str) -> str:
-    """把 'provider::组名' 转成好认的线路名，如 baofeng::bfzym3u8 -> 暴风。"""
+    """把 'provider::组名' 转成好认的线路名：custom_067239607a::ff -> 非凡。
+
+    先按源 id 取用户配置的站名（见 _source_display_name），组名只在能提供
+    额外信息时才追加；源名与组名同义（非凡 + ff）时只显示一次。
+    """
     provider, _, group = key.partition("::")
-    pcn = _PROVIDER_CN.get(provider, provider)
+    base = _source_display_name(provider)
     if not group:
-        return pcn
-    if group in _GROUP_CN:
-        return f"{pcn}·{_GROUP_CN[group]}"
-    # guard-/spider-/drpy- 等技术源：组名常是中文（如 🐻剧圈┃多线），取 ┃| 前可读部分
-    if re.match(r"(guard|spider|drpy)-", provider, re.I):
-        nice = re.sub(r"[┃|].*$", "", group).strip()
-        nice = re.sub(r"^[\s\U0001F000-\U0001FAFF☀-➿]+", "", nice)
-        if nice and not re.fullmatch(r"[A-Za-z0-9_-]+", nice):
-            return nice
-    stem = group
-    for suf in ("zym3u8", "m3u8", "yun"):
-        if stem.endswith(suf):
-            stem = stem[:-len(suf)]
-            break
-    stem = stem.upper() if stem.isascii() and stem else ""
-    return f"{pcn}·{stem}" if stem else pcn
+        return base
+    # 无信息量的组名：默认包装（m3u8）与纯数字序号，直接从菜单名里去掉
+    if group in ("m3u8", "1") or group.isdigit():
+        return base
+    if group == "yun":
+        return f"{base}·云播"
+    glabel = _GROUP_ALIAS.get(group.lower())
+    if not glabel:
+        g = group
+        for suf in ("zym3u8", "m3u8", "yun"):
+            if g.endswith(suf):
+                g = g[: -len(suf)]
+                break
+        glabel = _GROUP_ALIAS.get(g.lower()) or (
+            g.upper() if g.isascii() and g else g)
+    # 组名无信息量，或与源名同义（非凡 + 非凡 / 极速 + JISU）→ 只留源名
+    gl, bl = glabel.lower(), base.lower()
+    if not glabel or gl in bl or bl in gl:
+        return base
+    return f"{base}·{glabel}"
 
 
 def _line_display_name(t: dict) -> str:
@@ -9923,6 +10166,11 @@ async def hls_main(mg: str, request: Request):
 
     explicit_line = request.query_params.get("line")
     auto_play = request.query_params.get("auto") == "1" and not explicit_line
+    # A2「手动换源才固定」：只认显式 pin=1。pin 只会由两条路径产生——
+    #   1) 用户从播放器「线路」菜单切到某条线（preset 给非首变体加的 pin）；
+    #   2) 用户在线路墙点选某条线路（play_link 自带 pin=1）。
+    # 自动起播（首变体 auto=1）与快速失败切换都不带 pin，因此自动路径完全不受影响。
+    manual_line = request.query_params.get("pin") == "1"
     request.state._play_mg = mg  # 供探测复用播放列表构建、填充缓存
     # 起播即跳过已知坏线（用户显式选线除外），避免无谓探测延迟
     # （与上游一致：dodge 在分发前，不在 _serve_normal 内。）
@@ -9934,7 +10182,8 @@ async def hls_main(mg: str, request: Request):
         # _cached_sibling_playlist 是已冻结、明确不接线的功能，本次不搬。
         # 线路健康探测 + 自动选最快线
         if _autofail_on():
-            picked = await _ensure_playable(picked, request, auto=auto_play)
+            picked = await _ensure_playable(picked, request, auto=auto_play,
+                                            strict=manual_line)
             # 若自动换到了别的线路，后续 _pick_episode 仍按 query 的旧线解析；用换好的目标
             request.state._failover_picked = picked
 
@@ -9959,6 +10208,11 @@ async def hls_main(mg: str, request: Request):
         # <<< PRIVATE:CATVOD
 
         body = await _get_playlist_cached(mg, picked, request)
+        if body is None and manual_line:
+            # 手动指定线路严格遵守：抓不到就报错让用户自己换，绝不偷偷换源
+            _mark_line_bad(picked)
+            return Response("该线路暂时不可用，请返回切换其他线路",
+                            status_code=502)
         if body is None:
             # 当前线抓取失败：记忆并自动换一条已探测可用的线路重试一次
             if _autofail_on():
@@ -10033,9 +10287,11 @@ async def hls_main(mg: str, request: Request):
     #  - 仅加固/爬虫/drpy/专有解码/小雅这类慢源：短预算到点先回占位、后台自愈，
     #    播放器周期重拉转正片。
     slow_source = _is_slow_line(picked)
-    if not slow_source:
+    if not slow_source or manual_line:
         # v0.2.42：普通 CMS 每次 main 独立执行。不要在外层再做单飞合并，
         # 否则前一次探测卡住时，后续重试全部挂在同一个 _serve_normal 上。
+        # 手动固定线路（pin=1）也不走慢源占位自愈：占位会在后台自己找别的源，
+        # 与「用户指定哪条就播哪条」冲突；宁可等结果或明确报错。
         return await _serve_normal(picked)
     # 仅慢源保留单飞与短预算自愈，避免后台重复启动昂贵转存/爬虫任务。
     bk = f"{mg}|{picked.get('line')}|{picked.get('index', 0)}"
@@ -11540,6 +11796,7 @@ async def ext_set_config(request: Request):
     body = await request.json()
     allowed = {
         "max_per_keyword", "filter_junk", "junk_keywords", "online_first",
+        "redline_keywords",
         "hot_library_enabled", "hot_library_title", "hot_limit",
         "hot_per_source", "hot_pages_per_source", "hot_refresh_interval",
         "catalog_library_enabled",
@@ -11591,6 +11848,10 @@ async def ext_set_config(request: Request):
     if "pan_cache_cleanup_enabled" in patch:
         patch["pan_cache_cleanup_enabled"] = bool(
             patch["pan_cache_cleanup_enabled"])
+    if "redline_keywords" in patch:
+        # 与专用接口同口径：去重、去空、限长，避免经通用接口写入脏词表
+        patch["redline_keywords"] = config.normalize_keywords(
+            patch["redline_keywords"])
     sources_changed = False
     if "sources" in body and isinstance(body["sources"], list):
         cur = {s["id"]: s for s in config.all_sources()}
@@ -11667,6 +11928,21 @@ async def ext_junk_keywords(request: Request):
         kws = config.set_junk_keywords(body.get("keywords", []))
     _search_cache.clear(); _AGG_CACHE.clear()
     return {"code": 0, "msg": "saved", "data": {"junk_keywords": kws}}
+
+
+@app.post("/v/api/ext/redline-keywords")
+async def ext_redline_keywords(request: Request):
+    """内容红线词表：保存的是完整词表（含出厂词），可增删改，空表即不拦截。
+
+    命中即整条丢弃（不进聚合库/独立库/搜索），所以改完要清搜索与聚合缓存。
+    """
+    body = await request.json()
+    if body.get("reset"):
+        kws = config.reset_redline_keywords()
+    else:
+        kws = config.set_redline_keywords(body.get("keywords", []))
+    _search_cache.clear(); _AGG_CACHE.clear()
+    return {"code": 0, "msg": "saved", "data": {"redline_keywords": kws}}
 
 
 @app.get("/v/api/ext/mirror-pool")

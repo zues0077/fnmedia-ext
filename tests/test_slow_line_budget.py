@@ -46,7 +46,7 @@ FAST_PICKED = {"online_guid": "og-fast", "line": "cms::A", "index": 0,
                "url": "https://fast.test/m.m3u8"}
 
 
-async def _identity_playable(picked, request, auto=False):
+async def _identity_playable(picked, request, auto=False, strict=False):
     return picked
 
 

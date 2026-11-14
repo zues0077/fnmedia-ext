@@ -160,6 +160,19 @@ _OVERSEAS_KW = ("海外剧", "美剧", "英剧", "韩剧", "日剧", "泰剧",
                 # 结果「香港剧/韩国剧」这类正常分类被当垃圾丢掉（见 2026-11-12 实测）。
                 "香港剧", "台湾剧", "韩国剧", "日本剧", "泰国剧",
                 "新加坡剧", "马来剧", "印度剧", "土耳其剧")
+# 硬红线兜底词表：涉未成年人性化、非自愿（换脸/迷奸/强奸/偷拍等）的内容。
+# 同时作用于「分类名」和条目标题/备注，命中即丢弃：聚合库、独立库、搜索一律不收录。
+#
+# 生效词表以配置 `redline_keywords` 为准（后台「搜索设置 → 内容安全」可增删改，
+# 保存的是完整词表，删掉即不再拦截——配置为空是合法状态）。下面这份只在
+# 配置读不到时兜底，避免因配置异常把过滤整个关掉。
+_REDLINE_KW = (
+    # 未成年人
+    "萝莉", "童贞",
+    # 非自愿 / 性暴力
+    "换脸"
+)
+
 # 成人向分类名：显式导向 ADULT 福利分类，绝不落入常规电影/剧集类。
 # 词表参照 LunaTV src/lib/yellow.ts，并按国内源站实际分类名补了「理论/三级/
 # 无码/有码/国产传媒/黑料吃瓜」等——这些名字不含「福利/伦理」二字，光靠
@@ -749,6 +762,36 @@ def rules_snapshot() -> dict:
         "conflicts": (Catalog.rules_conflicts()
                       if "Catalog" in globals() else []),
     }
+
+
+def redline_keywords() -> tuple[str, ...]:
+    """当前生效的红线词表（配置里的完整词表，后台可增删改）。
+
+    配置缺失/损坏时退回 `_REDLINE_KW`；配置为空列表是合法状态（用户清空），
+    此时不做拦截。惰性 import 避免与 config 模块形成循环依赖。
+    """
+    try:
+        import config as _config
+        return _config.config.redline_keywords()
+    except Exception:  # noqa: BLE001
+        return tuple(_REDLINE_KW)
+
+
+def is_redline(*texts: str) -> bool:
+    """命中硬红线（涉未成年人性化、非自愿）即 True，调用方须整条丢弃。
+
+    词表见 `redline_keywords()`：默认取配置，配置异常时用 `_REDLINE_KW` 兜底。
+    """
+    kws = redline_keywords()
+    if not kws:
+        return False
+    for t in texts:
+        if not t:
+            continue
+        for k in kws:
+            if k and k in t:
+                return True
+    return False
 
 
 

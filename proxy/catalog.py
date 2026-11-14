@@ -161,7 +161,6 @@ _OVERSEAS_KW = ("海外剧", "美剧", "英剧", "韩剧", "日剧", "泰剧",
                 "香港剧", "台湾剧", "韩国剧", "日本剧", "泰国剧",
                 "新加坡剧", "马来剧", "印度剧", "土耳其剧")
 # 成人向分类名：显式导向 ADULT 福利分类，绝不落入常规电影/剧集类。
-# 硬红线（_REDLINE_KW）在 is_redline 中先于本表拦截，任何开关都不放行。
 # 词表参照 LunaTV src/lib/yellow.ts，并按国内源站实际分类名补了「理论/三级/
 # 无码/有码/国产传媒/黑料吃瓜」等——这些名字不含「福利/伦理」二字，光靠
 # 原表认不出来，只能靠源级 18 标记兜底（见 classify_source_class）。
@@ -751,15 +750,6 @@ def rules_snapshot() -> dict:
                       if "Catalog" in globals() else []),
     }
 
-
-def is_redline(*texts: str) -> bool:
-    for t in texts:
-        if not t:
-            continue
-        for k in _REDLINE_KW:
-            if k and k in t:
-                return True
-    return False
 
 
 # 源名专用成人特征词（比分类词表更严：打错 18 会让该源从全局搜索里消失，

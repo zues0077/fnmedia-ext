@@ -91,6 +91,7 @@ def test_norm_title_kept_for_chart_matching():
 # ---------- 分组层：年份噪声不能把同一部剧拆开 ----------
 
 import types
+from unittest.mock import patch
 
 import providers
 
@@ -163,3 +164,43 @@ def test_seasons_and_specials_stay_separate():
         _mk("庆余年第一季特别篇", "2019", "s3"),
     ])
     assert len(out) == 3, [g["title"] for g in out]
+
+
+# ---------- 备注词「正片」与线路名组别名 ----------
+
+def test_zhengpian_suffix_merges():
+    """「给阿嬷的情书-正片」与「给阿嬷的情书」必须算同一条（2026-11-14 实测）。"""
+    base = appmod._merge_key("给阿嬷的情书")
+    for raw in ("给阿嬷的情书-正片", "给阿嬷的情书 正片",
+                "给阿嬷的情书 完整版", "给阿嬷的情书 未删减"):
+        assert appmod._merge_key(raw) == base, raw
+
+
+def test_group_alias_and_single_letter_noise():
+    """技术组名要映射成站名；单字母组名（p/v）不追加到菜单名。"""
+    src = [{"id": "lzi", "name": "量子资源"},
+           {"id": "custom_e0dc17c012", "name": "红牛资源站"}]
+    with patch.object(appmod.config, "all_sources", return_value=src):
+        assert appmod._friendly_line("lzi::liangzi") == "量子"
+        assert appmod._friendly_line("lzi::lzm3u8") == "量子"
+        assert appmod._friendly_line("lzi::p") == "量子"
+        assert appmod._friendly_line("custom_e0dc17c012::hnyun") == "红牛"
+
+
+def test_quality_menu_labels_use_source_names():
+    """播放器「视频质量」菜单读 qualities[].resolution＝_line_choices 的 label；
+    必须显示站名，不能是 custom_xxx 内部 id（2026-11-14 用户实机发现）。"""
+    src = [{"id": "custom_a17abce3cd", "name": "🎬电影天堂"},
+           {"id": "custom_e0dc17c012", "name": "红牛资源站"}]
+    lines = [{"line": "custom_a17abce3cd::dytt", "index": 0,
+              "url": "https://x/a.m3u8", "m3u8": True},
+             {"line": "custom_e0dc17c012::hnyun", "index": 0,
+              "url": "https://x/b.m3u8", "m3u8": True}]
+    tgt = {"line": "custom_a17abce3cd::dytt", "index": 0,
+           "online_guid": "og", "url": "https://x/a.m3u8"}
+    with patch.object(appmod.config, "all_sources", return_value=src), \
+            patch.object(appmod.store, "target_lines", return_value=lines):
+        labels = [c["label"] for c in appmod._line_choices(tgt)]
+        quals = [q["resolution"] for q in appmod._qualities(tgt)]
+    assert labels == ["电影天堂", "红牛"], labels
+    assert quals == ["电影天堂", "红牛"], quals

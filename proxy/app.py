@@ -38,6 +38,10 @@ try:
     BUILD_LABEL = getattr(_build_info, "BUILD_LABEL", "dev")
 except Exception:  # noqa: BLE001
     BUILD_LABEL = "dev"
+# 播放链接的缓存破坏戳：飞牛播放器会把 master.m3u8 按 URL 缓存在客户端，
+# 客户端升级/改名后仍可能拿到旧 master（实测菜单里还是上一版的线路名）。
+# 把构建戳放进 URL，URL 一变客户端就必须重新取。
+BUILD_TAG = hashlib.md5(BUILD_LABEL.encode()).hexdigest()[:8]
 import providers
 import netutil
 import sourcehealth
@@ -3169,31 +3173,39 @@ def _merge_online_titles(titles: list, ranked: list[dict], keyword: str,
         nt = _merge_key(t.title)
         cand.append((t, nt, playable_by_line))
 
-    # 前缀别名归一：同季下「甄嬛传」被「后宫甄嬛传」包含（字数差 ≤4）就算同一部，
-    # 归到更长的那个名字上。带「之」的衍生剧（庆余年之少年风流）不参与，
-    # 否则「庆余年」会把所有衍生剧吞成一部。
+    # 前缀别名 + 近似片名归一（同季内）：包含关系（甄嬛传/后宫甄嬛传）与
+    # 2-gram 高度相似（复制粘贴少一个字之类）算同一部，用并查集归到更长的名字。
+    # 带「之/特别篇/番外…」的衍生剧不参与，否则「庆余年」会把衍生剧全吞掉。
     by_season: dict[int | None, set[str]] = {}
     for _t, (base, season), _p in cand:
         by_season.setdefault(season, set()).add(base)
     canonical: dict[tuple[str, int | None], tuple[str, int | None]] = {}
-    # 多出来的那部分含这些词＝衍生/特辑，属另一部作品，不能被前缀别名吞掉
-    deriv_marks = ("之", "特别篇", "特别版", "特辑", "番外", "前传", "外传",
-                   "续集", "大结局", "剧场版", "篇外")
     for season, bases in by_season.items():
-        ordered = sorted(bases, key=len, reverse=True)
-        for b in bases:
-            target = b
-            for longer in ordered:
-                if longer == b or len(longer) - len(b) > 4:
-                    continue
-                if b not in longer:
-                    continue
-                extra = longer.replace(b, "", 1)
-                if any(m in extra for m in deriv_marks):
-                    continue
-                target = longer
-                break
-            canonical[(b, season)] = (target, season)
+        names = sorted(bases)
+        parent = {b: b for b in names}
+
+        def _find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(a: str, b: str) -> None:
+            ra, rb = _find(a), _find(b)
+            if ra == rb:
+                return
+            # 代表取更长的名字（信息更多）
+            if len(ra) >= len(rb):
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                if _near_same_title(a, b):
+                    _union(a, b)
+        for b in names:
+            canonical[(b, season)] = (_find(b), season)
 
     # 年份跨度：同片名+季号下「最晚-最早 > 10 年」才认为真有不同版本（重拍片）。
     # 阈值 10 年由用户 2026-11-14 拍板：5 年内的差异（2019 vs 2024）属源站写混，
@@ -3363,8 +3375,56 @@ async def online_search(keyword: str, client: httpx.AsyncClient,
         keyword, fast_only=fast_only, timeout=timeout,
         visible=visible, viewer_key=viewer_key,
         on_stage=_publish if partial is not None else None)
+    # 长词兜底：首轮条数太少时用派生短词再聚合一轮（并发，不叠加等待）
+    briefs = await _expand_briefs(
+        keyword, briefs, fast_only=fast_only, visible=visible,
+        viewer_key=viewer_key)
     return [_search_card(b) for b in libfiltermod.filter_briefs(
         briefs, ctx.can_open_key, gkey_of=ctx.gkey_of_source)]
+
+
+async def _expand_briefs(keyword: str, briefs: list[dict], *,
+                         fast_only: bool, visible=None,
+                         viewer_key: str = "") -> list[dict]:
+    """首轮结果太少（≤3 条）时，用派生短词再聚合一轮并合并线路。
+
+    为什么需要：搜索是把用户原话发给各资源站，子串匹配的站对「给阿嫲的
+    一封情书」返回空，只有分词匹配的站能中（实测同一部片 2 站 vs 5 站）。
+    两个派生词并发聚合、各自限时 4 秒，避免把首屏等待拉长；失败不影响主结果。
+    """
+    try:
+        # 只看「与本片名相关」的条数：一次搜索常带回十几条无关片（同字不同剧），
+        # 用总条数判断会误认为"结果够了"，扩写永远不触发（2026-11-14 实测）。
+        base_kw = _merge_key(keyword)[0]
+        relevant = sum(1 for b in briefs
+                       if _shares_bigram(_merge_key(b.get("title") or "")[0],
+                                         base_kw))
+        if relevant > 3:
+            return briefs
+        variants = _query_variants(keyword)
+        if not variants:
+            return briefs
+        results = await asyncio.gather(
+            *[_aggregate_briefs(v, fast_only=fast_only, timeout=4.0,
+                                visible=visible, viewer_key=viewer_key)
+              for v in variants],
+            return_exceptions=True)
+        for v, extra in zip(variants, results):
+            if isinstance(extra, Exception):
+                _log.debug("expand search %s failed: %s", v,
+                           type(extra).__name__)
+                continue
+            briefs = _merge_brief_lists(briefs, extra, keyword)
+        # 合并出来的线路必须写回 store：卡片/播放走的是 store 里的 brief，
+        # 只改内存返回体的话，点进去还是原来那两条线（2026-11-14 实测）。
+        try:
+            store.remember_merged(briefs)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("remember_merged failed: %s", type(exc).__name__)
+        return briefs
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("expand search failed: %s", type(exc).__name__)
+        return briefs
 
 
 def _search_card(brief: dict) -> dict:
@@ -3399,6 +3459,11 @@ _EP_TAIL_RE = re.compile(
     r"|更新至?\s*\d+\s*集?|\d+\s*集全|已?完结)")
 _LANG_RE = re.compile(r"(国语|粤语|普通话|中文字幕|中字|双语|原声|台配|日语|韩语)")
 _QUAL_RE = re.compile(r"(4k|8k|2160p?|1080p?|720p?|hdr|hd|高清|超清|蓝光|原画)")
+# 「正片 / 完整版 / 未删减」是源站写在片名尾巴上的备注，不是片名的一部分；
+# 不剥掉会让「给阿嬷的情书-正片」与「给阿嬷的情书」分成两条
+# （2026-11-14 实测：短词搜索返回带 -正片 的那条，长词搜索返回干净的那条）。
+_NOTE_TAIL_RE = re.compile(r"(正片|完整版|未删减|无删减|高清版)+$")
+
 _SEASON_CN_RE = re.compile(r"第\s*([0-9零一二三四五六七八九十]+)\s*季")
 _SEASON_S_RE = re.compile(r"[sS]\s*(\d{1,2})(?![\dpP])")
 # 「特别篇 / 特别版 / 特辑」是同一部特辑的不同写法，统一成一个词才能合并。
@@ -3427,6 +3492,48 @@ def _strip_note_brackets(s: str) -> str:
     return _BRACKET_RE.sub(repl, s)
 
 
+# 字形归一（异体字 + 高频繁简）：源站片名常与用户输入写法不同，
+# 「给阿嫲的一封情书」(嫲) 与库里的「给阿嬷的情书」(嬷) 是同一个人名，
+# 不归一就既搜不到也并不会。只收「一对一、无歧义」的字，宁缺勿滥。
+_VARIANT_MAP = str.maketrans({
+    # 异体/俗字
+    "嫲": "嬷", "裡": "里", "裏": "里", "臺": "台", "檯": "台", "傢": "家",
+    "喫": "吃", "妳": "你", "牠": "它", "週": "周", "麪": "面", "麵": "面",
+    "閒": "闲", "峯": "峰", "羣": "群", "牀": "床", "è": "e",
+    # 高频繁体（影视片名里常见）
+    "傳": "传", "劇": "剧", "戲": "戏", "愛": "爱", "龍": "龙", "馬": "马",
+    "車": "车", "門": "门", "東": "东", "風": "风", "雲": "云", "劍": "剑",
+    "俠": "侠", "戰": "战", "記": "记", "錄": "录", "遊": "游", "夢": "梦",
+    "緣": "缘", "國": "国", "語": "语", "說": "说", "話": "话", "時": "时",
+    "間": "间", "頭": "头", "張": "张", "劉": "刘", "陳": "陈", "楊": "杨",
+    "華": "华", "萬": "万", "與": "与", "為": "为", "會": "会", "來": "来",
+    "開": "开", "關": "关", "長": "长", "飛": "飞", "鳥": "鸟", "魚": "鱼",
+    "鳳": "凤", "靈": "灵", "術": "术", "師": "师", "將": "将", "軍": "军",
+    "電": "电", "視": "视", "聲": "声", "學": "学", "醫": "医", "樂": "乐",
+    "無": "无", "極": "极", "級": "级", "網": "网", "絡": "络", "線": "线",
+    "選": "选", "擇": "择", "讓": "让", "誰": "谁", "錯": "错", "鐵": "铁",
+    "鋼": "钢", "銀": "银", "鐘": "钟", "陽": "阳", "陰": "阴", "隊": "队",
+    "陸": "陆", "際": "际", "難": "难", "雙": "双", "雞": "鸡", "離": "离",
+    "麗": "丽", "齊": "齐", "歲": "岁", "歷": "历", "廳": "厅", "廣": "广",
+    "廠": "厂", "應": "应", "該": "该", "認": "认", "識": "识", "講": "讲",
+    "論": "论", "試": "试", "驗": "验", "證": "证", "書": "书", "買": "买",
+    "賣": "卖", "貴": "贵", "賽": "赛", "贏": "赢", "輸": "输", "場": "场",
+    "壞": "坏", "壓": "压", "願": "愿", "歡": "欢", "舊": "旧", "雖": "虽",
+    "隨": "随", "險": "险", "隱": "隐", "雜": "杂", "霧": "雾", "靜": "静",
+    "韓": "韩", "頁": "页", "項": "项", "順": "顺", "須": "须", "預": "预",
+    "領": "领", "顏": "颜", "類": "类", "顯": "显", "飯": "饭", "館": "馆",
+    "體": "体", "髮": "发", "鬥": "斗", "龜": "龟", "們": "们", "個": "个",
+    "隻": "只", "點": "点", "麼": "么", "樣": "样", "種": "种", "總": "总",
+    "蘭": "兰", "蓮": "莲", "葉": "叶", "樹": "树", "橋": "桥", "牆": "墙",
+    "場": "场", "面": "面",
+})
+
+
+def _norm_variants(s: str) -> str:
+    """字形归一：异体字与高频繁体统一成站点常用写法。"""
+    return (s or "").translate(_VARIANT_MAP)
+
+
 def _merge_key(title: str) -> tuple[str, int | None]:
     """搜索合并键：(基础片名, 季号)。只用于跨源同名归并，不影响榜单匹配。
 
@@ -3444,11 +3551,13 @@ def _merge_key(title: str) -> tuple[str, int | None]:
         return ("", None)
     s = _strip_note_brackets(s)          # 【直连】[国语]（全40集）去掉；（第二季）留字
     s = s.lower()
+    s = _norm_variants(s)                # 嫲→嬷、繁→简，否则同一部片会分成两条
     s = _QUAL_RE.sub("", s)             # 4K/HDR/蓝光/高清…
     s = _LANG_RE.sub("", s)             # 国语/粤语/中字…
     s = _EP_TAIL_RE.sub("", s)          # 第46集 / 全40集 / 更新至24集 / 完结
     s = _SPECIAL_RE.sub("特别篇", s)     # 特别版/特辑 → 特别篇（同一部特辑）
     s = re.sub(r"[\s·・:：,，.。!！?？'’\"\-—_]+", "", s)
+    s = _NOTE_TAIL_RE.sub("", s)          # 情书-正片 → 情书
     s = re.sub(r"(19|20)\d{2}$", "", s)  # 尾部年份单独进合并键
     season: int | None = None
     m = _SEASON_CN_RE.search(s)          # 第N季 / 第N季（中文数字）
@@ -3467,6 +3576,130 @@ def _merge_key(title: str) -> tuple[str, int | None]:
                 season = int(m.group(1))
                 s = s[:m.start()]
     return (s, season)
+
+
+# ---- 近似片名判定（跨源别名归并） ----
+# 多出来的那部分含这些词＝衍生/特辑，属另一部作品，绝不能被近似合并吞掉。
+_DERIV_MARKS = ("之", "特别篇", "特别版", "特辑", "番外", "前传", "外传",
+                "续集", "大结局", "剧场版", "篇外")
+
+
+def _bigrams(s: str) -> set[str]:
+    """2-gram 集合；单字返回空集（不足一个 gram）。"""
+    return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) >= 2 else set()
+
+
+def _near_same_title(a: str, b: str) -> bool:
+    """两个「基础片名」是否几乎同一部（用于跨源别名归并）。
+
+    判据（保守，宁缺勿滥）：
+      1. 包含关系：短名 ≥3 字、长度差 ≤3、多出来的部分 ≤2 字且不含衍生标记
+         （甄嬛传 ⊂ 后宫甄嬛传 成立；庆余年 ⊂ 庆余年之少年风流 不成立；
+          情书 ⊂ 给阿嬷的情书 因短名只有 2 字也不成立）；
+      2. 近似：两侧都 ≥4 字、长度差 ≤3，去掉「的」后 2-gram Jaccard ≥ 0.8
+         （给阿嬷的情书 ≈ 给阿嬷情书；庆余年 / 庆余生 只有 3 字，走不到这里）。
+    """
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    lo, hi = (a, b) if len(a) <= len(b) else (b, a)
+    if len(lo) >= 3 and len(hi) - len(lo) <= 3 and lo in hi:
+        extra = hi.replace(lo, "", 1)
+        if len(extra) <= 2 and not any(m in extra for m in _DERIV_MARKS):
+            return True
+    if min(len(a), len(b)) < 4 or abs(len(a) - len(b)) > 3:
+        return False
+    aa, bb = a.replace("的", ""), b.replace("的", "")
+    ga, gb = _bigrams(aa), _bigrams(bb)
+    if not ga or not gb:
+        return False
+    return len(ga & gb) / len(ga | gb) >= 0.8
+
+
+# ---- 搜索词扩写：长词命中少时补 1~2 个短词再搜一轮 ----
+# 资源站搜索接口规则不一：分词匹配的站能中「给阿嫲的一封情书」，
+# 子串匹配的站只认片名里真有的字串。实测同一部片长词 2 个站、短词 5 个站。
+_LEAD_WORD_RE = re.compile(r"^(?:给|致|献给|送给|关于|有关)")
+_QUANT_RE = re.compile(r"[一1][封个部件集季张篇场幕]")
+
+
+def _query_variants(keyword: str, limit: int = 2) -> list[str]:
+    """派生查询词：去掉「给/致」与「一封/一部」这类修饰，得到更短的核心名。
+
+    「给阿嫲的一封情书」→ ["阿嫲的情书", "阿嫲情书"]。只做无歧义的删词，
+    不做同音/形近替换（那会引入不可控的误召回）。
+    """
+    q = (keyword or "").strip()
+    if not q:
+        return []
+    t = _LEAD_WORD_RE.sub("", q)
+    t = _QUANT_RE.sub("", t)
+    t = re.sub(r"\s+", "", t)
+    stripped: list[str] = []
+    if len(t) >= 2 and t != q:
+        stripped.append(t)
+    t2 = t.replace("的", "")
+    if len(t2) >= 2 and t2 != q and t2 not in stripped:
+        stripped.append(t2)
+    # 字形归一后的查询优先（嫲→嬷、繁→简）：源站数据常是另一种写法，
+    # 实测「阿嫲的情书」拿不到，「阿嬷的情书」能多命中 2~3 个站。
+    out: list[str] = []
+    for c in stripped:
+        nc = _norm_variants(c)
+        if nc != c and nc not in out:
+            out.append(nc)
+    for c in stripped:
+        if c not in out:
+            out.append(c)
+    return out[:limit]
+
+
+def _shares_bigram(a: str, b: str, min_shared: int = 2) -> bool:
+    """派生查询结果的相关性护栏：与用户原词至少共享 min_shared 个 2-gram。
+
+    只要求 1 个太松：字形归一后「阿嬷的梦中情人」与「给阿嬷的一封情书」
+    也共享「阿嬷」一个 gram，会被误当同一部。短词（≤3 字）降为 1 个，
+    否则连「情书」这种本身就很短的词永远进不来。
+    """
+    # 比之前先去掉「的」：否则「阿嬷的梦中情人」会靠「嬷的」这个 gram 蒙混过关
+    aa, bb = (a or "").replace("的", ""), (b or "").replace("的", "")
+    ga, gb = _bigrams(aa), _bigrams(bb)
+    need = 1 if min(len(aa), len(bb)) <= 3 else min_shared
+    return len(ga & gb) >= need
+
+
+def _merge_brief_lists(primary: list[dict], extra: list[dict],
+                       keyword: str) -> list[dict]:
+    """把派生查询的聚合结果并进主结果：同名同季合并线路，无关结果丢弃。
+
+    - 与主结果同键：只补线路（同名同季的不同源就是可切换线路）；
+    - 否则必须与用户原始关键词共享至少一个 2-gram 才收（防止「阿嫲情书」
+      把「阿嫲的梦中情人」这类无关片带进来）。
+    """
+    keyed: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for b in primary:
+        k = _merge_key(b.get("title") or "")
+        if k not in keyed:
+            keyed[k] = b
+            order.append(k)
+    added = 0
+    for b in extra:
+        title = b.get("title") or ""
+        k = _merge_key(title)
+        if k in keyed:
+            dst = keyed[k].setdefault("lines", {})
+            for line, eps in (b.get("lines") or {}).items():
+                if line not in dst or len(eps) > len(dst[line]):
+                    dst[line] = eps
+        elif _shares_bigram(k[0], _merge_key(keyword)[0]):
+            keyed[k] = b
+            order.append(k)
+            added += 1
+    if added:
+        _log.info("搜索扩写补入 %d 条（关键词=%s）", added, keyword)
+    return [keyed[k] for k in order]
 
 
 _CJK_RE = re.compile(r"[一-鿿]")
@@ -7117,7 +7350,11 @@ def _line_choices(target: dict) -> list[dict]:
     out, seen_provider, seen_name = [], set(), set()
     for t in raw:
         provider = t["line"].split("::", 1)[0]
-        name = _PROVIDER_CN.get(provider, provider)
+        # 播放器「视频质量」菜单读的就是这个 label（见 _qualities）。
+        # 之前用 _PROVIDER_CN.get(provider, provider)：自定义源不在内置表里，
+        # 菜单里就显示成 custom_a17abce3cd 这种内部 id（2026-11-14 实测）。
+        # 统一走 _source_display_name：用户配置的站名 → 去 emoji/尾巴，最差才回退 id。
+        name = _source_display_name(provider)
         if provider in seen_provider:
             continue
         # 极端情况下不同 provider 映射到同名，加序号区分
@@ -7385,14 +7622,16 @@ async def media_range(mg: str, request: Request):
     if target.get("_line_seed"):
         # 线路卡＝用户手动点选：pin 该线，起播不竞速、失败不偷偷换源
         q = urllib.parse.urlencode({"line": target["line"],
-                                    "index": target["index"], "pin": "1"})
+                                    "index": target["index"], "pin": "1",
+                                    "cb": BUILD_TAG})
     elif is_hls:
         # 普通起播：不带 line，preset 才会枚举全部线路（播放器出「线路」菜单），
         # 首个变体带 auto=1 走竞速 → 默认播最快的源
-        q = urllib.parse.urlencode({"index": target["index"]})
+        q = urllib.parse.urlencode({"index": target["index"], "cb": BUILD_TAG})
     else:
         # 非 HLS 直链必须带 line（direct 要知道取哪条），保持常规故障切换
-        q = urllib.parse.urlencode({"line": target["line"], "index": target["index"]})
+        q = urllib.parse.urlencode({"line": target["line"], "index": target["index"],
+                                    "cb": BUILD_TAG})
     if is_hls:
         return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/preset.m3u8?{q}",
                                 status_code=302)
@@ -7498,11 +7737,13 @@ async def play_play(request: Request):
     # 首个变体 auto=1 走竞速，默认播最快的源。
     if base_target.get("_line_seed"):
         q = urllib.parse.urlencode({"line": target["line"],
-                                    "index": target["index"], "pin": "1"})
+                                    "index": target["index"], "pin": "1",
+                                    "cb": BUILD_TAG})
     elif is_hls:
-        q = urllib.parse.urlencode({"index": target["index"]})
+        q = urllib.parse.urlencode({"index": target["index"], "cb": BUILD_TAG})
     else:
-        q = urllib.parse.urlencode({"line": target["line"], "index": target["index"]})
+        q = urllib.parse.urlencode({"line": target["line"], "index": target["index"],
+                                    "cb": BUILD_TAG})
     if is_hls:
         play_link = f"{ONLINE_PREFIX}/{mg}/preset.m3u8?{q}"
         # 后台立刻预热该线路（含解析 + 播放列表），播放器取 main 时大概率已就绪
@@ -9907,8 +10148,12 @@ async def hls_preset(mg: str, request: Request):
         hls_targets.sort(key=lambda t: 0 if _pan_match(str(t.get("url") or ""))
                          else 1)
 
+    cb = request.query_params.get("cb") or ""
+
     def variant_uri(t: dict, is_auto_first: bool = False) -> str:
         q = {"index": idx, "line": t["line"]}
+        if cb:
+            q["cb"] = cb
         # 仅播放器自动起播的首选变体带 auto=1（取 main 时触发竞速选最快线），
         # 且必须去掉 line——main 只有「auto=1 且无显式 line」才走竞速；
         # 带上 line 会把竞速变成“固定这条线”，自动起播就再也选不到最快的源了。
@@ -9973,6 +10218,9 @@ _GROUP_ALIAS = {
     "hy": "虎牙", "hym3u8": "虎牙", "huya": "虎牙",
     "jisu": "极速", "js": "极速", "ruyi": "如意", "ry": "如意",
     "hn": "红牛", "hnm3u8": "红牛", "hongniu": "红牛",
+    "liangzi": "量子", "liangziyun": "量子", "lzm3u8": "量子",
+    "hnyun": "红牛", "hnyunm3u8": "红牛", "ikm3u8": "iKun", "ikun": "iKun",
+    "jl": "巨量", "jlm3u8": "巨量", "juliang": "巨量",
     "xinlang": "新浪", "xl": "新浪", "youku": "优酷", "uk": "优酷",
     "s360": "360", "360": "360", "baidu": "百度", "bd": "百度",
 }
@@ -10032,8 +10280,9 @@ def _friendly_line(key: str) -> str:
     base = _source_display_name(provider)
     if not group:
         return base
-    # 无信息量的组名：默认包装（m3u8）与纯数字序号，直接从菜单名里去掉
-    if group in ("m3u8", "1") or group.isdigit():
+    # 无信息量的组名：默认包装（m3u8）、纯数字序号、单字母（p/v 之类），
+    # 直接从菜单名里去掉——否则会显示成「量子·P」这种噪音。
+    if group in ("m3u8", "1") or group.isdigit() or len(group) <= 1:
         return base
     if group == "yun":
         return f"{base}·云播"

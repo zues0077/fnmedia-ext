@@ -115,6 +115,32 @@ def _year_from_subtitle(sub: str) -> str:
     return m.group(0) if m else ""
 
 
+def parse_subtitle(sub: str) -> tuple[list[str], list[str]]:
+    """从豆瓣 card_subtitle 里取「地区」「类型」。
+
+    实测格式（2026-11-15，热门电影条目）：
+        2026 / 韩国 / 剧情 爱情 / 李沧东 / 全度妍 薛景求
+        2026 / 西班牙 法国 / 剧情 同性 历史 / 哈维尔… / …
+    第 1 段是年份，第 2 段是国家/地区（可能多个，空格分隔），第 3 段是类型
+    （空格分隔）。缺段时返回空列表，不猜。
+
+    这两个字段是「类型」「国家/地区」两个筛选维度唯一的数据来源——榜单只从
+    豆瓣拿标题/海报/评分/副标题，没有别的元数据可用。
+    """
+    parts = [p.strip() for p in re.split(r"[/／]", sub or "")]
+    areas: list[str] = []
+    genres: list[str] = []
+    if len(parts) >= 2:
+        for a in re.split(r"[\s　]+", parts[1]):
+            if a and a not in areas:
+                areas.append(a)
+    if len(parts) >= 3:
+        for g in re.split(r"[\s　]+", parts[2]):
+            if g and g not in genres:
+                genres.append(g)
+    return areas, genres
+
+
 async def _get_json(client: httpx.AsyncClient, url: str, *,
                     referer: str = "", timeout: float = 10.0) -> Any:
     headers = {"User-Agent": _UA, "Accept": "application/json"}

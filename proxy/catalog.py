@@ -2115,6 +2115,51 @@ class Catalog:
         with self._lock:
             return list(self._routes.get(self._scope_key(scope, "movie")) or [])
 
+    def class_names(self, cat: str, scope: str = AGG_SCOPE) -> list[str]:
+        """该大类下各源用到的分类名（去重、稳定排序）。
+
+        供「筛选条」的类型维度用：CMS 的每个路由就是「某源下的某个分类」，
+        同名的分类跨源合并成一个选项（如「动作片」）。
+        """
+        with self._lock:
+            routes = self._routes.get(self._scope_key(scope, cat)) or []
+        names: list[str] = []
+        for r in routes:
+            n = str(r.get("type_name") or "").strip()
+            if n and n not in names:
+                names.append(n)
+        return sorted(names)
+
+    def warm_filter_window(self, cat: str, extra: int = 120,
+                           scope: str = AGG_SCOPE) -> None:
+        """筛选时后台多抓一批（不阻塞本次响应），让下次翻页有更多同类片。
+
+        上限 600 条：再往上翻源站就明显变慢，且用户很少翻那么深。"""
+        sk = self._scope_key(scope, cat)
+        cur = len(self._dense.get(sk) or [])
+        target = min(600, cur + max(40, int(extra)))
+        if target <= cur:
+            return
+        try:
+            asyncio.create_task(self._extend_dense(scope, cat, target))
+        except RuntimeError:
+            pass
+
+    def window_filtered(self, cat: str, pred, offset: int, limit: int,
+                        scope: str = AGG_SCOPE) -> tuple[list[dict], int]:
+        """在「已缓存的 dense 窗口」上按谓词过滤，**不触发任何网络翻页**。
+
+        为什么不做深翻：按「够数就继续翻源站」实测会把一次筛选拖到 400 秒都
+        不返回（2026-11-15），把整个媒体库页面卡死。这里只在已抓到的条目里筛，
+        用户继续下滑时 dense 自然增长，筛选结果也随之变多；
+        总数报「当前已缓存里过滤后的条数」，与窗口同口径，翻页不会错位。
+        """
+        offset = max(0, int(offset))
+        limit = max(1, min(int(limit), 100))
+        dense = self._dense.get(self._scope_key(scope, cat)) or []
+        picked = [b for b in dense if pred(b)]
+        return picked[offset:offset + limit], len(picked)
+
     def available(self, cat: str, scope: str = AGG_SCOPE) -> bool:
         with self._lock:
             if self._routes.get(self._scope_key(scope, cat)):

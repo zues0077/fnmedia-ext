@@ -85,6 +85,7 @@ import fnusers as fnusersmod
 import libfilter as libfiltermod
 import admin_auth as admin_authmod
 import updater
+from facets import facets_store
 from store import (store, make_guid, merged_guid, media_guid, video_guid,
                    is_online_guid, season_guid, episode_guid, ep_media_guid,
                    ep_video_guid)
@@ -3917,6 +3918,11 @@ def _chart_rows_all(body: dict, cat: str) -> list[dict]:
     # 部分客户端把“媒体库根”也放进 parent_guid：只有真正的文件夹下钻才返回空
     if parent and parent not in CHART_LIB_GUIDS.values() and parent != HOT_LEGACY_GUID:
         return []
+    # 榜单刷新后，条目里的题材/地区/年份要自动进筛选词表（不用等用户点筛选）
+    try:
+        _chart_facets(cat)
+    except Exception:  # noqa: BLE001
+        pass
     rows = [chart_card(it) for it in items]
     tags = body.get("tags")
     if isinstance(tags, dict):
@@ -3933,6 +3939,51 @@ def _chart_rows_all(body: dict, cat: str) -> list[dict]:
         if wanted:
             rows = [r for r in rows if r.get("type") in wanted
                     or r.get("type") == "Directory"]
+    # 类型 / 国家地区：数据来自豆瓣 card_subtitle（"2026 / 韩国 / 剧情 爱情 / …"）。
+    # 榜单卡片里的 guid 已被换成线路文件夹 guid，需还原成原条目 guid 再查元数据。
+    if isinstance(tags, dict):
+        _gname = _chart_genre_name(cat, _tag_scalar(tags, "genres", "genre"))
+        _area = _tag_scalar(tags, "locate", "area")
+        _dec = str(_tag_scalar(tags, "decades", "decade", "year") or "").strip()
+        if _gname or _area or _dec:
+            def _row_meta(_it):
+                _a, _g = chartmod.parse_subtitle(_it.get("subtitle") or "")
+                if not _a and not _g:
+                    for _t in (_it.get("tags") or []):
+                        _m = re.match(r"^(.{2,4})动画$", str(_t or "").strip())
+                        if _m:
+                            _a, _g = [_m.group(1)], ["动画"]
+                            break
+                return _a, _g
+            _meta: dict[str, tuple[list[str], list[str]]] = {}
+            _years: dict[str, str] = {}
+            for _it in items:
+                _a, _g = _row_meta(_it)
+                _meta[_it.get("guid") or ""] = (_a, _g)
+                _years[_it.get("guid") or ""] = _year_bucket(_it.get("year"))
+            _keep = []
+            for _r in rows:
+                _og = _parse_line_folder_guid(_r.get("guid") or "") or (_r.get("guid") or "")
+                _a, _g = _meta.get(_og, ([], []))
+                if _gname and _gname not in _g:
+                    continue
+                if _area and _area not in _a:
+                    continue
+                if _dec:
+                    _yb = _years.get(_og, "")
+                    if not _yb:
+                        continue
+                    if _dec.endswith("年代"):
+                        try:
+                            _base = int(_dec[:-2])
+                        except ValueError:
+                            continue
+                        if not (_base <= int(_yb) < _base + 10):
+                            continue
+                    elif _yb != _dec:
+                        continue
+                _keep.append(_r)
+            rows = _keep
     rows = [_apply_marks(r) for r in rows]
     if int(body.get("is_favorite") or 0):
         rows = [r for r in rows if r.get("is_favorite")]
@@ -4038,20 +4089,45 @@ async def guard_tag_genres(request: Request):
     里查不到名而被隐藏。真实媒体库的可选类型来自各自 tag/list，不会出现这些 id，
     故只在“编辑元数据”的全局类型下拉里多出加固分类，不影响其它库的筛选。"""
     resp = await forward_upstream(request)
-    if not (features.GUARD and guard_native_enabled()):
-        return resp
     try:
         payload = json.loads(resp.body or b"{}")
-        data = payload.get("data")
-        if isinstance(data, list):
-            have = {x.get("id") for x in data if isinstance(x, dict)}
-            for _spec, _gid in _gn_genre_map().items():
-                if _gid not in have:
-                    data.append({"id": _gid, "value": _spec})
-            payload["data"] = data
-            return JSONResponse(payload)
     except Exception:  # noqa: BLE001
-        pass
+        return resp
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return resp
+    have = {x.get("id") for x in data if isinstance(x, dict)}
+    changed = False
+    if features.GUARD and guard_native_enabled():
+        for _spec, _gid in _gn_genre_map().items():
+            if _gid not in have:
+                have.add(_gid)
+                data.append({"id": _gid, "value": _spec})
+                changed = True
+    # 海量四库的「类型」= CMS 分类名（与 /tag/list 给的 id 一一对应）
+    if catalog_enabled():
+        for _cat in CATALOG_LIB_GUIDS:
+            try:
+                _avail = catalog.available(_cat)
+            except Exception:  # noqa: BLE001
+                _avail = False
+            if not _avail:
+                continue
+            for _name, _gid in _cat_genre_map(_cat).items():
+                if _gid not in have:
+                    have.add(_gid)
+                    data.append({"id": _gid, "value": _name})
+                    changed = True
+    # 榜单四库的「类型」= 豆瓣副标题里的题材（剧情/爱情/真人秀…）
+    for _ccat in CHART_LIB_GUIDS:
+        for _name, _gid in _chart_facets(_ccat)["genres"].items():
+            if _gid not in have:
+                have.add(_gid)
+                data.append({"id": _gid, "value": _name})
+                changed = True
+    if changed:
+        payload["data"] = data
+        return JSONResponse(payload)
     return resp
 
 
@@ -4062,20 +4138,39 @@ async def guard_tag_iso3166(request: Request):
     加固库筛选条的“地区”行即各源 categoryContent 的 area 筛选值（跨源归并同物
     异名）。保留官方国家字典，不影响真实媒体库。"""
     resp = await forward_upstream(request)
-    if not (features.GUARD and guard_native_enabled()):
-        return resp
     try:
         payload = json.loads(resp.body or b"{}")
-        data = payload.get("data")
-        if isinstance(data, list):
-            have = {x.get("key") for x in data if isinstance(x, dict)}
-            for _a in _gn_area_options():
-                if _a["v"] not in have:
-                    data.append({"key": _a["v"], "value": _a["n"]})
-            payload["data"] = data
-            return JSONResponse(payload)
     except Exception:  # noqa: BLE001
-        pass
+        return resp
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return resp
+    have = {x.get("key") for x in data if isinstance(x, dict)}
+    changed = False
+    if features.GUARD and guard_native_enabled():
+        for _a in _gn_area_options():
+            if _a["v"] not in have:
+                have.add(_a["v"])
+                data.append({"key": _a["v"], "value": _a["n"]})
+                changed = True
+    # 海量四库的「地区」= 资源站 area（key 与 value 同值）
+    if catalog_enabled():
+        for _cat in CATALOG_LIB_GUIDS:
+            for _a in _cat_area_options(_cat):
+                if _a not in have:
+                    have.add(_a)
+                    data.append({"key": _a, "value": _a})
+                    changed = True
+    # 榜单四库的「地区」= 豆瓣副标题里的国家/地区
+    for _ccat in CHART_LIB_GUIDS:
+        for _a in _chart_facets(_ccat)["areas"]:
+            if _a not in have:
+                have.add(_a)
+                data.append({"key": _a, "value": _a})
+                changed = True
+    if changed:
+        payload["data"] = data
+        return JSONResponse(payload)
     return resp
 
 
@@ -4104,8 +4199,428 @@ async def guard_native_tag_list(request: Request):
             pass
         return JSONResponse({"code": 0, "msg": "",
                              "data": _gn_tag_filter_payload()})
+    # 榜单四库：类型/地区来自豆瓣 card_subtitle
+    _chart_lib = CHART_GUID_CAT.get(_canonical_lib_guid(ag))
+    if _chart_lib:
+        return JSONResponse({"code": 0, "msg": "",
+                             "data": _chart_tag_filter_payload(_chart_lib)})
+    # 海量四库：类型=CMS 分类名、地区=资源站 area（加固库之外的另一套）
+    _cat_lib = CATALOG_GUID_CAT.get(_canonical_lib_guid(ag))
+    if _cat_lib and catalog_enabled():
+        # 不要求 `catalog.available()`：分类路由没建好（或该库根本没有路由）时
+        # 也要给筛选条——标准词表/年代档都是本地兜底的，不依赖路由。
+        # 之前拿 available 当门槛，导致 lib4 这类库筛选一直是空的（2026-11-15）。
+        payload = _cat_tag_filter_payload(_cat_lib)
+        # 地区/年代只能从「已浏览到的条目」里统计：刚重启时缓存是空的，
+        # 先给空值、同时在后台抓一批，用户第二次打开筛选就有地区可选了。
+        # 这里绝不阻塞响应——同步抓一页要 6~19 秒。
+        if not payload.get("locate"):
+            try:
+                catalog.warm_filter_window(_cat_lib)
+            except Exception:  # noqa: BLE001
+                pass
+        return JSONResponse({"code": 0, "msg": "", "data": payload})
     return await forward_upstream(request)
 # <<< PRIVATE:GUARD
+
+
+# ---------------------------------------------------------------- 海量四库筛选
+# 飞牛筛选条的按钮文案来自两个全局字典（类型=/tag/genres、地区=/tag/iso3166），
+# 每个库能用哪些维度由 /tag/list?ancestor_guid=<库> 决定；用户点选后前端把
+# tags 放进 item/list 的 body（值为标量）。加固专区已按这套跑通，这里照同一套
+# 给「海量四库」补上：类型=CMS 分类名、地区=资源站 area。
+# 分辨率/动态范围/音频规格需要逐条探测，暂不提供（宁缺勿假）。
+_CAT_GENRE_ID_BASE = 700000
+_CAT_GENRE_ID_MAX = 799999
+
+# 分辨率 / 动态范围 / 音频规格：源站 CMS 接口不返回真实值（条目里 media_stream 全 None），
+# 这里给的是飞牛官方筛选条同一套静态枚举，只为让按钮显示出来；没有条目级数据，
+# 点了会筛空——用户 2026-11-15 明确接受（"哪怕点了可能空"）。
+_RESOLUTION_OPTIONS = ["4k", "1080P", "720P", "480P"]
+_COLOR_RANGE_OPTIONS = ["HDR10", "HLG", "SDR"]
+_AUDIO_TYPE_OPTIONS = ["杜比环绕", "杜比全景声", "DTS", "立体声"]
+
+# 豆瓣标准题材词表（2026-11-15 按豆瓣电影/剧集/综艺/纪录片的分类整理）：
+# 电影 22 类；剧集在这套之上多了「古装/家庭」；综艺以「真人秀/脱口秀」为主，
+# 其余题材与电影通用；纪录片用「历史/人文/自然…」。内置库先铺这套标准词表，
+# 保证每个库都有像豆瓣那样的筛选条，再叠加资源站真实出现的分类（追加在后）。
+_DB_MOVIE_GENRES = ["剧情", "喜剧", "动作", "爱情", "科幻", "动画", "悬疑",
+                    "惊悚", "恐怖", "犯罪", "同性", "音乐", "歌舞", "历史",
+                    "战争", "西部", "奇幻", "冒险", "灾难", "武侠", "情色",
+                    "纪录片"]
+_LIB_GENRE_SEED = {
+    "movie": _DB_MOVIE_GENRES,
+    "tv": _DB_MOVIE_GENRES + ["古装", "家庭"],
+    "anime": ["动画", "奇幻", "冒险", "热血", "搞笑", "校园", "悬疑", "治愈"],
+    "variety": ["真人秀", "脱口秀", "音乐", "歌舞", "喜剧", "访谈", "文化",
+                "游戏", "亲子", "职场", "美食", "运动"],
+    "documentary": ["纪录片", "历史", "人文", "自然", "科技", "美食", "社会",
+                    "探险", "动物", "犯罪", "音乐"],
+    "uhd": _DB_MOVIE_GENRES,
+    "overseas": _DB_MOVIE_GENRES + ["古装", "家庭"],
+    "ai_comic": ["动画", "奇幻", "冒险", "搞笑", "科幻", "悬疑"],
+    "ted": ["演讲", "科技", "社会", "人文", "教育", "心理"],
+    "shortdrama": ["都市", "甜宠", "逆袭", "古装", "悬疑", "家庭", "职场",
+                   "穿越", "复仇", "战神"],
+}
+
+
+# 用户自建分类（lib/lib2…）没有专属词表，用「电影 + 剧集」这套通用题材兜底，
+# 保证每个分类都有可点的筛选项（用户 2026-11-15 确认：自定义分类也铺）。
+_GENERIC_GENRES = _DB_MOVIE_GENRES + ["古装", "家庭"]
+
+
+def _lib_genre_seed(cat: str) -> list[str]:
+    """该分类的标准题材词表。
+
+    内置库各有一套（电影/剧集/综艺/动漫/纪录片…）；不在表里的自定义分类退回
+    通用题材（电影 + 剧集），保证筛选条不至于空着。
+
+    例外：福利库（catalog:adult）**不预置任何题材**。它本来就由后台「扩展资源库」
+    开关控制、默认不可见；开启后筛选条只吃资源站真实分类（源一返回卡片就自动
+    入账），不必事先铺一套电影/剧集题材——否则会出现「古装」「家庭」「情色」
+    这种跟资源站分类毫无关系的按钮（用户 2026-11-15 要求）。
+    """
+    if cat == catalogmod.ADULT_CAT:
+        return []
+    return list(_LIB_GENRE_SEED.get(cat) or _GENERIC_GENRES)
+
+
+# 福利库曾经吃通用兜底词，这些词可能已经写进本地 state/facets.json；
+# 词表「只增不减」，不主动剔就会永远占着筛选条。进程内只清一次。
+_ADULT_SEED_PRUNED = False
+
+
+def _prune_adult_seed(keep=()) -> None:
+    """把历史遗留在福利库词表里的通用题材剔掉。
+
+    `keep` 是这一轮从路由/缓存里读到的真实分类名：「爱情」「家庭」这类词
+    既是通用兜底的组成，也可能是资源站真有的分类——真实存在的必须留下，
+    否则会被删掉再从末尾追加回来，按钮位置莫名跳动。
+    """
+    global _ADULT_SEED_PRUNED
+    if _ADULT_SEED_PRUNED:
+        return
+    _ADULT_SEED_PRUNED = True
+    keep_set = {str(n or "").strip() for n in keep or []}
+    drop = [n for n in _GENERIC_GENRES if n not in keep_set]
+    try:
+        facets_store.prune(f"catalog:{catalogmod.ADULT_CAT}", "genres", drop)
+    except Exception:  # noqa: BLE001 — 迁移失败不影响筛选条
+        pass
+
+
+def _seed_decades() -> list[str]:
+    """豆瓣式年代档：最近 8 个单年 + 更早按十年段。"""
+    now = time.localtime().tm_year
+    out = [str(y) for y in range(now, now - 8, -1)]
+    for base in (2010, 2000, 1990, 1980):
+        if base + 9 < now - 7:
+            out.append(f"{base}年代")
+    return out
+
+
+# 地区归一：资源站写法五花八门（"大陆" / "香港" / "英国,美国" /
+# "克罗地亚 / 波兰 / 加拿大 / 波黑" / "其它"），豆瓣口径是 "中国大陆 / 中国香港 /
+# 华语 / 欧美"。不归一就会出现「大陆」和「中国大陆」两个按钮，以及
+# 「泰国 / 中国大陆」这种合并值当地区用。
+_AREA_ALIAS = {
+    "大陆": "中国大陆", "内地": "中国大陆", "中国": "中国大陆",
+    "香港": "中国香港", "台湾": "中国台湾", "澳门": "中国澳门",
+}
+_AREA_SPLIT_RE = re.compile(r"[/,，、+&]+")
+_AREA_DROP = {"", "其它", "其他", "未知", "不详", "无"}
+
+
+def _split_areas(raw) -> list[str]:
+    """把任意写法的地区字段拆成规范化的国家/地区列表。"""
+    out: list[str] = []
+    for tok in _AREA_SPLIT_RE.split(str(raw or "")):
+        tok = tok.strip()
+        if not tok or tok in _AREA_DROP:
+            continue
+        tok = _AREA_ALIAS.get(tok, tok)
+        if tok not in out:
+            out.append(tok)
+    return out
+
+
+def _clean_class_name(name) -> str:
+    """CMS 分类名去后缀：动作片→动作、喜剧片→喜剧；「纪录片」保持不变。"""
+    n = str(name or "").strip()
+    if len(n) >= 3 and n.endswith("片") and n != "纪录片":
+        return n[:-1]
+    return n
+
+
+def _year_bucket(year) -> str:
+    """年份 → 筛选值。豆瓣筛选条是「单年 + 十年段 + 更早」，这里按同一口径。"""
+    y = str(year or "").strip()
+    if len(y) >= 4 and y[:4].isdigit():
+        return y[:4]
+    return ""
+
+
+def _decades_of(years) -> list[str]:
+    """把一批年份折成筛选项：近 12 个单年在前，更早的按十年段。"""
+    ys = sorted({int(y) for y in years if _year_bucket(y)}, reverse=True)
+    out = [str(y) for y in ys[:12]]
+    for y in ys[12:]:
+        d = f"{y // 10 * 10}年代"
+        if d not in out:
+            out.append(d)
+    return out
+
+
+# 分类名表带短 TTL 缓存：`class_names()` 要拿 catalog 的锁，而路由重建（184 个源）
+# 会在后台长时间持锁——实测筛选请求因此阻塞到几百秒不返回（2026-11-15）。
+# 缓存 + 「重建中不等待」+「退回缓存条目」是三个必要条件。
+_CAT_GENRE_CACHE: dict[str, tuple[float, dict[str, int]]] = {}
+_CAT_GENRE_TTL = 600.0
+
+
+def _cat_class_names(cat: str) -> list[str]:
+    """该库可用的「类型」词表（已去「片」后缀）。
+
+    优先用路由里的分类名；路由正在重建或尚未建好时，退回「已缓存条目的
+    type_name」——零网络、不抢锁。否则筛选条在重建期间会一直是空
+    （2026-11-15 实测：海量四库 avail=False/stale=True 时类型为 0 项）。
+    """
+    names: list[str] = []
+    # 直接读内存里的路由表（dict 读在 CPython 里是原子的，不拿锁）。
+    # 不能等 `routes_stale()`：路由从磁盘恢复后仍带 stale 标记，等它就会一直
+    # 返回空（2026-11-15 实测：海量四库路由 700+ 条已在内存，类型却是 0 项）；
+    # 也不能走 class_names()：那要拿 catalog 的锁，刷新（184 个源）期间会卡死。
+    try:
+        routes = catalog._routes.get(
+            catalog._scope_key(catalogmod.AGG_SCOPE, cat)) or []
+        names = [_clean_class_name(r.get("type_name")) for r in routes
+                 if str(r.get("type_name") or "").strip()]
+    except Exception:  # noqa: BLE001
+        names = []
+    if not names:
+        try:
+            dense = catalog.cached_dense(cat, limit=400)
+        except Exception:  # noqa: BLE001
+            dense = []
+        names = [_clean_class_name(b.get("type_name")) for b in dense
+                 if str(b.get("type_name") or "").strip()]
+    # 内置库先铺豆瓣标准题材（保证筛选条完整），资源站真实分类追加在后；
+    # 用户自建分类（lib/lib2…）没有标准词表，保持它自己的分类名。
+    if cat == catalogmod.ADULT_CAT:
+        # 福利库不铺题材：把历史遗留的通用词剔掉，但这一轮真实存在的分类名要留
+        _prune_adult_seed(names)
+    out: list[str] = _lib_genre_seed(cat)
+    for n in names:
+        if n and n not in out:
+            out.append(n)
+    # 并入本地词表：已经在列的位置不动，新源带来的新分类追加到末尾，
+    # 重启/换榜单都不会把筛选项弄丢（用户 2026-11-15 要求）。
+    return facets_store.merge(f"catalog:{cat}", "genres", out)
+
+
+def _cat_genre_map(cat: str) -> dict[str, int]:
+    """分类名 → 稳定虚拟类型 id（纯哈希，不随其它分类增删漂移）。"""
+    names = _cat_class_names(cat)
+    sig = tuple(names)
+    hit = _CAT_GENRE_CACHE.get(cat)
+    if hit and hit[0] == sig:
+        return dict(hit[1])
+    span = _CAT_GENRE_ID_MAX - _CAT_GENRE_ID_BASE + 1
+    out: dict[str, int] = {}
+    used: set[int] = set()
+    for n in names:
+        gid = _CAT_GENRE_ID_BASE + (zlib.crc32(n.encode("utf-8")) % span)
+        if gid in used:
+            continue
+        used.add(gid)
+        out[n] = gid
+    _CAT_GENRE_CACHE[cat] = (sig, dict(out))
+    return out
+
+
+def _cat_genre_name(cat: str, gid) -> str | None:
+    try:
+        gid = int(gid)
+    except (TypeError, ValueError):
+        return None
+    for name, g in _cat_genre_map(cat).items():
+        if g == gid:
+            return name
+    return None
+
+
+def _cat_area_options(cat: str) -> list[str]:
+    """该库已缓存条目里出现过的地区（归一化后去重，零网络）。"""
+    out: list[str] = []
+    try:
+        dense = catalog.cached_dense(cat, limit=400) or []
+    except Exception:  # noqa: BLE001
+        dense = []
+    for b in dense:
+        for a in _split_areas(b.get("area")):
+            if a not in out:
+                out.append(a)
+    merged = facets_store.merge(f"catalog:{cat}", "areas", out)
+    return merged[:40]
+
+
+def _cat_decade_options(cat: str) -> list[str]:
+    try:
+        dense = catalog.cached_dense(cat, limit=400) or []
+    except Exception:  # noqa: BLE001
+        dense = []
+    return facets_store.merge(f"catalog:{cat}", "decades",
+                              _seed_decades() + _decades_of(
+                                  [b.get("year") for b in dense]))
+
+
+def _merge_catalog_facets(cat: str, briefs: list[dict]) -> None:
+    """资源站一返回数据，就把条目里的 分类/地区/年份 自动并入本地词表。
+
+    触发点不是「用户打开筛选」，而是「列表出卡片」——这样源响应后筛选项会自己变多，
+    不用等用户再点一次筛选（用户 2026-11-15 明确要求）。只增不减、已有位置不动；
+    `merge` 内部只在真有新条目时写盘，翻页不会反复写文件。
+    """
+    if not briefs:
+        return
+    key = f"catalog:{cat}"
+    try:
+        genres = [_clean_class_name(b.get("type_name")) for b in briefs
+                  if str(b.get("type_name") or "").strip()]
+        facets_store.merge(key, "genres", _lib_genre_seed(cat) + genres)
+        areas: list[str] = []
+        for b in briefs:
+            areas.extend(_split_areas(b.get("area")))
+        if areas:
+            facets_store.merge(key, "areas", areas)
+        years = [_year_bucket(b.get("year")) for b in briefs]
+        facets_store.merge(key, "decades", _seed_decades() + _decades_of(years))
+    except Exception:  # noqa: BLE001 — 词表写入失败不影响列表
+        pass
+
+
+def _cat_tag_filter_payload(cat: str) -> dict:
+    return {"genres": list(_cat_genre_map(cat).values())[:60],
+            "resolutions": list(_RESOLUTION_OPTIONS),
+            "color_range": list(_COLOR_RANGE_OPTIONS),
+            "audio_type": list(_AUDIO_TYPE_OPTIONS),
+            "locate": _cat_area_options(cat),
+            "decades": _cat_decade_options(cat),
+            "recognition_status": []}
+
+
+# 榜单四库筛选：类型/地区来自豆瓣卡片的 card_subtitle（"2026 / 韩国 / 剧情 爱情 / …"）。
+# 用独立号段 600000~699999，避免与海量库（700000~）和加固库冲突。
+_CHART_GENRE_ID_BASE = 600000
+_CHART_GENRE_ID_MAX = 699999
+_CHART_FACET_CACHE: dict[str, tuple[float, dict]] = {}
+_CHART_FACET_TTL = 300.0
+
+
+def _chart_facets(cat: str) -> dict:
+    """榜单库的类型/地区/年份词表（5 分钟 TTL，纯内存解析，不联网）。
+
+    数据源是豆瓣 card_subtitle。动漫新番走的是「豆瓣标签」源：subtitle 为空、
+    tags 只有 ["日本动画"] 这类，此时从标签里反推「地区 + 动画」，否则这个库
+    的类型/地区会永远是空的。
+    """
+    hit = _CHART_FACET_CACHE.get(cat)
+    if hit and (time.time() - hit[0]) < _CHART_FACET_TTL:
+        return dict(hit[1])
+    genres: dict[str, int] = {}
+    areas: list[str] = []
+    years: list[str] = []
+    try:
+        items = chart_cache.items(cat)
+    except Exception:  # noqa: BLE001
+        items = []
+    span = _CHART_GENRE_ID_MAX - _CHART_GENRE_ID_BASE + 1
+    used: set[int] = set()
+
+    def _add_genre(name: str) -> None:
+        if not name or name in genres:
+            return
+        gid = _CHART_GENRE_ID_BASE + (zlib.crc32(name.encode("utf-8")) % span)
+        if gid in used:
+            return
+        used.add(gid)
+        genres[name] = gid
+
+    for it in items:
+        a_list, g_list = chartmod.parse_subtitle(it.get("subtitle") or "")
+        if not a_list and not g_list:
+            # 豆瓣标签源（动漫新番）：tags 形如 ["日本动画"]
+            for tag in (it.get("tags") or []):
+                m = re.match(r"^(.{2,4})动画$", str(tag or "").strip())
+                if m:
+                    a_list = [m.group(1)]
+                    g_list = ["动画"]
+                    break
+        for name in g_list:
+            _add_genre(name)
+        for raw in a_list:
+            for name in _split_areas(raw):
+                if name not in areas:
+                    areas.append(name)
+        yb = _year_bucket(it.get("year"))
+        if yb:
+            years.append(yb)
+    # 并入本地词表（只增不减、已有位置不动）：榜单刷新/重启都不会把已在列的
+    # 类型、地区、年份弄丢；新一期出现的新题材只是追加到末尾。
+    key = f"chart:{cat}"
+    g_names = facets_store.merge(key, "genres",
+                                 _lib_genre_seed(cat) + list(genres))
+    a_names = facets_store.merge(key, "areas", areas)
+    d_names = facets_store.merge(key, "decades",
+                                 _seed_decades() + _decades_of(years))
+    # id 表以本地库顺序为准重建（名字→id 仍是纯哈希，跨版本稳定）
+    out_g: dict[str, int] = {}
+    seen_ids: set[int] = set()
+    for name in g_names:
+        gid = _CHART_GENRE_ID_BASE + (zlib.crc32(name.encode("utf-8")) % span)
+        if gid in seen_ids:
+            continue
+        seen_ids.add(gid)
+        out_g[name] = gid
+    out = {"genres": out_g, "areas": a_names[:30], "decades": d_names}
+    _CHART_FACET_CACHE[cat] = (time.time(), dict(out))
+    return out
+
+
+def _chart_genre_name(cat: str, gid) -> str | None:
+    try:
+        gid = int(gid)
+    except (TypeError, ValueError):
+        return None
+    for name, g in _chart_facets(cat)["genres"].items():
+        if g == gid:
+            return name
+    return None
+
+
+def _chart_tag_filter_payload(cat: str) -> dict:
+    f = _chart_facets(cat)
+    return {"genres": list(f["genres"].values())[:60],
+            "resolutions": list(_RESOLUTION_OPTIONS),
+            "color_range": list(_COLOR_RANGE_OPTIONS),
+            "audio_type": list(_AUDIO_TYPE_OPTIONS),
+            "locate": list(f["areas"]),
+            "decades": list(f["decades"]),
+            "recognition_status": []}
+
+
+def _tag_scalar(tags, *keys):
+    """飞牛提交筛选时是标量；兼容数组写法，统一取第一个非空值。"""
+    if not isinstance(tags, dict):
+        return None
+    for k in keys:
+        v = tags.get(k)
+        if isinstance(v, list):
+            v = v[0] if v else None
+        if v not in (None, "", -1, "-1"):
+            return v
+    return None
 
 
 def _all_virtual_lib_guids() -> set[str]:
@@ -6154,12 +6669,50 @@ async def item_list(request: Request):
         page_size = max(1, min(page_size, 100))
         offset = int(body["offset"]) if body.get("offset") is not None \
             else (page - 1) * page_size
-        total = catalog.total(ccat)
-        offset = max(0, min(offset, total))
-        briefs = await catalog.get_window(ccat, offset, page_size)
-        # 派生 4K 的总数在翻页后才准（total() 在此场景下返回实际找到的数）；
-        # 先按旧总数翻、再按找到的数报，前端才不会对着空库一直翻页。
-        total = catalog.total(ccat)
+        # 筛选：类型（CMS 分类名，虚拟 id）与地区（资源站 area）。
+        # 过滤必须在「取窗」时就生效，否则先取 22 条再过滤会让页码/总数错位。
+        _tags = body.get("tags")
+        _gname = _cat_genre_name(ccat, _tag_scalar(_tags, "genres", "genre"))
+        _area = _tag_scalar(_tags, "locate", "area")
+        _dec = str(_tag_scalar(_tags, "decades", "decade", "year") or "").strip()
+        if _gname or _area or _dec:
+            def _pred(b, _g=_gname, _a=_area, _d=_dec):
+                # 分类名统一去「片」后缀再比（资源站写「动作片」，筛选项是「动作」）
+                if _g and _clean_class_name(b.get("type_name")) != _g:
+                    return False
+                # 地区字段可能是 "英国,美国" / "泰国 / 中国大陆"，拆开逐个比
+                if _a and _a not in _split_areas(b.get("area")):
+                    return False
+                if _d:
+                    yb = _year_bucket(b.get("year"))
+                    if not yb:
+                        return False
+                    if _d.endswith("年代"):
+                        try:
+                            base = int(_d[:-2])
+                        except ValueError:
+                            return False
+                        if not (base <= int(yb) < base + 10):
+                            return False
+                    elif yb != _d:
+                        return False
+                return True
+            briefs, total = catalog.window_filtered(ccat, _pred, offset, page_size)
+            if len(briefs) < page_size:
+                # 只过滤已缓存内容（深翻会把请求拖死），但顺手在后台多抓一页，
+                # 用户刷新/翻页时能多出一些同类片。
+                try:
+                    catalog.warm_filter_window(ccat)
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            total = catalog.total(ccat)
+            offset = max(0, min(offset, total))
+            briefs = await catalog.get_window(ccat, offset, page_size)
+            # 派生 4K 的总数在翻页后才准（total() 在此场景下返回实际找到的数）；
+            # 先按旧总数翻、再按找到的数报，前端才不会对着空库一直翻页。
+            total = catalog.total(ccat)
+        _merge_catalog_facets(ccat, briefs)
         rows = _catalog_filter([_catalog_card(b, ccat) for b in briefs], body)
         rows = clientmod.normalize_cards(rows, client)
         return JSONResponse({"code": 0, "msg": "", "data": {

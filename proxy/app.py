@@ -6918,18 +6918,15 @@ async def _stream_list_impl(guid: str, request: Request):
                     target = store.get_episode_target(resume_guid)
             else:
                 target = store.resolve_media_guid(media_guid(guid))
-    _vs = (sl.get("video_streams") or [{}])[0]
-    quals = _qualities(target, _height_of(_vs)) if target else []
+    quals = _qualities(target) if target else []
     if target and target.get("t4"):
         # Menus never start a media probe. Reuse an exact episode/line result.
         playback = t4_service.cached_playback(target)
         metadata = t4_media.metadata.cached(playback) if playback else None
         t4_metadata.apply(sl, playback.wrapper if playback else "", metadata)
     if quals:
-        # 面板渲染成 `${resolution}p`；resolution_type 给真实高度、bps 给估算码率，
-        # 别把「切线路用的 9000 万段编码」暴露成 90Mbps。
-        _vs["resolution_type"] = _res_label(_vs)
-        _vs["bps"] = _display_bps(_vs)
+        sl["video_streams"][0]["resolution_type"] = quals[0]["resolution"]
+        sl["video_streams"][0]["bps"] = quals[0]["bitrate"]
         sl["qualities"] = quals
         sl["cloud_storage_info"] = None
     # 真实时长（resume3-duration）：video_streams[0].duration 仍为 0 时
@@ -7717,7 +7714,7 @@ async def stream_post(request: Request):
         f, v = sl["files"][0], sl["video_streams"][0]
         if not f["size"]:
             f["size"] = playback.size
-        qualities = _qualities(menu_target, _height_of(v))
+        qualities = _qualities(menu_target)
         names = [choice["line"] for choice in choices]
         if len(choices) > 1:
             # These codes select sources in the official quality menu, not encoders.

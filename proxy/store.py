@@ -49,6 +49,21 @@ def make_guid(t: providers.OnlineTitle) -> str:
     return _h(f"{_GUID_PREFIX}_{t.provider}_{t.vod_id}")
 
 
+def merged_guid(key) -> str:
+    """搜索合并卡的稳定身份：只由（片名, 季号, 年份组）决定，与代表源无关。
+
+    代表源是按「标题与搜索词的相关度」选的，换个关键词代表源就变；用
+    `make_guid(rep)` 会让同一部片在三次搜索里得到三个 guid，各自的线路
+    也互不相通（2026-11-15 实测：「情书」「给阿嬷的情书」「给阿嫲的一封
+    情书」命中同一部片，却是 25b06952 / 6efc77ad / d77884ac 三条记录，
+    分别只有 2 / 4 / 2 条线）。
+    """
+    base = key[0] if key else ""
+    season = key[1] if len(key) > 1 else None
+    year = key[2] if len(key) > 2 else ""
+    return _h(f"{_GUID_PREFIX}_merged_{base}_{season}_{year}")
+
+
 def media_guid(online_guid: str) -> str:
     return _h("media:" + online_guid)
 

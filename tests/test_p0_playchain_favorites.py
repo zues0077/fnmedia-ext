@@ -449,6 +449,11 @@ class PlaychainTests(unittest.IsolatedAsyncioTestCase):
         r = await self.client.post("/v/api/v1/stream",
                                    json={"media_guid": mg})
         assert r.json()["code"] == 0
+        # 单线路标题也必须有至少一条「视频质量」项：空数组会让飞牛 Web 播放器
+        # 永远停在「视频信息解析中…」（2026-11-15 实机取证）。
+        quals = r.json()["data"]["qualities"]
+        assert len(quals) == 1, quals
+        assert quals[0]["resolution"] and quals[0]["bitrate"] > 0, quals
         r = await self.client.post("/v/api/v1/play/play",
                                    json={"media_guid": mg})
         assert r.json()["code"] == 0

@@ -204,3 +204,69 @@ def test_quality_menu_labels_use_source_names():
         quals = [q["resolution"] for q in appmod._qualities(tgt)]
     assert labels == ["电影天堂", "红牛"], labels
     assert quals == ["电影天堂", "红牛"], quals
+
+
+def test_display_bps_falls_back_to_resolution():
+    """在线源 bps 恒为 0：面板展示值要按分辨率估算，不能是 0。"""
+    assert appmod._display_bps({"bps": 0, "height": 1080}) == 5_000_000
+    assert appmod._display_bps({"bps": None, "height": 2160}) == 20_000_000
+    assert appmod._display_bps({"bps": 0, "height": 720}) == 2_500_000
+    assert appmod._display_bps({"bps": 0, "height": 0}) == 1_000_000
+    # 有真实码率就用真实值
+    assert appmod._display_bps({"bps": 1_234_567, "height": 1080}) == 1_234_567
+
+
+def test_quality_menu_label_carries_height():
+    """面板会把 resolution 拼成 `${x}p`，所以菜单名要写成「站名 1080」。"""
+    src = [{"id": "custom_a17abce3cd", "name": "🎬电影天堂"},
+           {"id": "custom_e0dc17c012", "name": "红牛资源站"}]
+    lines = [{"line": "custom_a17abce3cd::dytt", "index": 0,
+              "url": "https://x/a.m3u8", "m3u8": True},
+             {"line": "custom_e0dc17c012::hnyun", "index": 0,
+              "url": "https://x/b.m3u8", "m3u8": True}]
+    tgt = {"line": "custom_a17abce3cd::dytt", "index": 0,
+           "online_guid": "og", "url": "https://x/a.m3u8"}
+    with patch.object(appmod.config, "all_sources", return_value=src), \
+            patch.object(appmod.store, "target_lines", return_value=lines):
+        labels = [q["resolution"] for q in appmod._qualities(tgt, 1080)]
+        no_height = [q["resolution"] for q in appmod._qualities(tgt)]
+    assert labels == ["电影天堂 1080", "红牛 1080"], labels
+    assert no_height == ["电影天堂", "红牛"], no_height
+
+
+def test_res_label_strips_client_suffix():
+    """面板自己会加 p，所以我们给 1080 而不是 1080p（否则 1080pp）。"""
+    assert appmod._res_label({"height": 1080}) == "1080"
+    assert appmod._res_label({"height": 2160}) == "2160"
+    assert appmod._res_label({"height": 0, "resolution_type": "1080p"}) == "1080"
+    assert appmod._res_label({"height": 0, "resolution_type": ""}) == "原画"
+    assert appmod._height_of({"height": "720"}) == 720
+    assert appmod._height_of({}) == 0
+
+
+def test_card_guid_is_stable_across_search_words():
+    """同一部片换个搜索词（代表源会变）必须还是同一个 guid。
+
+    2026-11-15 实测：搜「情书」「给阿嬷的情书」「给阿嫲的一封情书」命中同一部片，
+    却是 25b06952 / 6efc77ad / d77884ac 三条记录，线路分别只有 2/4/2 条。
+    """
+    a = _mk("给阿嬷的情书 ·正片", "2020", "srcA")
+    b = _mk("给阿嬷的情书 ·HD中字", "2020", "srcB")
+    g1 = _groups([a], "情书")[0]["guid"]
+    g2 = _groups([a, b], "给阿嬷的情书")[0]["guid"]
+    g3 = _groups([b], "给阿嫲的一封情书")[0]["guid"]
+    assert g1 == g2 == g3, (g1, g2, g3)
+
+
+def test_existing_lines_are_unioned_not_overwritten():
+    """后一次搜索命中的源更少时，不能把之前记下的线路覆盖掉。"""
+    a = _mk("给阿嬷的情书", "2020", "srcA")
+    old_eps = [{"title": "正片", "url": "https://cdn.test/old.m3u8",
+                "direct": True, "resolve": False}]
+    with patch.object(appmod.store, "get_title_by_guid",
+                      return_value={"lines": {"srcZ::m3u8": old_eps}}):
+        out = _groups([a], "情书")
+    assert len(out) == 1
+    lines = out[0]["lines"]
+    assert "srcZ::m3u8" in lines, lines
+    assert any(k.startswith("srcA::") for k in lines), lines

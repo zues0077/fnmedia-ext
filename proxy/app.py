@@ -85,8 +85,9 @@ import fnusers as fnusersmod
 import libfilter as libfiltermod
 import admin_auth as admin_authmod
 import updater
-from store import (store, make_guid, media_guid, video_guid, is_online_guid,
-                   season_guid, episode_guid, ep_media_guid, ep_video_guid)
+from store import (store, make_guid, merged_guid, media_guid, video_guid,
+                   is_online_guid, season_guid, episode_guid, ep_media_guid,
+                   ep_video_guid)
 
 t4_service = T4Service(store, config)
 t4_media = T4Media()
@@ -3009,6 +3010,21 @@ def _lev_similarity(a: str, b: str) -> float:
     return 1.0 - prev[lb] / max(la, lb)
 
 
+def _kw_coverage(title: str, keyword: str) -> int:
+    """片名对搜索词的 2-gram 覆盖率（0~100），用于同档相关度内的细排。
+
+    相关度 `_title_relevance` 只分「完全/开头/包含/模糊」几档，同档内谁更像
+    搜的词没有依据；这里按「片名覆盖了 query 多少个 2-gram」细排。
+    2026-11-15 调研：爱奇艺/达观用 term 权重细排，LinkedMDB 实测加权
+    Jaccard 0.7 阈值精度 97.6%。这里只用命中比例，不引入新权重体系。
+    """
+    kw = _bigrams(_merge_key(keyword)[0].replace("的", ""))
+    t = _bigrams(_merge_key(title or "")[0].replace("的", ""))
+    if not kw or not t:
+        return 0
+    return int(len(kw & t) / len(kw) * 100)
+
+
 def _title_relevance(title: str, keyword: str) -> int:
     """片名与搜索词的相关性分（0~100），参考 LunaTV search-ranking.ts 分档。
 
@@ -3207,6 +3223,14 @@ def _merge_online_titles(titles: list, ranked: list[dict], keyword: str,
         for b in names:
             canonical[(b, season)] = (_find(b), season)
 
+    # 被折叠进来的其它写法（甄嬛传 / 后宫·甄嬛传）。这才是**有用的别名**：
+    # 换种写法去搜能命中不同的源。同一 key 内只差「-正片/集数」的写法不算，
+    # 因为 CMS 的 wd 是 LIKE 子串匹配，搜更长的串只会更窄。
+    aliases_of: dict[tuple, list[str]] = {}
+    for (_b, _season), (_target, _s) in canonical.items():
+        if _b != _target:
+            aliases_of.setdefault((_target, _season), []).append(_b)
+
     # 年份跨度：同片名+季号下「最晚-最早 > 10 年」才认为真有不同版本（重拍片）。
     # 阈值 10 年由用户 2026-11-14 拍板：5 年内的差异（2019 vs 2024）属源站写混，
     # 一律合并；像「射雕英雄传」1983 / 2017 这种差 30+ 年的必须拆开。
@@ -3240,6 +3264,10 @@ def _merge_online_titles(titles: list, ranked: list[dict], keyword: str,
                  # 标题相关性只算一次并缓存（同组归一化标题基本相同）
                  "rel": _title_relevance(t.title, keyword)}
             groups[key] = g
+        for _alias in aliases_of.get(canonical.get(nt, nt), ()):
+            _lst = g.setdefault("aliases", [])
+            if _alias not in _lst:
+                _lst.append(_alias)
         else:
             # 同组内取最高相关性，避免首个源的标题写法偏差影响整组
             _r = _title_relevance(t.title, keyword)
@@ -3270,6 +3298,9 @@ def _merge_online_titles(titles: list, ranked: list[dict], keyword: str,
     except Exception:  # noqa: BLE001
         _pinned, _blocked = set(), set()
 
+    def _coverage(g) -> int:
+        return _kw_coverage(g["rep"].title, keyword)
+
     def _group_key(g) -> tuple:
         lines_n = sum(len(v) for v in g["lines"].values())
         any_line = next(iter(g["lines"].keys()), "")
@@ -3284,15 +3315,48 @@ def _merge_online_titles(titles: list, ranked: list[dict], keyword: str,
         if auto_best:
             grade, avg_lat, fail = (sourcehealth.weight(sk, _now_h) if sk
                                     else (1, 5.0, 1.0))
-            return (pin_rank, blk_rank, rel, mr_key, -grade, lines_n,
-                    -fail, -avg_lat)
-        return (pin_rank, blk_rank, rel, mr_key, lines_n)
+            return (pin_rank, blk_rank, rel, _coverage(g), mr_key, -grade,
+                    lines_n, -fail, -avg_lat)
+        return (pin_rank, blk_rank, rel, _coverage(g), mr_key, lines_n)
 
-    ordered = sorted(groups.values(), key=_group_key, reverse=True)[:maxn]
+    ordered = sorted(groups.items(), key=lambda kv: _group_key(kv[1]),
+                     reverse=True)[:maxn]
     briefs = []
-    for g in ordered:
+    for gkey, g in ordered:
         brief = inj.brief_of(g["rep"])
+        # 卡片身份只认（基础片名, 季号, 年份组），不看代表源：代表源随搜索词
+        # 变化，用它的 guid 会让同一部片分裂成多个条目、线路互不相通
+        # （2026-11-15 实测：搜「情书」「给阿嬷的情书」「给阿嫲的一封情书」
+        # 得到三个 guid，线路分别是 2/4/2 条）。
+        try:
+            brief["guid"] = merged_guid(gkey)
+        except Exception:  # noqa: BLE001
+            pass
         brief["lines"] = g["lines"]
+        # 别名（同一部片的其它写法）随卡片走，供下次搜索时补搜用。
+        brief["aliases"] = list(g.get("aliases") or [])[:5]
+        # 同一部片可能已被别的搜索词聚合过（guid 稳定后必然命中同一条）：
+        # 线路取并集，避免「这次搜到的源更少」把之前的源覆盖掉。
+        try:
+            old = store.get_title_by_guid(brief["guid"])
+        except Exception:  # noqa: BLE001
+            old = None
+        if old:
+            union = dict(old.get("lines") or {})
+            for line, eps in brief["lines"].items():
+                cur = union.get(line)
+                nd_new = sum(1 for e in eps if e.get("direct"))
+                nd_cur = sum(1 for e in (cur or []) if e.get("direct"))
+                if cur is None or nd_new > nd_cur or (
+                        nd_new == nd_cur and len(eps) > len(cur)):
+                    union[line] = eps
+            brief["lines"] = union
+            # 别名也要累积：不同搜索词会折叠进不同的写法
+            merged_alias = list(brief["aliases"])
+            for a in (old.get("aliases") or []):
+                if a not in merged_alias:
+                    merged_alias.append(a)
+            brief["aliases"] = merged_alias[:5]
         # P0-6：聚合搜索 brief 补来源分类路由，供 libfilter 归属扩展分类库。
         # type_id 来自搜索 vod（providers._map_vod 保留），cat 由 catalog
         # 路由表反查；路由未加载/无匹配时 cat 为 ""，libfilter 回退到
@@ -3383,38 +3447,105 @@ async def online_search(keyword: str, client: httpx.AsyncClient,
         briefs, ctx.can_open_key, gkey_of=ctx.gkey_of_source)]
 
 
+# 搜索阶梯：一次只发一级，命中够了就停。
+# 业界主流是 relaxation（逐级减词、命中即停），不是一次把所有派生词并发发完
+# ——后者会白吃预算（2026-11-15 调研：Algolia removeWordsIfNoResults 的
+# lastWords/allOptional 策略、Bloomreach/Inferensys 的 relaxation ladder）。
+_LADDER_ENOUGH = 3        # 相关条目达到这个数就认为够用户挑了
+# 阶梯是「补充手段」，不能把首屏拖长：总预算 5 秒、单级 2.5 秒封顶。
+# 实测（2026-11-15）搜索本身就可能吃到 8~10 秒，阶梯再加 8 秒会到 18 秒级。
+_LADDER_BUDGET = 5.0
+_LADDER_STEP_TIMEOUT = 2.5
+
+
+def _ladder_queries(keyword: str, briefs: list[dict],
+                    base_kw: str) -> list[str]:
+    """按「信息量从高到低」排出补搜阶梯：先派生词（去修饰/去「的」），再别名。
+
+    别名是同一部片被折叠进来的另一种写法（甄嬛传 ↔ 后宫·甄嬛传），换种写法
+    去搜能命中不同的源；同一 key 内只差「-正片/集数」的写法不进阶梯，
+    因为 CMS 的 wd 是 LIKE 子串匹配，搜更长的串只会更窄。
+    """
+    steps: list[str] = []
+
+    def _push(q: str) -> None:
+        q = (q or "").strip()
+        if not q or len(q) < 2 or q in steps or q == keyword.strip():
+            return
+        steps.append(q)
+
+    for v in _query_variants(keyword, limit=3):
+        _push(v)
+    used = 0
+    for b in briefs:
+        if used >= 2:
+            break
+        if not _shares_bigram(_merge_key(b.get("title") or "")[0], base_kw):
+            continue
+        for a in (b.get("aliases") or []):
+            if used >= 2:
+                break
+            before = len(steps)
+            _push(a)
+            if len(steps) > before:
+                used += 1
+    return steps
+
+
 async def _expand_briefs(keyword: str, briefs: list[dict], *,
                          fast_only: bool, visible=None,
                          viewer_key: str = "") -> list[dict]:
-    """首轮结果太少（≤3 条）时，用派生短词再聚合一轮并合并线路。
+    """首轮相关结果太少时，按阶梯逐级放宽查询，命中够了就停。
 
-    为什么需要：搜索是把用户原话发给各资源站，子串匹配的站对「给阿嫲的
-    一封情书」返回空，只有分词匹配的站能中（实测同一部片 2 站 vs 5 站）。
-    两个派生词并发聚合、各自限时 4 秒，避免把首屏等待拉长；失败不影响主结果。
+    为什么需要：搜索是把用户原话原样发给各资源站，而苹果 CMS 的 `wd` 是
+    `LIKE '%关键词%'`（整串包含，不是分词），子串匹配的站对长片名直接返回空
+    （实测同一部片：长片名 2 站、短片名 5 站）。所以要做的是「减法放宽」，
+    而不是「一次加一堆近义词」。
     """
     try:
         # 只看「与本片名相关」的条数：一次搜索常带回十几条无关片（同字不同剧），
-        # 用总条数判断会误认为"结果够了"，扩写永远不触发（2026-11-14 实测）。
+        # 用总条数判断会误认为"结果够了"，阶梯永远不触发（2026-11-14 实测）。
         base_kw = _merge_key(keyword)[0]
-        relevant = sum(1 for b in briefs
+
+        def _related(items: list[dict]) -> int:
+            return sum(1 for b in items
                        if _shares_bigram(_merge_key(b.get("title") or "")[0],
                                          base_kw))
-        if relevant > 3:
+
+        start_related = _related(briefs)
+        if start_related > _LADDER_ENOUGH:
             return briefs
-        variants = _query_variants(keyword)
-        if not variants:
+        steps = _ladder_queries(keyword, briefs, base_kw)
+        if not steps:
             return briefs
-        results = await asyncio.gather(
-            *[_aggregate_briefs(v, fast_only=fast_only, timeout=4.0,
-                                visible=visible, viewer_key=viewer_key)
-              for v in variants],
-            return_exceptions=True)
-        for v, extra in zip(variants, results):
-            if isinstance(extra, Exception):
-                _log.debug("expand search %s failed: %s", v,
-                           type(extra).__name__)
+        _log.info("搜索阶梯：「%s」起点相关 %d，待试 %s",
+                  keyword, start_related, steps)
+        deadline = time.monotonic() + _LADDER_BUDGET
+        for step in steps:
+            left = deadline - time.monotonic()
+            if left <= 1.0:
+                break
+            try:
+                # 必须用 wait_for 兜底：_aggregate_briefs 若命中「已在飞的共享
+                # 聚合任务」，会等那个任务跑完、不理会这里传的 timeout——实测
+                # 一次慢源 60 秒超时会把整个搜索拖到 62 秒（2026-11-15）。
+                extra = await asyncio.wait_for(
+                    _aggregate_briefs(
+                        step, fast_only=fast_only,
+                        timeout=min(_LADDER_STEP_TIMEOUT, left),
+                        visible=visible, viewer_key=viewer_key),
+                    timeout=min(_LADDER_STEP_TIMEOUT, left) + 0.5)
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("ladder search %s failed: %s", step,
+                           type(exc).__name__)
                 continue
+            before = _related(briefs)
             briefs = _merge_brief_lists(briefs, extra, keyword)
+            after = _related(briefs)
+            _log.info("搜索阶梯：「%s」→「%s」相关 %d→%d",
+                      keyword, step, before, after)
+            if after >= _LADDER_ENOUGH and after > before:
+                break          # 命中即停：已经够挑了
         # 合并出来的线路必须写回 store：卡片/播放走的是 store 里的 brief，
         # 只改内存返回体的话，点进去还是原来那两条线（2026-11-14 实测）。
         try:
@@ -3693,6 +3824,11 @@ def _merge_brief_lists(primary: list[dict], extra: list[dict],
             for line, eps in (b.get("lines") or {}).items():
                 if line not in dst or len(eps) > len(dst[line]):
                     dst[line] = eps
+            # 别名一起并（下一轮阶梯可以用它补搜）
+            al = keyed[k].setdefault("aliases", [])
+            for a in (b.get("aliases") or []):
+                if a not in al:
+                    al.append(a)
         elif _shares_bigram(k[0], _merge_key(keyword)[0]):
             keyed[k] = b
             order.append(k)
@@ -6782,15 +6918,18 @@ async def _stream_list_impl(guid: str, request: Request):
                     target = store.get_episode_target(resume_guid)
             else:
                 target = store.resolve_media_guid(media_guid(guid))
-    quals = _qualities(target) if target else []
+    _vs = (sl.get("video_streams") or [{}])[0]
+    quals = _qualities(target, _height_of(_vs)) if target else []
     if target and target.get("t4"):
         # Menus never start a media probe. Reuse an exact episode/line result.
         playback = t4_service.cached_playback(target)
         metadata = t4_media.metadata.cached(playback) if playback else None
         t4_metadata.apply(sl, playback.wrapper if playback else "", metadata)
     if quals:
-        sl["video_streams"][0]["resolution_type"] = quals[0]["resolution"]
-        sl["video_streams"][0]["bps"] = quals[0]["bitrate"]
+        # 面板渲染成 `${resolution}p`；resolution_type 给真实高度、bps 给估算码率，
+        # 别把「切线路用的 9000 万段编码」暴露成 90Mbps。
+        _vs["resolution_type"] = _res_label(_vs)
+        _vs["bps"] = _display_bps(_vs)
         sl["qualities"] = quals
         sl["cloud_storage_info"] = None
     # 真实时长（resume3-duration）：video_streams[0].duration 仍为 0 时
@@ -7371,6 +7510,33 @@ def _line_choices(target: dict) -> list[dict]:
     return out
 
 
+def _display_bps(v: dict) -> int:
+    """「视频质量」面板展示用的码率。
+
+    在线源没有真实码率（`inj.stream_list` 给的 bps 恒为 0），面板会显示成
+    0 或者干脆不算出数值；这里在 bps 缺省时按分辨率给一个合理估算。
+    注意：单线路时播放器不会回传 bitrate 选线，所以这个值不参与 `_line_of_bitrate`
+    的线路反解（那条只认 9000 万段）。
+    """
+    try:
+        bps = int(v.get("bps") or 0)
+    except (TypeError, ValueError):
+        bps = 0
+    if bps > 0:
+        return bps
+    try:
+        height = int(v.get("height") or 0)
+    except (TypeError, ValueError):
+        height = 0
+    if height >= 2000:
+        return 20_000_000
+    if height >= 1000:
+        return 5_000_000
+    if height >= 700:
+        return 2_500_000
+    return 1_000_000
+
+
 def _line_bitrate(line: str, lines: list[str]) -> int:
     # 用 9000 万段的稳定整数编码线路，避免与真实码率（通常<3000万）冲突
     try:
@@ -7392,15 +7558,44 @@ def _line_of_bitrate(br, lines: list[str]) -> str | None:
     return None
 
 
-def _qualities(target: dict) -> list[dict]:
-    """把每条播放线路表达成播放器「清晰度」菜单里的一个可选项。"""
+def _height_of(v: dict) -> int:
+    try:
+        return int((v or {}).get("height") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _res_label(v: dict) -> str:
+    """把 video_stream 的分辨率表达成面板期望的写法。
+
+    飞牛「视频质量」面板渲染时会自己再拼一个 "p"（正常情况 1080 → 1080p），
+    所以这里必须给 "1080" 而不是 "1080p"，否则界面会显示成 1080pp。
+    """
+    height = _height_of(v)
+    if height > 0:
+        return str(height)
+    # 兜底：video_stream 没给宽高时用 resolution_type，去掉它可能自带的 p/i
+    rt = re.sub(r"[pPiI]+$", "", str((v or {}).get("resolution_type") or "").strip())
+    return rt or "原画"
+
+
+def _qualities(target: dict, height: int = 0) -> list[dict]:
+    """把每条播放线路表达成播放器「清晰度」菜单里的一个可选项。
+
+    height 是当前视频的真实高度（1080/720…）。面板会把 resolution 拼成
+    `${resolution}p`，只给站名会显示成「非凡p」（p 是客户端加的），
+    所以有高度时写成「非凡 1080」→ 界面呈现「非凡 1080p」，既认得出源、
+    又像正常的画质项。
+    """
     lines = _line_choices(target)
     if len(lines) <= 1:
         return []
     out = []
     for i, t in enumerate(lines):
+        name = t.get("label") or _friendly_line(t["line"])
         out.append({
-            "resolution": t.get("label") or _friendly_line(t["line"]),
+            "resolution": f"{name} {height}" if height > 0 else name,
+            # 9000 万段是「选了哪条线」的编码，播放/切线路靠它反解，别改成真实码率
             "bitrate": 90_000_000 + i * 10001,
             "progressive": True,
             "is_m3u8": False,  # 置 False 才不会被菜单项置灰
@@ -7522,7 +7717,7 @@ async def stream_post(request: Request):
         f, v = sl["files"][0], sl["video_streams"][0]
         if not f["size"]:
             f["size"] = playback.size
-        qualities = _qualities(menu_target)
+        qualities = _qualities(menu_target, _height_of(v))
         names = [choice["line"] for choice in choices]
         if len(choices) > 1:
             # These codes select sources in the official quality menu, not encoders.
@@ -7561,11 +7756,26 @@ async def stream_post(request: Request):
         sl = inj.stream_list(brief)
     f = sl["files"][0]
     v = sl["video_streams"][0]
-    quals = _qualities(target)
-    if quals:
-        # 默认选中第一条线路，让播放器初始分辨率/码率与之一致
-        v["resolution_type"] = quals[0]["resolution"]
-        v["bps"] = quals[0]["bitrate"]
+    quals = _qualities(target, _height_of(v))
+    if not quals:
+        # 只有一条线路（没有可切换项）时不能返回空数组：飞牛 Web 播放器的
+        # 「视频质量」面板拿到 qualities=[] 会永远停在「视频信息解析中…」
+        # （2026-11-15 实机取证：POST /v/api/v1/stream 200 / 22ms 之后面板不动）。
+        # 补一条原画项即可，与 T4 分支对单源的处理保持一致（那边注释也写了
+        # 「原生播放器需要一条可用的原画项」）。单线路时播放器不会回传 bitrate
+        # 选线（`len(choices) > 1` 才解析），所以这里的值只用于面板展示。
+        quals = [{
+            "resolution": _res_label(v),
+            "bitrate": _display_bps(v),
+            "progressive": True,
+            "is_m3u8": False,
+        }]
+    # 面板把 resolution 渲染成 `${resolution}p`：这里给真实高度（1080→1080p）、
+    # 码率给估算值。不能把线路编码值（9000 万段）放到 resolution_type/bps 上，
+    # 否则界面会出现「90Mbps」这种给切线路用的内部编码（2026-11-15 实机）。
+    v["resolution_type"] = _res_label(v)
+    v["bps"] = _display_bps(v)
+
     return JSONResponse({"code": 0, "msg": "", "data": {
         "file_stream": f, "video_stream": v,
         "audio_streams": [], "subtitle_streams": [],
